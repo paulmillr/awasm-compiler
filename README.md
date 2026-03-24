@@ -1040,7 +1040,6 @@ s.breakIf(cond);
 | `forLoop` | 0+ times     | Before body     |
 | `ifElse`  | 0 or 1 time  | Before body     |
 
-
 ## License
 
 The MIT License (MIT)
