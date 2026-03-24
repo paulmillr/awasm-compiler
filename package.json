@@ -60,7 +60,7 @@
   "funding": "https://paulmillr.com/funding/",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/paulmillr/awasm.git"
+    "url": "git+https://github.com/paulmillr/awasm-compiler.git"
   },
   "type": "module",
   "main": "index.js",
