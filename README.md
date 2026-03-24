@@ -17,8 +17,7 @@ Auditable js-to-wasm compiler, focusing on ultra-high performance & security.
 - **Synchronous execution:** with optional async variant
 - Zero or minimal dependencies
 - PGP-signed releases and transparent NPM builds
-- [Check out the homepage](https://paulmillr.com/noble/)
-  for reading resources, documentation, and apps built with noble
+- [Check out the homepage](https://paulmillr.com/awasm/)
 
 ## Usage
 
