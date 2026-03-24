@@ -4,9 +4,9 @@ Auditable js-to-wasm compiler, focusing on ultra-high performance & security.
 
 - 🪶 Small: 0 deps, ~10K lines of code
 - 🏎 Fast: produces JIT-friendly code
-- Reproducible: deterministic builds with stable code ordering
-- Parallel: manages threads & SIMD in user code
 - Multi-backend: compile to wasm, larger JS, threaded wasm, or runtime
+- Parallel: manages threads and SIMD without hassle
+- Stable code ordering: allows deterministic builds
 
 ### This library belongs to _awasm_
 
