@@ -1,0 +1,14 @@
+{
+  "extends": "@paulmillr/jsbt/tsconfig.json",
+  "compilerOptions": {
+    "outDir": ".",
+    "isolatedDeclarations": false,
+    "sourceMap": false
+  },
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

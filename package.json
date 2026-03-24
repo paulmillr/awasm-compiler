@@ -1,0 +1,72 @@
+{
+  "name": "@awasm/compiler",
+  "version": "0.1.0",
+  "description": "Auditable js-to-wasm compiler, focusing on ultra-high performance & security",
+  "files": [
+    "src",
+    "*.js",
+    "*.js.map",
+    "*.d.ts",
+    "*.d.ts.map"
+  ],
+  "dependencies": {
+    "@scure/base": "^2.0.0",
+    "micro-packed": "~0.8.0"
+  },
+  "devDependencies": {
+    "@paulmillr/jsbt": "0.5.0",
+    "@types/node": "25.3.0",
+    "fast-check": "4.2.0",
+    "prettier": "3.6.2",
+    "typescript": "5.9.2"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:release": "npx --no @paulmillr/jsbt esbuild test/build",
+    "build:clean": "rm *.{js,js.map,d.ts,d.ts.map} 2> /dev/null",
+    "format": "prettier --write 'src/**/*.{js,ts}' 'test/**/*.{js,ts,mjs}'",
+    "test": "node test/index.ts",
+    "test:bun": "bun test/index.ts",
+    "test:deno": "deno --allow-env --allow-read test/index.ts",
+    "test:node20": "cd test; npx tsc; node compiled/test/index.js"
+  },
+  "exports": {
+    "./codegen.js": "./codegen.js",
+    "./js.js": "./js.js",
+    "./memory.js": "./memory.js",
+    "./module.js": "./module.js",
+    "./rewrites.js": "./rewrites.js",
+    "./runtime.js": "./runtime.js",
+    "./types.js": "./types.js",
+    "./wasm.js": "./wasm.js",
+    "./workers.js": "./workers.js",
+    "./utils.js": "./utils.js"
+  },
+  "engines": {
+    "node": ">= 22.22.0"
+  },
+  "keywords": [
+    "awasm",
+    "wasm",
+    "compiler",
+    "transpiler",
+    "webassembly",
+    "parallel",
+    "threaded",
+    "auditable",
+    "noble",
+    "cryptography"
+  ],
+  "funding": "https://paulmillr.com/funding/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paulmillr/awasm.git"
+  },
+  "type": "module",
+  "main": "index.js",
+  "module": "index.js",
+  "types": "index.d.ts",
+  "sideEffects": false,
+  "author": "Paul Miller (https://paulmillr.com)",
+  "license": "MIT"
+}
