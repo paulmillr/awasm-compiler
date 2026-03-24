@@ -165,7 +165,8 @@ const TYPES = {
   u256x16: { signed: false, float: false, width: 256, lanes: 16 },
 } as const;
 
-export type TypeName = keyof typeof TYPES;
+export interface TypeDict extends Record<keyof typeof TYPES, unknown> {}
+export type TypeName = keyof TypeDict;
 // Derive sets from predicates
 type LooseSet<T extends string> = Set<T> & { has(v: string): v is T };
 const filter = <K extends TypeName>(pred: (d: (typeof TYPES)[K]) => boolean): LooseSet<K> =>

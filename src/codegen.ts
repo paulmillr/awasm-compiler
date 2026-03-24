@@ -335,7 +335,7 @@ function genScope(mg: ModuleGraph, m: Module<any, any>, opts: CompilerOpts) {
         throw new Error(`br: no parent (depth=${depth})`);
       const { shape } = parent.node;
       if (!FnOpShape.validate(shape, outputs)) {
-                throw new Error('wrong output shape for branch');
+        throw new Error('wrong output shape for branch');
       }
       const args = FnOpShape.decode(outputs).flat;
       const { strong, weak } = allMemLinks();
