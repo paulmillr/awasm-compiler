@@ -1,5 +1,7 @@
 # AWASM compiler
 
+> Awesome? WASM? AWASM!
+
 Auditable js-to-wasm compiler, focusing on ultra-high performance & security.
 
 - 🪶 Small: 0 deps, ~10K lines of code
