@@ -4,7 +4,7 @@
 
 Auditable js-to-wasm compiler, focusing on ultra-high performance & security.
 
-- 🪶 Small: 0 deps, ~10K lines of code
+- 🪶 Small: 2 deps, 12K lines of code, fits into 64KB (zstd-compressed)
 - 🏎 Fast: produces JIT-friendly code
 - Multi-backend: compile to wasm, larger JS, threaded wasm, or runtime
 - Parallel: manages threads and SIMD without hassle
