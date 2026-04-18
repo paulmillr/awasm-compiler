@@ -591,7 +591,8 @@ function initWorkers(limit = 32) {
           catch {}
         }
         if (NodeWorker) {
-          initWorker = ()=>new NodeWorker("("+workerSrc+")(req"+"uire('worker_threads').parentPort);", { eval: true });
+          // Node ESM eval workers don't expose require(), so parentPort must come from an import fallback.
+          initWorker = ()=>new NodeWorker("(typeof require==='function' ? Promise.resolve(require('node:worker_threads')) : import('node:worker_threads')).then(({ parentPort }) => ("+workerSrc+")(parentPort));", { eval: true });
         }
       }
       while (workers.length < W-1) {
