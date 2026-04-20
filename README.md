@@ -19,7 +19,7 @@ Auditable js-to-wasm compiler, focusing on ultra-high performance & security.
 - **Synchronous execution:** with optional async variant
 - Zero or minimal dependencies
 - PGP-signed releases and transparent NPM builds
-- [Check out the homepage](https://paulmillr.com/awasm/)
+- [Check out the homepage](https://paulmillr.com/awasm/), [compiler](https://github.com/paulmillr/awasm-compiler), [awasm-noble](https://github.com/paulmillr/awasm-noble)
 
 ## Usage
 
