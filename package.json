@@ -1,6 +1,6 @@
 {
   "name": "@awasm/compiler",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Auditable js-to-wasm compiler, focusing on ultra-high performance & security",
   "files": [
     "src",
