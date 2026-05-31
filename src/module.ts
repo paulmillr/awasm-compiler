@@ -16,16 +16,21 @@ import type {
 } from './types.ts'; // Can import only types here!
 import type { ND } from './utils.ts';
 
+/** Shift mask value used by integer shift operations. */
 export type ShiftMask = Val<'u32'>;
 type AddrDyn = Val<'u32'>;
+/** Static or dynamic wasm32 memory address. */
 export type Addr = number | Val<'u32'>;
+/** Static or dynamic i32 shift amount. */
 export type Shift = number | Val<'i32'>;
+/** i32/u32 condition value used by control-flow helpers. */
 export type Cond = Val<'i32'> | Val<'u32'>;
 
 // Phantom type
 // Brand
 declare const brandSym: unique symbol;
 
+/** Branded compiler value carrying its Wasm type and optional generic phantom. */
 // S invariant; G phantom. When G=never, drop the field entirely.
 export type Val<S extends TypeName, G = unknown> = symbol & {
   readonly [brandSym]: (x: S) => S;
@@ -34,6 +39,7 @@ export type Val<S extends TypeName, G = unknown> = symbol & {
 // OPS
 type Expand<T> = T extends infer O ? { [K in keyof O]: O[K] } : never;
 
+/** Typed operation surface available for compiler values of a specific type. */
 export type GetOps<T extends TypeName, G = unknown> = Expand<
   {
     name: T & G;
@@ -71,13 +77,24 @@ export type GetOps<T extends TypeName, G = unknown> = Expand<
 // type StrUnion<T> = T extends string ? `${T}` : never;
 // type T1Ops = StrUnion<keyof GetOps<'u32'>>;
 
-// /*
-// type T1Ops = "swapEndianness" | "add" | "mul" | "sub" | "div" | "rem" | "min" | "max" | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "eqz" | "and" | "or" | "xor" | "andnot" | "not" | "clz" | "ctz" | "popcnt" | "shr" | "shl" | "rotr" | "rotl" | "name" | "size" | "const" | "laneOffsets" | "select" | "to" | "from" | "toN" | "fromN"
-// */
+/*
+type T1Ops =
+  | "swapEndianness" | "add" | "mul" | "sub" | "div" | "rem" | "min" | "max"
+  | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "eqz" | "and" | "or" | "xor"
+  | "andnot" | "not" | "clz" | "ctz" | "popcnt" | "shr" | "shl" | "rotr"
+  | "rotl" | "name" | "size" | "const" | "laneOffsets" | "select" | "to"
+  | "from" | "toN" | "fromN"
+*/
 //type T2Ops = StrUnion<keyof GetOps<'f64x4'>>;
-// /*
-// type T2Ops = "sub" | "name" | "select" | "const" | "eqz" | "eq" | "ne" | "lt" | "gt" | "le" | "ge" | "abs" | "neg" | "ceil" | "floor" | "trunc" | "nearest" | "sqrt" | "add" | "mul" | "div" | "min" | "max" | "copysign" | "shuffle" | "splat" | "size" | "swapEndianness" | "rem" | "isNaN" | "laneOffsets" | "to" | "from" | "toN" | "fromN" | "extractLane" | "replaceLane" | "shuffleLanes" | "rol" | "ror" | "interleave" | "deinterleave"
-// */
+/*
+type T2Ops =
+  | "sub" | "name" | "select" | "const" | "eqz" | "eq" | "ne" | "lt" | "gt"
+  | "le" | "ge" | "abs" | "neg" | "ceil" | "floor" | "trunc" | "nearest"
+  | "sqrt" | "add" | "mul" | "div" | "min" | "max" | "copysign" | "shuffle"
+  | "splat" | "size" | "swapEndianness" | "rem" | "isNaN" | "laneOffsets"
+  | "to" | "from" | "toN" | "fromN" | "extractLane" | "replaceLane"
+  | "shuffleLanes" | "rol" | "ror" | "interleave" | "deinterleave"
+*/
 
 // Nested memory regions
 type AnySpecReal = ScalarSpec<TypeName, any> | StructSpec | ArraySpec;
@@ -98,13 +115,30 @@ type Normalized<T extends AnySpec> = T extends TypeName
           ? ArraySpec<Normalized<E>, S>
           : never;
 
+/** Memory specification for one scalar value. */
 export interface ScalarSpec<T extends TypeName, Generic = unknown, Size extends number = number> {
+  /** Discriminator for scalar memory nodes. */
   kind: 'scalar';
+  /** Scalar type stored in memory. */
   type: T;
-  generic: Generic; // optional bound generic
+  /** Optional bound generic carried through typed memory access. */
+  generic: Generic;
+  /** Memory layout options for this scalar. */
   opts: Readonly<MemoryOpts>;
+  /** Optional byte size override for byte-view scalar aliases. */
   size?: Size;
 }
+/**
+ * Builds a scalar memory specification.
+ *
+ * @param type - Scalar type or generic scalar wrapper.
+ * @param opts - Memory layout options. {@link MemoryOpts}
+ * @returns Scalar memory specification.
+ * @example
+ * ```js
+ * scalar('u32');
+ * ```
+ */
 export function scalar<T extends TypeName | GenericMemType<any, any>>(
   type: T,
   opts: MemoryOpts = {}
@@ -112,11 +146,27 @@ export function scalar<T extends TypeName | GenericMemType<any, any>>(
   return { kind: 'scalar', type, opts } as any;
 }
 
+/** Memory specification for a struct with named fields. */
 export interface StructSpec<F extends Record<string, AnySpecReal> = Record<string, AnySpecReal>> {
+  /** Discriminator for struct memory nodes. */
   kind: 'struct';
+  /** Field specifications by field name. */
   fields: { [K in keyof F]: F[K] };
+  /** Memory layout options for this struct. */
   opts: Readonly<MemoryOpts>;
 }
+/**
+ * Builds a struct memory specification.
+ *
+ * @param fields - Field specifications by field name.
+ * @param opts - Memory layout options. {@link MemoryOpts}
+ * @returns Struct memory specification with shorthand string fields normalized.
+ * @throws If the struct has no fields. {@link Error}
+ * @example
+ * ```js
+ * struct({ word: 'u32' });
+ * ```
+ */
 export function struct<F extends Record<string, AnySpec>>(
   fields: F,
   opts: MemoryOpts = {}
@@ -135,21 +185,46 @@ type CollapseArray<T extends AnySpec, S extends readonly number[]> =
     ? CollapseArray<E, [...S, ...S0]>
     : ArraySpec<Normalized<T>, S>;
 
+/** Memory specification for a multidimensional array. */
 export interface ArraySpec<
   T extends AnySpecReal = AnySpecReal,
   S extends readonly number[] = readonly number[],
 > {
+  /** Discriminator for array memory nodes. */
   kind: 'array';
+  /** Element memory specification. */
   type: T;
+  /** Positive extents for every array dimension. */
   readonly sizes: S;
+  /** Memory layout options for this array. */
   opts: Readonly<MemoryOpts>;
 }
+/**
+ * Builds an array memory specification.
+ *
+ * @param type - Element type or element memory specification.
+ * @param opts - Memory layout options. {@link MemoryOpts}
+ * @param sizes - Positive safe-integer extents for every array dimension.
+ * @returns Array memory specification with nested arrays collapsed into one shape.
+ * @throws If no dimension is supplied or a dimension is invalid. {@link Error}
+ * @example
+ * ```js
+ * array('u32', {}, 4);
+ * ```
+ */
 export function array<T extends AnySpec, const S extends readonly number[]>(
   type: T,
   opts: MemoryOpts,
   ...sizes: S
 ): CollapseArray<T, S> {
-  if (sizes.length === 0 || (sizes.length === 1 && sizes[0] === 0)) throw new Error('array: empty');
+  if (sizes.length === 0) throw new Error('array: empty');
+  // Memory layout uses extents as multiplicative region sizes.
+  let count = 1;
+  for (const s of sizes) {
+    if (!Number.isSafeInteger(s) || s <= 0) throw new Error('wrong array size');
+    count *= s;
+    if (!Number.isSafeInteger(count)) throw new Error('wrong array size');
+  }
   let t = type as any;
   if (typeof t === 'string') t = scalar(t as any);
   if (t.kind === 'array')
@@ -157,15 +232,28 @@ export function array<T extends AnySpec, const S extends readonly number[]>(
   return { kind: 'array', type: t, sizes, opts } as any;
 }
 
+/** Memory options plus an explicit integer width for low-level byte views. */
 export type MemoryOptsWidth = MemoryOpts & {
   width: 8 | 16 | 32 | 64;
 };
 
+/** Any normalized top-level memory segment specification. */
 export type SegMeta = AnySpecReal;
 
+/** Named memory segment registry. */
 export type Segs = Record<string, SegMeta>;
 type GenericMemType<T extends TypeName, G extends T> = { type: T; generic: G };
-// identity at runtime, carries phantom types only
+
+/**
+ * Carries a narrower generic scalar type through memory typing.
+ *
+ * @param t - Concrete scalar type to carry as a phantom generic.
+ * @returns Runtime identity value with generic type metadata.
+ * @example
+ * ```js
+ * toGeneric('u32');
+ * ```
+ */
 export function toGeneric<T extends TypeName, G extends T>(t: G): GenericMemType<T, G> {
   return t as any;
 }
@@ -191,14 +279,51 @@ type MutOps<T extends TypeName, G> = {
   compareExchange(expected: Val<T, G>, replacement: Val<T, G>): Val<T, G>;
 };
 
+/** Atomic operation surface for integer scalar memory views. */
 export type ScalarAtomics<T extends TypeName, G> = {
+  /**
+   * Emits an atomic load.
+   *
+   * @returns Loaded scalar value.
+   */
   load(): Val<T, G>;
+  /**
+   * Emits an atomic store.
+   *
+   * @param v - Value to store.
+   */
   store(v: Val<T, G> | number): void;
+  /**
+   * Emits an atomic exchange.
+   *
+   * @param v - Replacement value.
+   * @returns Previous scalar value.
+   */
   exchange(v: Val<T, G> | number): Val<T, G>;
+  /**
+   * Emits an atomic compare-exchange.
+   *
+   * @param expected - Value expected in memory.
+   * @param replacement - Value written when the expected value matches.
+   * @returns Previous scalar value.
+   */
   compareExchange(expected: Val<T, G> | number, replacement: Val<T, G> | number): Val<T, G>;
-  // Synchronization (Implied address = this scalar)
-  notify(count?: Val<'u32'> | number): Val<'u32'>; // Returns count of woken waiters
-  wait(expected: Val<T, G> | number, timeout: Val<'i64'> | number): Val<'u32'>; // Returns 0 (ok), 1 (timeout), 2 (not equal)
+  /**
+   * Emits an atomic notify on this scalar address.
+   *
+   * @param count - Maximum number of waiters to notify.
+   * @returns Count of woken waiters.
+   */
+  notify(count?: Val<'u32'> | number): Val<'u32'>;
+  /**
+   * Emits an atomic wait on this scalar address.
+   *
+   * @param expected - Expected scalar value.
+   * @param timeout - Timeout in nanoseconds.
+   * @returns Wait status: `0` ok, `1` timeout, or `2` not equal.
+   */
+  wait(expected: Val<T, G> | number, timeout: Val<'i64'> | number): Val<'u32'>;
+  /** Emits an atomic fence. */
   fence(): void;
 } & { [K in OpsAtomics]: (v: Val<T, G> | number) => Val<T, G> };
 
@@ -290,11 +415,19 @@ type ResolveMem<S extends AnySpec> =
         ? MemStruct<F>
         : never;
 
+/** Runtime memory access surface generated from a memory segment registry. */
 export type MemorySurface<M extends Segs> = {
   [K in keyof M]: ResolveMem<Normalized<M[K]>>;
 };
 
-export type FnDef<In extends readonly TypeName[], Ret> = { inputs: In; ret: Ret };
+/** Function signature metadata stored in a module function registry. */
+export type FnDef<In extends readonly TypeName[], Ret> = {
+  /** Input type names in call order. */
+  inputs: In;
+  /** Callback return value type tracked by TypeScript. */
+  ret: Ret;
+};
+/** Named function definition registry. */
 export type FnRegistry = Record<string, FnDef<readonly TypeName[], unknown>>;
 
 type TupleVals<A extends readonly TypeName[]> = {
@@ -304,20 +437,72 @@ type TupleVals<A extends readonly TypeName[]> = {
 type C = Val<'u32'>; // condition type
 type N = number | Val<'u32'>; // loop count / index
 
+/** Control-flow helper surface available inside module function callbacks. */
 export type ControlFlow = {
+  /**
+   * Emits an anonymous block around a stateful body.
+   *
+   * @param state - Values carried through the block.
+   * @param body - Callback that emits block body instructions.
+   * @returns Updated state values.
+   */
   block<S extends readonly unknown[]>(
     state: [...S],
     body: (...s: [...S]) => S['length'] extends 0 ? [...S] | void : [...S] | S[number][]
   ): [...S];
+  /**
+   * Emits a named block around a stateful body.
+   *
+   * @param label - Branch label for nested control helpers.
+   * @param state - Values carried through the block.
+   * @param body - Callback that emits block body instructions.
+   * @returns Updated state values.
+   */
   namedBlock<S extends readonly unknown[]>(
     label: string,
     state: [...S],
     body: (...s: [...S]) => S['length'] extends 0 ? [...S] | void : [...S] | S[number][]
   ): [...S];
+  /**
+   * Emits a conditional branch.
+   *
+   * @param depth - Numeric branch depth or named label.
+   * @param cond - Branch condition.
+   * @param outputs - Values returned to the destination block.
+   */
   brIf<S extends readonly unknown[]>(depth: string | number, cond: Cond, ...outputs: [...S]): void;
+  /**
+   * Emits an unconditional branch.
+   *
+   * @param depth - Numeric branch depth or named label.
+   * @param outputs - Values returned to the destination block.
+   */
   br<S extends readonly unknown[]>(depth: string | number, ...outputs: [...S]): void;
+  /**
+   * Continues the current or named loop when a condition is true.
+   *
+   * @param cond - Continue condition.
+   * @param label - Optional loop label.
+   * @param rest - Loop state values.
+   */
   continueIf(cond: Cond, label?: string, ...rest: unknown[]): void;
+  /**
+   * Breaks the current or named block when a condition is true.
+   *
+   * @param cond - Break condition.
+   * @param label - Optional block label.
+   * @param rest - Block output values.
+   */
   breakIf(cond: Cond, label?: string, ...rest: unknown[]): void;
+  /**
+   * Emits a do-while loop.
+   *
+   * @param state - Values carried through loop iterations.
+   * @param cond - Loop continuation condition.
+   * @param body - Callback that emits one loop body.
+   * @param label - Optional loop label.
+   * @returns Updated state values.
+   */
   doWhile<S extends readonly unknown[]>(
     state: [...S],
     cond: (...s: [...S]) => Cond,
@@ -330,6 +515,16 @@ export type ControlFlow = {
     body: (...s: [...S]) => S['length'] extends 0 ? [...S] | void : [...S] | S[number][],
     label?: string
   ): [...S];
+  /**
+   * Emits a for-style loop.
+   *
+   * @param state - Initial loop state values.
+   * @param cond - Loop continuation condition.
+   * @param inc - Callback that computes the next loop state.
+   * @param body - Callback that emits one loop body.
+   * @param label - Optional loop label.
+   * @returns Updated state values.
+   */
   forLoop<S extends readonly unknown[]>(
     state: [...S],
     cond: (...s: [...S]) => Cond,
@@ -344,6 +539,15 @@ export type ControlFlow = {
     body: (...s: [...S]) => S['length'] extends 0 ? [...S] | void : [...S] | S[number][],
     label?: string
   ): [...S];
+  /**
+   * Emits a counted loop whose body receives the current counter.
+   *
+   * @param state - Initial loop state values.
+   * @param cnt - Static or dynamic iteration count.
+   * @param body - Callback that emits one loop body.
+   * @param label - Optional loop label.
+   * @returns Updated state values.
+   */
   doN1<S extends readonly unknown[]>(
     state: [...S],
     cnt: N,
@@ -351,6 +555,15 @@ export type ControlFlow = {
     label?: string
   ): [...S];
   doN1<T>(state: readonly T[], cnt: N, body: (cnt: C, ...s: T[]) => T[], label?: string): T[];
+  /**
+   * Emits a counted loop with the same counter contract as `doN1`.
+   *
+   * @param state - Initial loop state values.
+   * @param cnt - Static or dynamic iteration count.
+   * @param body - Callback that emits one loop body.
+   * @param label - Optional loop label.
+   * @returns Updated state values.
+   */
   doN<S extends readonly unknown[]>(
     state: [...S],
     cnt: N,
@@ -358,6 +571,15 @@ export type ControlFlow = {
     label?: string
   ): [...S];
   doN<T>(state: readonly T[], cnt: N, body: (cnt: C, ...s: T[]) => T[], label?: string): T[];
+  /**
+   * Emits an if/else block with state threading.
+   *
+   * @param cond - Branch condition.
+   * @param state - Values carried through both branches.
+   * @param ifBody - Callback for the true branch.
+   * @param elseBody - Optional callback for the false branch.
+   * @returns Updated state values.
+   */
   ifElse<S extends readonly unknown[]>(
     cond: C,
     state: [...S],
@@ -366,18 +588,50 @@ export type ControlFlow = {
   ): [...S];
 };
 
+/** Operation helpers indexed by every supported type name. */
 export type ScopeTypes = {
   [N in TypeName]: GetOps<N>;
 };
 
-export type Flags = { nativeSIMD?: boolean; native64bit?: boolean; threads?: boolean };
+/** Feature flags active while emitting one function. */
+export type Flags = {
+  /** Native SIMD operations may be emitted. */
+  nativeSIMD?: boolean;
+  /** Native 64-bit operations may be emitted instead of lowered 32-bit pairs. */
+  native64bit?: boolean;
+  /** Threaded code generation is active. */
+  threads?: boolean;
+};
 
+/** Function callback scope used to build typed compiler IR. */
 export type Scope<M extends Segs = {}, F = {}> = {
+  /** Active compiler feature flags. */
   flags: Flags;
+  /** Typed operation helpers by type name. */
   types: ScopeTypes;
+  /**
+   * Gets operation helpers for a generic scalar family.
+   *
+   * @param t - Concrete generic type.
+   * @param lanes - Optional SIMD lane count.
+   * @returns Operation helpers for the requested generic family.
+   */
   getTypeGeneric<Fam extends TypeName, G extends Fam>(t: G, lanes?: number): GetOps<Fam, G>;
+  /**
+   * Gets operation helpers for a type.
+   *
+   * @param t - Concrete type name.
+   * @param lanes - Optional SIMD lane count.
+   * @returns Operation helpers for the requested type.
+   */
   getType<T extends TypeName>(t: T, lanes?: number): GetOps<T, unknown>;
+  /**
+   * Emits debug print values in supported targets.
+   *
+   * @param args - Strings or nested compiler values to print.
+   */
   print(...args: (string | ND<Val<any, any>>)[]): void;
+  /** Callable function registry visible from this callback. */
   functions: {
     [K in keyof F]: F[K] extends { inputs: infer In extends readonly TypeName[]; ret: infer Ret }
       ? {
@@ -386,14 +640,29 @@ export type Scope<M extends Segs = {}, F = {}> = {
         }
       : never;
   };
+  /** Typed memory access surface visible from this callback. */
   memory: MemorySurface<M>;
 } & ControlFlow;
 
 type BatchOpts = { lanes: number; perThread?: number };
 
+/** Public function return type specifier. */
 export type RetType = TypeName | readonly TypeName[] | 'void';
+const checkFnName = (name: string) => {
+  // Wrappers always expose memory and segments, so functions cannot safely use those public names.
+  if (name === 'memory' || name === 'segments') throw new Error('reserved function name: ' + name);
+};
 /**
- * A builder that accumulates memory and function definitions. Pass it to toWasm() or toJs() to generate executable code.
+ * A builder that accumulates memory and function definitions.
+ * Pass it to toWasm() or toJs() to generate executable code.
+ *
+ * @param name - Module name used in generated wrappers and imports.
+ * @example
+ * ```js
+ * const mod = new Module('demo')
+ *   .fn('zero', [], 'u32', (f) => f.types.u32.const(0));
+ * mod.clone();
+ * ```
  */
 export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
   readonly name: string;
@@ -444,6 +713,7 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
     cb?: CB,
     module?: string
   ): Module<M, F & { [P in Name]: FnDef<In, ReturnType<CB>> & { out: Out } }> {
+    checkFnName(name);
     if (this.functions[name]) throw new Error('function already exists:' + name);
     this.functions[name] = { inputs, outputs, cb, module, import: true } as any;
     return this as any;
@@ -459,6 +729,7 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
     outputs: Out,
     cb: CB
   ): Module<M, F & { [P in Name]: FnDef<In, ReturnType<CB>> }> {
+    checkFnName(name);
     if (this.functions[name]) throw new Error('function already exists:' + name);
     this.functions[name] = { inputs, outputs, cb } as any;
     return this as any;
@@ -467,8 +738,8 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
   Batched function:
   - callback looks like (s, lanes (1 or N if simd), pos, perBatchSize, ...some args)
   - can be called as (batchPos, batchLen, perBatchSize)
-  - 'perBatchSize' is how much each batch thing will do, mainly for per thread allocation. We pass it as is into
-    callback but use for per thread work allocation.
+  - 'perBatchSize' is how much each batch thing will do, mainly for per thread allocation.
+    We pass it as is into callback but use for per thread work allocation.
   */
   batchFn<
     Name extends string,
@@ -486,16 +757,17 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
     inputs: In,
     cb: CB
   ): Module<M, F & { [P in Name]: FnDef<In, ReturnType<CB>> }> {
+    checkFnName(name);
     if (this.functions[name]) throw new Error('function already exists:' + name);
-    if (!Number.isSafeInteger(opts.lanes))
+    if (!Number.isSafeInteger(opts.lanes) || opts.lanes < 1)
       throw new Error(`batch function opts: wrong lanes: ${opts.lanes}`);
     this.functions[name] = { inputs, outputs: 'void', cb, opts, batch: true } as any;
     return this as any;
   }
-  clone() {
+  clone(): Module<M, F> {
     const res = new Module(this.name);
     (res as any).functions = { ...this.functions };
     (res as any).memory = { ...this.memory };
-    return res;
+    return res as Module<M, F>;
   }
 }

@@ -6,6 +6,18 @@ import * as wasm from '../src/wasm.ts';
 describe('JS', () => {
   should('genObject', () => {
     deepStrictEqual(js.genObject({ a: { b: '3+2' } }), `{a: {b: 3+2}}`);
+    const obj = { '': '1', 'a-b': '2', 'a.b': '3', normal: '4' };
+    deepStrictEqual(Function(`return ${js.genObject(obj)}`)(), {
+      '': 1,
+      'a-b': 2,
+      'a.b': 3,
+      normal: 4,
+    });
+    const protoObj: Record<string, string> = Object.create(null);
+    protoObj.__proto__ = '7';
+    const protoParsed = Function(`return ${js.genObject(protoObj)}`)();
+    deepStrictEqual(Object.prototype.hasOwnProperty.call(protoParsed, '__proto__'), true);
+    deepStrictEqual(protoParsed.__proto__, 7);
   });
   should('isLiveAfter', () => {
     const dead = [
@@ -26,6 +38,41 @@ describe('JS', () => {
       { TAG: 'end' },
     ];
     deepStrictEqual(js.__TEST.isLiveAfter(live as any, 3, 0), true);
+  });
+  should('call tail remains live across skippable block assignment', () => {
+    const mod = {
+      functions: [
+        { name: 'seed', import: true, inputs: [], outputs: ['i32'] },
+        {
+          name: 'skip_set',
+          export: true,
+          inputs: ['i32'],
+          outputs: ['i32'],
+          locals: [{ type: 'i32', count: 1 }],
+          instructions: [
+            { TAG: 'call', data: 'seed', opts: { inputsCnt: 0, outTypes: ['i32'] } },
+            { TAG: 'local.set', data: 1n },
+            { TAG: 'block', data: 'void', hoist: [1] },
+            { TAG: 'local.get', data: 0n },
+            { TAG: 'br_if', data: 0n },
+            { TAG: 'i32.const', data: 7n },
+            { TAG: 'local.set', data: 1n },
+            { TAG: 'end' },
+            { TAG: 'local.get', data: 1n },
+            { TAG: 'end' },
+          ],
+        },
+      ],
+    };
+    const env = { seed: () => 42 };
+    const wasmMod = js.exec(js.wrapModule(mod, js.wrapWASM(mod, wasm.createWasm(mod as any)), {}), {
+      env,
+    });
+    const jsMod = js.exec(js.wrapModule(mod, js.createJS(mod as any), {}), { env });
+    deepStrictEqual(wasmMod.skip_set(1), 42);
+    deepStrictEqual(wasmMod.skip_set(0), 7);
+    deepStrictEqual(jsMod.skip_set(1), 42);
+    deepStrictEqual(jsMod.skip_set(0), 7);
   });
   should('genWASM', () => {
     return;
@@ -103,6 +150,24 @@ return { ..._exports, memory, segments };`
     for (const line of lines) deepStrictEqual(line.length > 0 && line.length <= 100, true);
     const mod = js.exec(js.wrapModule(def, raw, {}));
     deepStrictEqual(mod.add(1, 2), 3);
+  });
+  should('freeze option freezes segment chunk arrays', () => {
+    const def = { memory: { size: 32, export: true }, functions: [] };
+    const segments = {
+      data: {
+        pos: 0,
+        size: 16,
+        paddedSize: 16,
+        subRegions: { '': [0, 16, 4, 4] },
+      },
+    };
+    const code = 'const instance = { exports: { memory: { buffer: new ArrayBuffer(32) } } };';
+    const out = js.exec(js.wrapModule(def as any, code, segments as any, {}, { freeze: true }));
+    deepStrictEqual(Object.isFrozen(out), true);
+    deepStrictEqual(Object.isFrozen(out.segments), true);
+    deepStrictEqual(Object.isFrozen(out.segments.data_chunks), true);
+    out.segments.data_chunks[0][0] = 7;
+    deepStrictEqual(out.segments.data_chunks[0][0], 7);
   });
   should('dead local.set keeps atomic side effects', () => {
     const raw = js.createJS(

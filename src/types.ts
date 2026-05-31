@@ -1,3 +1,4 @@
+import type { TArg } from '@scure/base';
 import * as P from 'micro-packed';
 import { as, FnOp, toWasm, type CompilerOpts, type ModuleGraph } from './codegen.ts';
 import * as js from './js.ts';
@@ -5,8 +6,19 @@ import type { GetOps, Val } from './module.ts'; // Circular type-definitions, ya
 import { Module, struct, type RetType } from './module.ts';
 import * as utils from './utils.ts';
 
-// NOTE: separate from types for tree-shaking in runtime
-export const TypeCoders: Record<TypeName, P.CoderType<any>> = {
+const _1n = /* @__PURE__ */ BigInt(1);
+const _63n = /* @__PURE__ */ BigInt(63);
+const _64n = /* @__PURE__ */ BigInt(64);
+const I64_MASK_N = /* @__PURE__ */ BigInt(-1);
+const U64_MASK_N = /* @__PURE__ */ BigInt('0xffffffffffffffff');
+const I_MASK = -1;
+const U32_MASK = 0xffff_ffff;
+const U16_MASK = 0xffff;
+const U8_MASK = 0xff;
+
+// NOTE: separate from type metadata for tree-shaking in runtime.
+/** Binary coders for every scalar and SIMD compiler type. */
+export const TypeCoders: Record<TypeName, P.CoderType<any>> = /* @__PURE__ */ utils.deepFreeze({
   i8: P.I8,
   u8: P.U8,
   i16: P.I16LE,
@@ -83,7 +95,7 @@ export const TypeCoders: Record<TypeName, P.CoderType<any>> = {
   i64x16: /* @__PURE__ */ P.array(16, P.I64LE),
   u64x16: /* @__PURE__ */ P.array(16, P.U64LE),
   f64x16: /* @__PURE__ */ P.array(16, P.F64LE),
-};
+});
 
 // prettier-ignore
 const TYPES = {
@@ -165,86 +177,289 @@ const TYPES = {
   u256x16: { signed: false, float: false, width: 256, lanes: 16 },
 } as const;
 
+/** Open interface backing the public `TypeName` string union. */
 export interface TypeDict extends Record<keyof typeof TYPES, unknown> {}
+/** Every known compiler type name. */
 export type TypeName = keyof TypeDict;
 // Derive sets from predicates
 type LooseSet<T extends string> = Set<T> & { has(v: string): v is T };
+type ArrVal<T extends readonly unknown[]> = T[number];
+const opsCompareFloatItems = /* @__PURE__ */ (() => ['isNaN'] as const)();
+const opsCompareBaseItems = /* @__PURE__ */ (() =>
+  ['eq', 'ne', 'lt', 'gt', 'le', 'ge', 'eqz'] as const)();
+const opsBasicItems = /* @__PURE__ */ (() =>
+  [
+    'swapEndianness',
+    'add',
+    'mul',
+    'sub',
+    'div',
+    'rem',
+    'min',
+    'max',
+    ...opsCompareBaseItems,
+  ] as const)();
+const opsShiftsItems = /* @__PURE__ */ (() => ['shr', 'shl', 'rotr', 'rotl'] as const)();
+const opsIntItems = /* @__PURE__ */ (() =>
+  [
+    'and',
+    'or',
+    'xor',
+    'andnot',
+    'not',
+    'clz',
+    'ctz',
+    'popcnt',
+    ...opsShiftsItems,
+  ] as const)();
+const opsSignedItems = /* @__PURE__ */ (() => ['abs', 'neg'] as const)();
+const opsCompareItems = /* @__PURE__ */ (() =>
+  [...opsCompareBaseItems, ...opsCompareFloatItems] as const)();
+const opsFloatItems = /* @__PURE__ */ (() =>
+  [
+    'sqrt',
+    'ceil',
+    'floor',
+    'trunc',
+    'nearest',
+    'copysign',
+    ...opsCompareFloatItems,
+  ] as const)();
+const opsAtomicsItems = /* @__PURE__ */ (() => ['add', 'sub', 'and', 'or', 'xor'] as const)();
+const opsVariadicItems = /* @__PURE__ */ (() =>
+  ['add', 'mul', 'and', 'xor', 'or', 'min', 'max'] as const)();
+const ops1ArgItems = /* @__PURE__ */ (() =>
+  [
+    'swapEndianness',
+    'not',
+    'clz',
+    'ctz',
+    'popcnt',
+    'abs',
+    'neg',
+    'sqrt',
+    'ceil',
+    'floor',
+    'trunc',
+    'nearest',
+    'eqz',
+    'isNaN',
+  ] as const)();
+const ops2ArgItems = /* @__PURE__ */ (() =>
+  [
+    'and',
+    'or',
+    'xor',
+    'andnot',
+    'add',
+    'mul',
+    'sub',
+    'div',
+    'rem',
+    'min',
+    'max',
+    'copysign',
+    'eq',
+    'ne',
+    'lt',
+    'gt',
+    'le',
+    'ge',
+  ] as const)();
+type OpsCompareFloatName = ArrVal<typeof opsCompareFloatItems>;
+type OpsCompareBaseName = ArrVal<typeof opsCompareBaseItems>;
+/** Basic arithmetic and comparison operation name union. */
+export type OpsBasic = ArrVal<typeof opsBasicItems>;
+/** Shift and rotate operation name union. */
+export type OpsShifts = ArrVal<typeof opsShiftsItems>;
+/** Integer-only operation name union. */
+export type OpsInt = ArrVal<typeof opsIntItems>;
+/** Signed-number operation name union. */
+export type OpsSigned = ArrVal<typeof opsSignedItems>;
+/** Comparison operation name union. */
+export type OpsCompare = ArrVal<typeof opsCompareItems>;
+/** Floating-point-only operation name union. */
+export type OpsFloat = ArrVal<typeof opsFloatItems>;
+/** Atomic read-modify-write operation name union. */
+export type OpsAtomics = ArrVal<typeof opsAtomicsItems>;
+/** Variadic operation name union. */
+export type OpsVariadic = ArrVal<typeof opsVariadicItems>;
+/** Unary operation name union. */
+export type Ops1Arg = ArrVal<typeof ops1ArgItems>;
+/** Binary operation name union. */
+export type Ops2Arg = ArrVal<typeof ops2ArgItems>;
 const filter = <K extends TypeName>(pred: (d: (typeof TYPES)[K]) => boolean): LooseSet<K> =>
-  new Set(
-    Object.entries(TYPES)
-      .filter(([_, d]) => pred(d as any))
-      .map(([k]) => k)
+  utils.deepFreeze(
+    new Set(
+      Object.entries(TYPES)
+        .filter(([_, d]) => pred(d as any))
+        .map(([k]) => k)
+    )
   ) as any;
 type FilterKeys<T, P> = { [K in keyof T]: T[K] extends P ? K : never }[keyof T];
+/** Type names whose lane width is 32 bits. */
 export type Width32 = FilterKeys<typeof TYPES, { width: 32 }>;
+/** Type names whose lane width is 32 bits. */
 export const Width32 = /* @__PURE__ */ filter((d) => d.width === 32) as LooseSet<Width32>;
+/** Type names whose lane width is 16 bits. */
 export type Width16 = FilterKeys<typeof TYPES, { width: 16 }>;
+/** Type names whose lane width is 16 bits. */
 export const Width16 = /* @__PURE__ */ filter((d) => d.width === 16) as LooseSet<Width16>;
+/** Type names whose lane width is 8 bits. */
 export type Width8 = FilterKeys<typeof TYPES, { width: 8 }>;
+/** Type names whose lane width is 8 bits. */
 export const Width8 = /* @__PURE__ */ filter((d) => d.width === 8) as LooseSet<Width8>;
+/** Type names whose lane width is 64 bits. */
 export type Width64 = FilterKeys<typeof TYPES, { width: 64 }>;
 
+/** Type names whose lane width is 64 bits. */
 export const Width64 = /* @__PURE__ */ filter((d) => d.width === 64) as LooseSet<Width64>;
+/** Scalar type names with exactly one lane. */
 export type ScalarType = FilterKeys<typeof TYPES, { lanes: 1 }>;
+/** Scalar type names with exactly one lane. */
 export const ScalarType = /* @__PURE__ */ filter((d) => d.lanes === 1) as LooseSet<ScalarType>;
+/** SIMD type names with more than one lane. */
 export type SIMDType = Exclude<TypeName, ScalarType>;
+/** SIMD type names with more than one lane. */
 export const SIMDType = /* @__PURE__ */ filter((d) => d.lanes > 1) as LooseSet<SIMDType>;
+/** Floating-point type names. */
 export type FloatType = FilterKeys<typeof TYPES, { float: true }>;
+/** Floating-point type names. */
 export const FloatType = /* @__PURE__ */ filter((d) => d.float) as LooseSet<FloatType>;
+/** Integer type names. */
 export type IntType = FilterKeys<typeof TYPES, { float: false }>;
+/** Integer type names. */
 export const IntType = /* @__PURE__ */ filter((d) => !d.float) as LooseSet<IntType>;
+/** Signed type names. */
 export type SignedType = FilterKeys<typeof TYPES, { signed: true }>;
+/** Signed type names. */
 export const SignedType = /* @__PURE__ */ filter((d) => d.signed) as LooseSet<SignedType>;
+/** Unsigned type names. */
 export type UnsignedType = FilterKeys<typeof TYPES, { signed: false }>;
+/** Unsigned type names. */
 export const UnsignedType = /* @__PURE__ */ filter((d) => !d.signed) as LooseSet<UnsignedType>;
+/** 128-bit and 256-bit integer type names. */
 export type BigIntType = FilterKeys<typeof TYPES, { float: false; width: 128 | 256 }>;
+/** 128-bit and 256-bit integer type names. */
 export const BigIntType = /* @__PURE__ */ filter(
   (d) => !d.float && (d.width === 128 || d.width === 256)
 ) as LooseSet<BigIntType>;
+/** Scalar 128-bit and 256-bit integer type names. */
 export type BigIntScalarType = Extract<BigIntType, ScalarType>;
+/** Scalar 128-bit and 256-bit integer type names. */
 export const BigIntScalarType = /* @__PURE__ */ filter(
   (d) => d.lanes === 1 && !d.float && (d.width === 128 || d.width === 256)
 ) as LooseSet<BigIntScalarType>;
+/** Scalar and SIMD integer type names narrower than 32 bits. */
 export type SmallIntType = FilterKeys<typeof TYPES, { float: false; width: 8 | 16 }>;
+/** Scalar and SIMD integer type names narrower than 32 bits. */
 export const SmallIntType = /* @__PURE__ */ filter(
   (d) => !d.float && (d.width === 8 || d.width === 16)
 ) as LooseSet<SmallIntType>;
 // Build the public name list through a pure call so single-export bundles can drop it when unused.
-export const TypeName = /* @__PURE__ */ Object.keys(TYPES).filter(
-  (k) => !BigIntType.has(k as TypeName)
-) as TypeName[];
+/** Runtime list of non-bigint type names used by generators. */
+export const TypeName: TypeName[] = /* @__PURE__ */ (() =>
+  utils.deepFreeze(Object.keys(TYPES).filter((k) => !BigIntType.has(k as TypeName)) as TypeName[]))();
 
+/** Scalar lane type extracted from a scalar or SIMD type name. */
 export type ScalarOf<N extends TypeName> = N extends `${infer P}x${number}`
   ? Extract<P, TypeName>
   : N;
-export const ScalarOf = <T extends TypeName>(t: T) => t.split('x')[0] as ScalarOf<T>;
+/**
+ * Returns the scalar lane type for a scalar or SIMD type name.
+ *
+ * @param t - Type name to inspect.
+ * @returns Scalar lane type name.
+ * @example
+ * ```js
+ * ScalarOf('u32x4');
+ * ```
+ */
+export const ScalarOf = <T extends TypeName>(t: T): ScalarOf<T> => t.split('x')[0] as ScalarOf<T>;
 
+/** SIMD lane count extracted from a type name. */
 export type LanesOf<N extends TypeName> = N extends `${string}x${infer L extends number}`
   ? L extends number
     ? L
     : never
   : 1;
 
-export function lanesOf(type: TypeName) {
+/**
+ * Returns the lane count for a scalar or SIMD type name.
+ *
+ * @param type - Type name to inspect.
+ * @returns Number of lanes, with scalars returning `1`.
+ * @example
+ * ```js
+ * lanesOf('u32x4');
+ * ```
+ */
+export function lanesOf(type: TypeName): 1 | 2 | 4 | 8 | 16 {
   if (type.endsWith('x16')) return 16;
   if (type.endsWith('x8')) return 8;
   if (type.endsWith('x4')) return 4;
   if (type.endsWith('x2')) return 2;
   return 1;
 }
-export const sizeof = (type: TypeName) => {
+
+/**
+ * Returns the byte size of one value of a type.
+ *
+ * @param type - Type name to inspect.
+ * @returns Byte size including all lanes for SIMD types.
+ * @example
+ * ```js
+ * sizeof('u32x4');
+ * ```
+ */
+export const sizeof = (type: TypeName): number => {
   // Required in runtime, otherwise would be: return TypeCoders[type].size!;
   return (TYPES[type].width / 8) * lanesOf(type);
 };
-export const addLanes = (type: TypeName, lanes: number) =>
+
+/**
+ * Adds a lane suffix to a scalar type, leaving SIMD types unchanged.
+ *
+ * @param type - Scalar or SIMD type name.
+ * @param lanes - Lane count to add to scalar types.
+ * @returns SIMD type name.
+ * @example
+ * ```js
+ * addLanes('u32', 4);
+ * ```
+ */
+export const addLanes = (type: TypeName, lanes: number): SIMDType =>
   (ScalarType.has(type) ? `${type}x${lanes}` : type) as SIMDType;
-export const minSimdType = (type: TypeName) =>
+
+/**
+ * Returns the smallest native-width SIMD type for a scalar lane type.
+ *
+ * @param type - Scalar or SIMD type name.
+ * @returns SIMD type with at least 128-bit total width.
+ * @example
+ * ```js
+ * minSimdType('u32');
+ * ```
+ */
+export const minSimdType = (type: TypeName): SIMDType =>
   addLanes(
     type,
     TYPES[type].width === 64 ? 2 : TYPES[type].width === 32 ? 4 : TYPES[type].width === 16 ? 8 : 16
   ) as SIMDType;
-export const normSignedness = (t: TypeName) => t.replace('u', 'i');
 
+/**
+ * Normalizes unsigned integer type names to their signed-width equivalent.
+ *
+ * @param t - Type name to normalize.
+ * @returns Type name with an `i` prefix for integer widths.
+ * @example
+ * ```js
+ * normSignedness('u32x4');
+ * ```
+ */
+export const normSignedness = (t: TypeName): TypeName => t.replace('u', 'i') as TypeName;
+
+/** Mask result type for comparisons over a source type. */
 export type MaskType<T extends TypeName> = T extends SIMDType
   ? Extract<
       `${T extends Width64
@@ -257,112 +472,51 @@ export type MaskType<T extends TypeName> = T extends SIMDType
       TypeName
     >
   : 'u32';
-export const maskType = (type: TypeName) => {
-  if (!SIMDType.has(type)) return 'u32';
-  if (Width64.has(type)) return addLanes('u64', lanesOf(type));
-  if (Width32.has(type)) return addLanes('u32', lanesOf(type));
-  if (Width16.has(type)) return addLanes('u16', lanesOf(type));
-  return addLanes('u8', lanesOf(type));
+
+/**
+ * Returns the comparison mask type for a source type.
+ *
+ * @param type - Source type name.
+ * @returns `u32` for scalars or lane-matched unsigned SIMD mask type.
+ * @example
+ * ```js
+ * maskType('i16x8');
+ * ```
+ */
+export const maskType = <T extends TypeName>(type: T): MaskType<T> => {
+  if (!SIMDType.has(type)) return 'u32' as MaskType<T>;
+  if (Width64.has(type)) return addLanes('u64', lanesOf(type)) as MaskType<T>;
+  if (Width32.has(type)) return addLanes('u32', lanesOf(type)) as MaskType<T>;
+  if (Width16.has(type)) return addLanes('u16', lanesOf(type)) as MaskType<T>;
+  return addLanes('u8', lanesOf(type)) as MaskType<T>;
 };
 
 const defSet = <const T extends readonly string[]>(arr: T): LooseSet<T[number]> =>
-  new Set(arr) as LooseSet<T[number]>;
-const opsCompareFloat = /* @__PURE__ */ defSet(['isNaN'] as const);
-const opsCompareBase = /* @__PURE__ */ defSet(['eq', 'ne', 'lt', 'gt', 'le', 'ge', 'eqz'] as const);
-export const opsBasic = /* @__PURE__ */ defSet([
-  'swapEndianness',
-  'add',
-  'mul',
-  'sub',
-  'div',
-  'rem',
-  'min',
-  'max',
-  ...opsCompareBase,
-] as const);
-export const opsShifts = /* @__PURE__ */ defSet(['shr', 'shl', 'rotr', 'rotl'] as const);
-export const opsInt = /* @__PURE__ */ defSet([
-  'and',
-  'or',
-  'xor',
-  'andnot',
-  'not',
-  'clz',
-  'ctz',
-  'popcnt',
-  ...opsShifts,
-] as const);
-export const opsSigned = /* @__PURE__ */ defSet(['abs', 'neg'] as const);
-export const opsCompare = /* @__PURE__ */ defSet([...opsCompareBase, ...opsCompareFloat] as const);
-export const opsFloat = /* @__PURE__ */ defSet([
-  'sqrt',
-  'ceil',
-  'floor',
-  'trunc',
-  'nearest',
-  'copysign',
-  ...opsCompareFloat,
-] as const);
-export const opsAtomics = /* @__PURE__ */ defSet(['add', 'sub', 'and', 'or', 'xor'] as const);
-// Arity
-export const opsVariadic = /* @__PURE__ */ defSet([
-  'add',
-  'mul',
-  'and',
-  'xor',
-  'or',
-  'min',
-  'max',
-] as const);
-export const ops1Arg = /* @__PURE__ */ defSet([
-  'swapEndianness',
-  'not',
-  'clz',
-  'ctz',
-  'popcnt',
-  'abs',
-  'neg',
-  'sqrt',
-  'ceil',
-  'floor',
-  'trunc',
-  'nearest',
-  'eqz',
-  'isNaN',
-] as const);
-export const ops2Arg = /* @__PURE__ */ defSet([
-  'and',
-  'or',
-  'xor',
-  'andnot',
-  'add',
-  'mul',
-  'sub',
-  'div',
-  'rem',
-  'min',
-  'max',
-  'copysign',
-  'eq',
-  'ne',
-  'lt',
-  'gt',
-  'le',
-  'ge',
-] as const);
+  utils.deepFreeze(new Set(arr)) as LooseSet<T[number]>;
+const opsCompareFloat: LooseSet<OpsCompareFloatName> = /* @__PURE__ */ defSet(opsCompareFloatItems);
+const opsCompareBase: LooseSet<OpsCompareBaseName> = /* @__PURE__ */ defSet(opsCompareBaseItems);
+/** Basic arithmetic and comparison operation names. */
+export const opsBasic: LooseSet<OpsBasic> = /* @__PURE__ */ defSet(opsBasicItems);
+/** Shift and rotate operation names. */
+export const opsShifts: LooseSet<OpsShifts> = /* @__PURE__ */ defSet(opsShiftsItems);
+/** Integer-only operation names. */
+export const opsInt: LooseSet<OpsInt> = /* @__PURE__ */ defSet(opsIntItems);
+/** Signed-number operation names. */
+export const opsSigned: LooseSet<OpsSigned> = /* @__PURE__ */ defSet(opsSignedItems);
+/** Comparison operation names. */
+export const opsCompare: LooseSet<OpsCompare> = /* @__PURE__ */ defSet(opsCompareItems);
+/** Floating-point-only operation names. */
+export const opsFloat: LooseSet<OpsFloat> = /* @__PURE__ */ defSet(opsFloatItems);
+/** Atomic read-modify-write operation names. */
+export const opsAtomics: LooseSet<OpsAtomics> = /* @__PURE__ */ defSet(opsAtomicsItems);
+/** Variadic operation names. */
+export const opsVariadic: LooseSet<OpsVariadic> = /* @__PURE__ */ defSet(opsVariadicItems);
+/** Unary operation names. */
+export const ops1Arg: LooseSet<Ops1Arg> = /* @__PURE__ */ defSet(ops1ArgItems);
+/** Binary operation names. */
+export const ops2Arg: LooseSet<Ops2Arg> = /* @__PURE__ */ defSet(ops2ArgItems);
 
-// Derive types
-type SetOf<S> = S extends LooseSet<infer T> ? T : never;
-export type OpsBasic = SetOf<typeof opsBasic>;
-export type OpsShifts = SetOf<typeof opsShifts>;
-export type OpsInt = SetOf<typeof opsInt>;
-export type OpsSigned = SetOf<typeof opsSigned>;
-export type OpsCompare = SetOf<typeof opsCompare>;
-export type OpsFloat = SetOf<typeof opsFloat>;
-export type OpsAtomics = SetOf<typeof opsAtomics>;
-export type OpsVariadic = SetOf<typeof opsVariadic>;
-export type Ops1Arg = SetOf<typeof ops1Arg>;
-export type Ops2Arg = SetOf<typeof ops2Arg>;
+/** Any supported non-atomic operation name. */
 export type OpName = OpsBasic | OpsShifts | OpsInt | OpsSigned | OpsCompare | OpsFloat;
 
 type OpsForType<T extends TypeName> =
@@ -371,7 +525,16 @@ type OpsForType<T extends TypeName> =
   | (T extends SignedType ? OpsSigned : never)
   | (T extends IntType ? OpsInt : never);
 
-// Runtime
+/**
+ * Returns operation names valid for a type.
+ *
+ * @param type - Type whose operation set is requested.
+ * @returns Set of valid operation names for that type.
+ * @example
+ * ```js
+ * opsForType('u32');
+ * ```
+ */
 export function opsForType<T extends TypeName>(type: T): LooseSet<OpsForType<T>> {
   const sets: LooseSet<string>[] = [opsBasic, opsCompareBase];
   if (FloatType.has(type)) sets.push(opsFloat, opsCompareFloat);
@@ -389,6 +552,7 @@ type SigForOp<O extends OpName, V, Shift, Mask> =
   O extends Ops1Arg ? (a: V) => SigRetForOp<O, V, Mask> :
   never;
 
+/** Operation function signatures specialized for a value representation. */
 export type OpsFnForType<T extends TypeName, V, Shift, Mask> = {
   [K in OpsForType<T>]: SigForOp<K, V, Shift, Mask>;
 };
@@ -401,12 +565,60 @@ function checkType(fn: ModuleGraph, type: TypeName, op: FnOp) {
   }
 }
 
-export const SIMDUtils = {
+type SIMDZip = { encode(values: FnOp[]): FnOp[]; decode(values: FnOp[]): FnOp[] };
+type SIMDMaskPair = { even: number[]; odd: number[] };
+type SIMDMasks = {
+  '64x2': SIMDMaskPair & { identity: number[]; reverse: number[]; reverseBytes: number[] };
+  '32x4': SIMDMaskPair & {
+    interleave: { low: number[]; high: number[] };
+    reverse: number[];
+    transpose: SIMDMaskPair;
+    reverseBytes: number[];
+  };
+  '16x8': SIMDMaskPair & {
+    interleave: { low: number[]; high: number[] };
+    transpose: SIMDMaskPair;
+    reverse: number[];
+    reverseBytes: number[];
+  };
+  '8x16': SIMDMaskPair & {
+    interleave: { low: number[]; high: number[] };
+    transpose: SIMDMaskPair;
+  };
+};
+type SIMDUtilsAPI = {
+  checkLane(lanes: number, lane: number): number;
+  checkShufflePattern(bytes: number, pattern: number[]): number[];
+  shuffleLanes(laneSize: number, pattern: number[], bytes?: number): number[];
+  MASKS: SIMDMasks;
+  zip32(f: GetOpsFnOp<SIMDType>): SIMDZip;
+  zip64Single(f: GetOpsFnOp<SIMDType>, v: FnOp[]): FnOp[];
+  zip64(f: GetOpsFnOp<SIMDType>): SIMDZip;
+  zipPow2(f: GetOpsFnOp<SIMDType>, masks: SIMDMaskPair): SIMDZip;
+  getZip(f: GetOpsFnOp<SIMDType>): SIMDZip;
+  interleaveStream(f: GetOpsFnOp<SIMDType>): SIMDZip;
+};
+/** Shared SIMD lane, shuffle, and interleave helpers used by codegen and rewrites. */
+export const SIMDUtils: SIMDUtilsAPI = /* @__PURE__ */ utils.deepFreeze({
+  checkLane: (lanes: number, lane: number) => {
+    if (!Number.isSafeInteger(lane) || lane < 0 || lane >= lanes)
+      throw new Error(`invalid SIMD lane: ${lane} not in [0, ${lanes})`);
+    return lane;
+  },
+  checkShufflePattern: (bytes: number, pattern: number[]) => {
+    if (pattern.length !== bytes)
+      throw new Error(`invalid SIMD shuffle pattern length: ${pattern.length}, expected ${bytes}`);
+    for (const i of pattern) SIMDUtils.checkLane(bytes * 2, i);
+    return pattern;
+  },
   // Convert lane pattern to byte pattern
-  shuffleLanes: (laneSize: number, pattern: number[]) => {
-    // swizzle takes 2 args, so 2 * v128.size = 2*16 = 32
-    const x = utils.chunks(utils.seq(32), laneSize);
-    return pattern.flatMap((i) => x[i]);
+  shuffleLanes: (laneSize: number, pattern: number[], bytes = 32) => {
+    // Default is two v128 inputs: 2 * v128.size = 2 * 16 = 32 bytes.
+    const x = utils.chunks(utils.seq(bytes), laneSize);
+    return pattern.flatMap((i) => {
+      SIMDUtils.checkLane(x.length, i);
+      return x[i];
+    });
   },
   MASKS: {
     '64x2': {
@@ -549,11 +761,51 @@ export const SIMDUtils = {
       return out;
     },
   }),
-};
+});
 
+/**
+ * Reinterprets a signed 32-bit value as unsigned.
+ *
+ * @param x - Number or bigint to wrap to 32 bits.
+ * @returns Unsigned 32-bit bigint.
+ * @example
+ * ```js
+ * i32ToU32(-1);
+ * ```
+ */
 export const i32ToU32 = (x: number | bigint): bigint => BigInt.asUintN(32, BigInt(x));
+/**
+ * Reinterprets a signed 64-bit value as unsigned.
+ *
+ * @param x - Number or bigint to wrap to 64 bits.
+ * @returns Unsigned 64-bit bigint.
+ * @example
+ * ```js
+ * i64ToU64(-1n);
+ * ```
+ */
 export const i64ToU64 = (x: number | bigint): bigint => BigInt.asUintN(64, BigInt(x));
+/**
+ * Reinterprets an unsigned 32-bit value as signed.
+ *
+ * @param x - Number or bigint to wrap to 32 bits.
+ * @returns Signed 32-bit bigint.
+ * @example
+ * ```js
+ * u32ToI32(0xffff_ffff);
+ * ```
+ */
 export const u32ToI32 = (x: number | bigint): bigint => BigInt.asIntN(32, BigInt(x));
+/**
+ * Reinterprets an unsigned 64-bit value as signed.
+ *
+ * @param x - Number or bigint to wrap to 64 bits.
+ * @returns Signed 64-bit bigint.
+ * @example
+ * ```js
+ * u64ToI64(0xffff_ffff_ffff_ffffn);
+ * ```
+ */
 export const u64ToI64 = (x: number | bigint): bigint => BigInt.asIntN(64, BigInt(x));
 
 function checkInterleave(type: TypeName, values: FnOp[]) {
@@ -567,6 +819,7 @@ function checkInterleave(type: TypeName, values: FnOp[]) {
 type MapVals<A extends readonly unknown[], To> = { [I in keyof A]: ReplaceVal<A[I], To> };
 
 // prettier-ignore
+/** Replaces branded compiler values inside a type with another representation. */
 export type ReplaceVal<T, To> =
   T extends Val<any, any> ? To :   // replace branded value type
   T extends (...args: infer A) => infer R ? (...args: MapVals<A, To>) => ReplaceVal<R, To> : // functions
@@ -575,6 +828,7 @@ export type ReplaceVal<T, To> =
   T extends object ? { [K in keyof T]: ReplaceVal<T[K], To> } : // objects
   T; // primitives
 
+/** Operation helper surface specialized to raw `FnOp` values. */
 export type GetOpsFnOp<T extends TypeName> = ReplaceVal<GetOps<T>, FnOp>;
 function genType<T extends TypeName>(fn: ModuleGraph, name: T): GetOpsFnOp<T> {
   const lanes = lanesOf(name);
@@ -586,7 +840,8 @@ function genType<T extends TypeName>(fn: ModuleGraph, name: T): GetOpsFnOp<T> {
       if ((Width64.has(name) && IntType.has(name)) || isBig) value = BigInt(value);
       else {
         value = Number(value);
-        if (FloatType.has(name)) value = Math.fround(value);
+        // Keep f64 constants at JS double precision; only f32 lanes are rounded before encoding.
+        if (FloatType.has(name) && Width32.has(name)) value = Math.fround(value);
       }
       const bytes = coder.encode(SIMDType.has(name) ? new Array(lanes).fill(value) : value);
       return fn.op(name, 'const', [], { value: SIMDType.has(name) ? bytes : value, type: name });
@@ -678,10 +933,12 @@ function genType<T extends TypeName>(fn: ModuleGraph, name: T): GetOpsFnOp<T> {
       },
       splat: (lhs: FnOp) => fn.op(name, 'splat', [lhs]),
       shuffle: (lhs: FnOp, rhs: FnOp, pattern: number[]) =>
-        fn.op(name, 'shuffle', [lhs, rhs], { pattern }),
+        fn.op(name, 'shuffle', [lhs, rhs], {
+          pattern: SIMDUtils.checkShufflePattern(sizeof(name), pattern),
+        }),
       // per lane shuffle (easier to read)
       shuffleLanes: (lhs: FnOp, rhs: FnOp, pattern: number[]) =>
-        res.shuffle(lhs, rhs, SIMDUtils.shuffleLanes(laneCoder.size!, pattern)),
+        res.shuffle(lhs, rhs, SIMDUtils.shuffleLanes(laneCoder.size!, pattern, sizeof(name) * 2)),
       swizzle: (lhs: FnOp, mask: FnOp) => fn.op(name, 'swizzle', [lhs, mask]),
       interleave: (values: FnOp[]) => interleave.encode(checkInterleave(name, values)),
       deinterleave: (values: FnOp[]) => interleave.decode(checkInterleave(name, values)),
@@ -692,9 +949,12 @@ function genType<T extends TypeName>(fn: ModuleGraph, name: T): GetOpsFnOp<T> {
           Array.from({ length: lanes }, (_, i) => (i + (((k % lanes) + lanes) % lanes)) % lanes)
         ),
       ror: (v: FnOp, k: number) => res['rol'](v, (lanes - (k % lanes)) % lanes),
-      extractLane: (lhs: FnOp, lane: number) => fn.op(name, 'extract_lane', [lhs], { lane }),
+      extractLane: (lhs: FnOp, lane: number) =>
+        fn.op(name, 'extract_lane', [lhs], { lane: SIMDUtils.checkLane(lanes, lane) }),
       replaceLane: (lhs: FnOp, lane: number, laneValue: FnOp) =>
-        fn.op(name, 'replace_lane', [lhs, laneValue], { lane }),
+        fn.op(name, 'replace_lane', [lhs, laneValue], {
+          lane: SIMDUtils.checkLane(lanes, lane),
+        }),
       /*
 Pairwise reductions:
 t1 = shuffle1([a,b,c,d])         // [b,*,d,*]
@@ -707,15 +967,34 @@ final = op(t2, t3)               // (a⊕b) ⊕ (c⊕d)
   return res as GetOpsFnOp<T>;
 }
 
-export function getMask(type: TypeName) {
-  if (type === 'i64') return -1n;
-  else if (type === 'u64') return 0xffff_ffff_ffff_ffffn;
-  else if (type === 'i32') return -1;
-  else if (type === 'u32') return 0xffff_ffff;
-  else if (type === 'i16') return -1;
-  else if (type === 'u16') return 0xffff;
-  else if (type === 'i8') return -1;
-  else if (type === 'u8') return 0xff;
+/**
+ * Returns an all-ones scalar mask for integer scalar types.
+ *
+ * @param type - Integer scalar type name.
+ * @returns JavaScript number or bigint mask matching the type width.
+ * @throws If the type is not an implemented integer scalar. {@link Error}
+ * @example
+ * ```js
+ * getMask('u32');
+ * ```
+ */
+export function getMask(
+  type: TypeName
+):
+  | typeof I64_MASK_N
+  | typeof U64_MASK_N
+  | typeof I_MASK
+  | typeof U32_MASK
+  | typeof U16_MASK
+  | typeof U8_MASK {
+  if (type === 'i64') return I64_MASK_N;
+  else if (type === 'u64') return U64_MASK_N;
+  else if (type === 'i32') return I_MASK;
+  else if (type === 'u32') return U32_MASK;
+  else if (type === 'i16') return I_MASK;
+  else if (type === 'u16') return U16_MASK;
+  else if (type === 'i8') return I_MASK;
+  else if (type === 'u8') return U8_MASK;
   else throw new Error('not implemented');
 }
 
@@ -1134,6 +1413,20 @@ function genSIMDMask<T extends TypeName>(f: ModuleGraph, typeName: T): GetOpsFnO
   return res as GetOpsFnOp<T>;
 }
 type AllTypes = { [K in TypeName]: GetOpsFnOp<K> };
+/**
+ * Creates operation helpers for every compiler type in one function graph.
+ *
+ * @param fn - Function graph that receives generated operations.
+ * @returns Operation helper table by type name.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { genTypes } from '@awasm/compiler/types.js';
+ *
+ * genTypes(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
+ */
 export function genTypes(fn: ModuleGraph): AllTypes {
   const res: Record<string, any> = {};
   for (const type of ScalarType) {
@@ -1158,7 +1451,9 @@ export function genTypes(fn: ModuleGraph): AllTypes {
   return res as AllTypes;
 }
 
+/** Result type returned by `genTypes`. */
 export type TypesRes = ReturnType<typeof genTypes>;
+/** Value types supported by the raw Wasm backend. */
 export type WasmType =
   | 'i32'
   | 'i64'
@@ -1171,25 +1466,62 @@ export type WasmType =
   | 'f64x2'
   | 'i8x16'
   | 'i16x8';
+/** Core Wasm value type used after compiler type normalization. */
+export type WasmValueType = 'i32' | 'i64' | 'f32' | 'f64' | 'v128';
 
-export function normType(type: TypeName) {
+/**
+ * Normalizes compiler type names to core Wasm value types.
+ *
+ * @param type - Compiler type name.
+ * @returns Wasm value type name used in function signatures.
+ * @throws If a bigint-only type cannot be represented by this backend. {@link Error}
+ * @example
+ * ```js
+ * normType('u32');
+ * ```
+ */
+export function normType(type: TypeName): WasmValueType {
   if (SIMDType.has(type)) return 'v128';
   if (BigIntType.has(type)) throw new Error(`normType(${type}): big-int not supported in codegen`);
   if (['i8', 'u8', 'i16', 'u16'].includes(type)) return 'i32';
   if (type === 'u32') return 'i32';
   if (type === 'u64') return 'i64';
-  return type;
+  return type as WasmValueType;
 }
 
-export function normRetType(type: RetType) {
+/**
+ * Normalizes a public return type specifier into Wasm result types.
+ *
+ * @param type - Return type specifier.
+ * @returns Zero or more Wasm result type names.
+ * @example
+ * ```js
+ * normRetType(['u32', 'f64']);
+ * ```
+ */
+export function normRetType(type: RetType): WasmValueType[] {
   if (type === 'void') return [];
   return (Array.isArray(type) ? type : [type]).map((i) => normType(i));
 }
 
 /**
- * Per node return types based on operation
+ * Computes the compiler type returned by an operation node.
+ *
+ * @param f - Function graph that owns the operation.
+ * @param op - Operation handle whose return type is inspected.
+ * @returns Compiler type name returned by the operation.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { nodeRetType } from '@awasm/compiler/types.js';
+ *
+ * const graph = new ModuleGraph('demo', {}, new Module('demo'), {});
+ * const op = graph.op('u32', 'const', [], { value: 0, type: 'u32' });
+ * nodeRetType(graph, op);
+ * ```
  */
-export function nodeRetType(f: ModuleGraph, op: FnOp) {
+export function nodeRetType(f: ModuleGraph, op: FnOp): TypeName {
   const node = as(f.ops.get(op.idx), 'op');
   let res = node.type;
   if (opsCompare.has(node.op)) return maskType(node.type);
@@ -1203,9 +1535,16 @@ export function nodeRetType(f: ModuleGraph, op: FnOp) {
 }
 
 /**
- * Main module with per operation functions for 'runtime.ts'
+ * Builds the helper module used by runtime type operations.
+ *
+ * @param opts - Options controlling conversion and cast helper generation.
+ * @returns Module containing per-operation runtime helper functions.
+ * @example
+ * ```js
+ * genRuntimeTypeMod({ conversions: false });
+ * ```
  */
-export function genRuntimeTypeMod(opts: { conversions?: boolean; casts?: boolean } = {}) {
+export function genRuntimeTypeMod(opts: { conversions?: boolean; casts?: boolean } = {}): Module {
   const conversions = opts.conversions !== false;
   const casts = opts.casts !== false;
   const mod = new Module('runtimeTypes');
@@ -1267,19 +1606,26 @@ export function genRuntimeTypeMod(opts: { conversions?: boolean; casts?: boolean
   return mod;
 }
 
-export const TYPE_MOD_OPTS: CompilerOpts = {
+/** Compiler options used for the runtime type helper module. */
+export const TYPE_MOD_OPTS: CompilerOpts = /* @__PURE__ */ utils.deepFreeze({
   lowerPatternJS: true,
   lowerU64Arg: true,
   lowerSmallInt: true,
   jsOutObject: true,
-};
+});
 
 // this allows us to do constant folding and stuff
 let runtimeTypesCache: any;
 /**
- * Generate small per operation functions which can be used for constant folding in optimizer
+ * Generates executable runtime type helpers for optimizer constant folding.
+ *
+ * @returns Cached runtime type helper object.
+ * @example
+ * ```js
+ * genRuntimeTypes();
+ * ```
  */
-export function genRuntimeTypes() {
+export function genRuntimeTypes(): any {
   if (runtimeTypesCache) return runtimeTypesCache;
   const m = genRuntimeTypeMod({ conversions: false, casts: false });
   // Low level stuff
@@ -1343,8 +1689,8 @@ export function genRuntimeTypes() {
         // Match wasm BigInt64 readback in tests: return signed BigInt for both i64/u64.
         tRes[opName] = (a: any, b: any) => {
           const aa = BigInt(a);
-          const bb = BigInt(b) & 63n;
-          const mask = (1n << 64n) - 1n;
+          const bb = BigInt(b) & _63n;
+          const mask = (_1n << _64n) - _1n;
           const u = BigInt.asUintN(64, aa);
           if (opName === 'shl') {
             const res = BigInt.asUintN(64, u << bb);
@@ -1354,8 +1700,8 @@ export function genRuntimeTypes() {
             if (typeName === 'u64') return BigInt.asIntN(64, BigInt.asUintN(64, u >> bb));
             return BigInt.asIntN(64, BigInt.asIntN(64, aa) >> bb);
           }
-          const rot = opName === 'rotl' ? bb : (64n - bb) & 63n;
-          const res = BigInt.asUintN(64, ((u << rot) | (u >> ((64n - rot) & 63n))) & mask);
+          const rot = opName === 'rotl' ? bb : (_64n - bb) & _63n;
+          const res = BigInt.asUintN(64, ((u << rot) | (u >> ((_64n - rot) & _63n))) & mask);
           return BigInt.asIntN(64, res);
         };
         continue;
@@ -1420,7 +1766,13 @@ export function genRuntimeTypes() {
     const mSimdWasm = js.exec(toWasm(mSimd, { optimize: false }));
     const tRes: any = {};
     // we cannot use vectorized stuff in args, so we have to write them to buffer
-    function call(opName: string, a?: Uint8Array, b?: Uint8Array, c?: Uint8Array) {
+    function call(
+      opName: string,
+      a?: TArg<Uint8Array>,
+      b?: TArg<Uint8Array>,
+      c?: TArg<Uint8Array>,
+      shift?: number
+    ) {
       const A = mSimdWasm.segments[`state_${typeName}.A`];
       const B = mSimdWasm.segments[`state_${typeName}.B`];
       const C = mSimdWasm.segments[`state_${typeName}.C`];
@@ -1428,13 +1780,18 @@ export function genRuntimeTypes() {
       if (a) A.set(a);
       if (b) B.set(b);
       if (c) C.set(c);
-      mSimdWasm[`${typeName}_${opName}`]();
+      // Shift count is scalar, unlike vector operands stored in helper memory.
+      if (shift === undefined) mSimdWasm[`${typeName}_${opName}`]();
+      else mSimdWasm[`${typeName}_${opName}`](shift);
       return D.slice();
     }
     for (const op of opsForType(typeName)) {
-      if (opsVariadic.has(op) || ops2Arg.has(op))
+      if (opsShifts.has(op))
+        tRes[op] = (value: TArg<Uint8Array>, shift: number) =>
+          call(op, value, undefined, undefined, shift);
+      else if (opsVariadic.has(op) || ops2Arg.has(op))
         tRes[op] = (...args: any) => args.reduce((acc: any, i: any) => call(op, acc, i));
-      else if (ops1Arg) tRes[op] = (...args: any) => call(op, args[0]);
+      else if (ops1Arg.has(op)) tRes[op] = (...args: any) => call(op, args[0]);
     }
     tRes.swizzle = (...args: any) => call('swizzle', args[0], args[1]);
     return tRes;

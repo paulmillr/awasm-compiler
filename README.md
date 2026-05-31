@@ -28,9 +28,9 @@ Auditable js-to-wasm compiler, focusing on ultra-high performance & security.
 > `npm install @awasm/compiler`
 
 ```typescript
-import { Module, array } from '@awasm/module.js';
-import { toWasm, toJs } from '@awasm/codegen.js';
-import * as js from '@awasm/js.js';
+import { Module, array } from '@awasm/compiler/module.js';
+import { toWasm, toJs } from '@awasm/compiler/codegen.js';
+import * as js from '@awasm/compiler/js.js';
 
 // 1. Define module
 const mod = new Module('example')
@@ -52,7 +52,14 @@ const jsCode = toJs(mod);      // Pure JS fallback
 const instance = js.exec(wasmCode);
 
 // 4. Use
-instance.segments['data'].set(new Uint8Array([1,0,0,0, 2,0,0,0, ...]));
+instance.segments['data'].set(
+  new Uint8Array([
+    1, 0, 0, 0, 2, 0, 0, 0,
+    3, 0, 0, 0, 4, 0, 0, 0,
+    5, 0, 0, 0, 6, 0, 0, 0,
+    7, 0, 0, 0, 8, 0, 0, 0,
+  ])
+);
 const result = instance.sum();  // returns sum of data array
 ```
 
@@ -185,7 +192,14 @@ const jsCode = toJs(mod);      // Pure JS fallback
 const instance = js.exec(wasmCode);
 
 // 4. Use
-instance.segments['data'].set(new Uint8Array([1,0,0,0, 2,0,0,0, ...]));
+instance.segments['data'].set(
+  new Uint8Array([
+    1, 0, 0, 0, 2, 0, 0, 0,
+    3, 0, 0, 0, 4, 0, 0, 0,
+    5, 0, 0, 0, 6, 0, 0, 0,
+    7, 0, 0, 0, 8, 0, 0, 0,
+  ])
+);
 const result = instance.sum();  // returns sum of data array
 ```
 
@@ -196,31 +210,33 @@ const result = instance.sum();  // returns sum of data array
 ### Creating a Module
 
 ```typescript
+import { Module, array } from '@awasm/compiler/module.js';
+
 const mod = new Module('moduleName')  // name used in generated code
-  .mem(...)      // define memory region
-  .batchMem(...) // define batched memory (auto-sized for SIMD/threads)
-  .fn(...)       // define function
-  .batchFn(...)  // define batched/parallel function
-  .importFn(...) // import external function
-  .use(...)      // compose with another module builder
+  .mem('data', array('u32', {}, 64))                                      // define memory region
+  .batchMem('work', array('u32', {}, 64))                                 // define batched memory (auto-sized for SIMD/threads)
+  .fn('sum', [], 'u32', (s) => s.types.u32.const(0))                      // define function
+  .batchFn('process', { lanes: 4 }, ['u32'], () => {})                    // define batched/parallel function
+  .importFn('log', ['u32'], 'void', (value) => console.log(value))        // import external function
+  .use((m) => m);                                                         // compose with another module builder
 ```
 
 Methods are chainable and return the module for further definition.
 
 ### Composing Modules: `.use()`
 
-```typescript
-.use(transformer)
-```
-
-Applies a function that extends the module. Useful for reusable patterns:
+`.use(transformer)` applies a function that extends the module. Useful for reusable patterns:
 
 ```typescript
+import { Module, array, type FnRegistry, type Segs } from '@awasm/compiler/module.js';
+
 // Define reusable module extension
-function addPadding<M, F>(mod: Module<M, F>) {
-  return mod.mem('padBuffer', array('u32', {}, 64)).fn('pad', ['u32'], 'void', (s, len) => {
-    /* ... */
-  });
+function addPadding<M extends Segs, F extends FnRegistry>(mod: Module<M, F>) {
+  return mod
+    .mem('padBuffer', array('u32', {}, 64))
+    .fn('pad', ['u32'], 'void', (s, len) => {
+      /* ... */
+    });
 }
 
 // Use it
@@ -235,10 +251,11 @@ const mod = new Module('hash')
 ### Memory: `.mem()` / `.batchMem()`
 
 ```typescript
-import { array, struct, scalar } from '@awasm/compiler/module.js';
+import { Module, array, struct } from '@awasm/compiler/module.js';
 
-.mem('name', spec)
-.batchMem('name', spec)  // wraps in array, outer dimension auto-sized
+const mod = new Module('memory')
+  .mem('state', struct({ counter: 'u64' }))
+  .batchMem('streams', array('u32', {}, 64)); // wraps in array, outer dimension auto-sized
 ```
 
 `batchMem` converts the spec to an array if not already one, then adds an outer dimension sized for parallelism (SIMD lanes × thread count). For arrays, it just prepends the dimension; for non-arrays (struct, scalar), it wraps them in an array first.
@@ -254,6 +271,8 @@ import { array, struct, scalar } from '@awasm/compiler/module.js';
 Specs can be nested arbitrarily:
 
 ```typescript
+import { array, struct } from '@awasm/compiler/module.js';
+
 // Array of structs
 array(struct({ x: 'f32', y: 'f32', z: 'f32' }), {}, 100);
 
@@ -287,31 +306,29 @@ Types can be nested arbitrarily.
 
 ### Functions: `.fn()`
 
-```typescript
-.fn(name, inputs, outputs, callback)
-```
+Use `.fn(name, inputs, outputs, callback)` to define an exported function.
 
 - `inputs`: Array of input types `['u32', 'u64', ...]`
 - `outputs`: Return type(s) `'u32'` or `['u32', 'u32']` or `'void'`
 - `callback`: `(scope, ...args) => returnValue`
 
 ```typescript
-.fn('add', ['u32', 'u32'], 'u32', (s, a, b) => {
-  return s.types.u32.add(a, b);
-})
+import { Module } from '@awasm/compiler/module.js';
 
-.fn('swap', ['u32', 'u32'], ['u32', 'u32'], (s, a, b) => {
-  return [b, a];  // multiple returns
-})
+const mod = new Module('functions')
+  .fn('add', ['u32', 'u32'], 'u32', (s, a, b) => {
+    return s.types.u32.add(a, b);
+  })
+  .fn('swap', ['u32', 'u32'], ['u32', 'u32'], (s, a, b) => {
+    return [b, a];  // multiple returns
+  });
 ```
 
 ### Batched Functions: `.batchFn()`
 
 For SIMD/parallel processing:
 
-```typescript
-.batchFn(name, opts, inputs, callback)
-```
+Use `.batchFn(name, opts, inputs, callback)` for SIMD/parallel processing.
 
 - `opts`: `{ lanes: number, perThread?: number }`
 - `callback`: `(scope, lanes, batchPos, perBatchSize, ...args) => void`
@@ -319,14 +336,27 @@ For SIMD/parallel processing:
 **Important:** The callback signature differs from how the function is called:
 
 ```typescript
+import { Module } from '@awasm/compiler/module.js';
+import { toWasm } from '@awasm/compiler/codegen.js';
+import * as js from '@awasm/compiler/js.js';
+
 // Definition: callback receives (scope, lanes, pos, perBatchSize, ...args)
-.batchFn('process', { lanes: 4 }, ['u32', 'u32'], (s, lanes, pos, perBatch, arg1, arg2) => {
-  // lanes: 1 for scalar, 4 for SIMD
-  // pos: current batch position
-  // perBatch: passed through from caller, used for thread work allocation
-})
+const mod = new Module('batch')
+  .batchFn(
+    'process',
+    { lanes: 4 },
+    ['u32', 'u32'],
+    (s, lanes, pos, perBatch, arg1, arg2) => {
+      // lanes: 1 for scalar, 4 for SIMD
+      // pos: current batch position
+      // perBatch: passed through from caller, used for thread work allocation
+    }
+  );
 
 // Usage: called as (batchPos, batchLen, perBatchSize, ...args)
+const instance = js.exec(toWasm(mod, { useSIMD: false, useThreads: false }));
+const arg1Value = 1;
+const arg2Value = 2;
 instance.process(0, 100, 16, arg1Value, arg2Value);
 ```
 
@@ -337,6 +367,8 @@ The `perBatchSize` parameter indicates how much work each batch item represents.
 **Combined example with batchMem and lanes:**
 
 ```typescript
+import { Module, array, struct } from '@awasm/compiler/module.js';
+
 const mod = new Module('parallel')
   // batchMem: outer dimension auto-sized for parallelism
   .batchMem(
@@ -375,31 +407,39 @@ Example: 17 items with `{ lanes: 4 }` → callback called with `lanes=4` at posi
 
 ### Import Functions: `.importFn()`
 
-```typescript
-.importFn(name, inputs, outputs, callback?, module?)
-```
+Use `.importFn(name, inputs, outputs, callback?, module?)` to declare imports.
 
 Two modes:
 
 1. **With callback**: Function is serialized via `.toString()` and embedded. **Cannot capture closures** — only reference global variables.
 
 ```typescript
-.importFn('log', ['u32'], 'void', (value) => {
-  console.log('Value:', value);  // uses global console
-})
+import { Module } from '@awasm/compiler/module.js';
+
+const mod = new Module('imports')
+  .importFn('log', ['u32'], 'void', (value) => {
+    console.log('Value:', value);  // uses global console
+  });
 ```
 
 2. **Without callback**: Function must be provided at runtime via `_imports`. Looks in `_imports.env` by default, or `_imports[module]` if module specified.
 
 ```typescript
+import { Module } from '@awasm/compiler/module.js';
+import { toJs } from '@awasm/compiler/codegen.js';
+import * as js from '@awasm/compiler/js.js';
+
 // Definition
-.importFn('hash', ['u32', 'u32'], 'u32')
-.importFn('compress', ['u32'], 'void', undefined, 'crypto')
+const code = toJs(
+  new Module('imports')
+    .importFn('hash', ['u32', 'u32'], 'u32')
+    .importFn('compress', ['u32'], 'void', undefined, 'crypto')
+);
 
 // Usage
 js.exec(code, {
   env: { hash: (a, b) => a ^ b },
-  crypto: { compress: (x) => { ... } }
+  crypto: { compress: (x) => void x }
 });
 ```
 
@@ -410,8 +450,11 @@ js.exec(code, {
 ### Compiling
 
 ```typescript
+import { Module } from '@awasm/compiler/module.js';
 import { toWasm, toJs } from '@awasm/compiler/codegen.js';
 
+const mod = new Module('compile')
+  .fn('zero', [], 'u32', (s) => s.types.u32.const(0));
 const wasmResult = toWasm(mod); // Compiles to WebAssembly
 const jsResult = toJs(mod); // Compiles to pure JavaScript
 ```
@@ -421,24 +464,33 @@ Use `toWasm` for best performance. Use `toJs` as a fallback for environments wit
 Both return an object:
 
 ```typescript
-{
+type CompileResult = {
   raw: string,       // IIFE code to execute
   typeRaw: string,   // TypeScript type definition
   modFn: string,     // ES module export
   modFnType: string, // ES module type export
-}
+};
 ```
 
 ### Executing
 
 ```typescript
+import { Module } from '@awasm/compiler/module.js';
+import { toJs, toWasm } from '@awasm/compiler/codegen.js';
 import * as js from '@awasm/compiler/js.js';
 
-const instance = js.exec(wasmResult);
+const mod = new Module('exec')
+  .fn('zero', [], 'u32', (s) => s.types.u32.const(0));
+const wasmResult = toWasm(mod);
+const jsResult = toJs(mod);
+const imports = {};
+const pool = undefined;
+
+const wasmInstance = js.exec(wasmResult);
 // or
-const instance = js.exec(jsResult);
+const jsInstance = js.exec(jsResult);
 // or
-const instance = js.exec(wasmResult, imports, pool);
+const pooledInstance = js.exec(wasmResult, imports, pool);
 ```
 
 ### Writing to Files
@@ -446,16 +498,21 @@ const instance = js.exec(wasmResult, imports, pool);
 To avoid `js.exec` (which uses `eval`), write the generated code to files and import:
 
 ```typescript
-import { writeFileSync } from 'fs';
+import { mkdirSync, writeFileSync } from 'fs';
+import { Module } from '@awasm/compiler/module.js';
+import { toWasm } from '@awasm/compiler/codegen.js';
 
+const mod = new Module('file_example')
+  .fn('zero', [], 'u32', (s) => s.types.u32.const(0));
 const result = toWasm(mod);
 
 // Write as ES module
+mkdirSync('./build', { recursive: true });
 writeFileSync('./build/myModule.js', result.modFn);
 writeFileSync('./build/myModule.d.ts', result.modFnType);
 
 // Then import normally
-import myModule from './build/myModule.js';
+const { default: myModule } = await import('./build/myModule.js');
 const instance = myModule();
 ```
 
@@ -464,35 +521,40 @@ const instance = myModule();
 For debugging or executing without a compilation step (also smaller build size):
 
 ```typescript
+import { Module } from '@awasm/compiler/module.js';
+import { toJs } from '@awasm/compiler/codegen.js';
 import { toRuntime } from '@awasm/compiler/runtime.js';
 import { genRuntimeTypeMod, TYPE_MOD_OPTS } from '@awasm/compiler/types.js';
+import * as js from '@awasm/compiler/js.js';
 
 // Generate type module once
 const typeMod = js.exec(toJs(genRuntimeTypeMod(), TYPE_MOD_OPTS));
 
 // Create interpreter instance
+const mod = new Module('runtime')
+  .fn('zero', [], 'u32', (s) => s.types.u32.const(0));
 const instance = toRuntime(() => typeMod, mod)();
 ```
 
 ### Instance Shape
 
 ```typescript
-{
+type Instance = {
   // Exported functions
-  sum(): number,
-  process(a: number, b: number): void,
+  sum(): number;
+  process(a: number, b: number): void;
 
   // Raw memory buffer
-  memory: Uint8Array,
+  memory: Uint8Array;
 
   // Named memory segment views
   segments: {
-    'data': Uint8Array,
-    'state.counter': Uint8Array,
-    'state.buffer': Uint8Array,
+    data: Uint8Array;
+    'state.counter': Uint8Array;
+    'state.buffer': Uint8Array;
     // ...
-  }
-}
+  };
+};
 ```
 
 **JS memory views:** All exported segments are `Uint8Array` views (bytes), regardless of element type.
@@ -502,7 +564,17 @@ const instance = toRuntime(() => typeMod, mod)();
 ### Accessing Memory from JS
 
 ```typescript
-const instance = js.exec(toWasm(mod));
+import { Module, array } from '@awasm/compiler/module.js';
+import { toJs } from '@awasm/compiler/codegen.js';
+import * as js from '@awasm/compiler/js.js';
+
+const mod = new Module('memory_access')
+  .mem('data', array('u8', {}, 16))
+  .mem('result', array('u8', {}, 16));
+const instance = js.exec(toJs(mod));
+const inputBytes = new Uint8Array([1, 2, 3]);
+const data = new Uint8Array([4, 5, 6]);
+const offset = 0;
 
 // Read/write via segments
 instance.segments['data'].set(inputBytes);
@@ -521,6 +593,11 @@ Use `s.print()` inside functions to log values at runtime (converted to u32 for 
 To inspect generated code, access `result.raw` — it's a JS string containing either pure JS code or JS boilerplate that instantiates the WASM module:
 
 ```typescript
+import { Module } from '@awasm/compiler/module.js';
+import { toJs, toWasm } from '@awasm/compiler/codegen.js';
+
+const mod = new Module('debug')
+  .fn('zero', [], 'u32', (s) => s.types.u32.const(0));
 const result = toJs(mod);
 console.log(result.raw); // readable JS implementation
 
@@ -535,31 +612,39 @@ console.log(wasmResult.raw); // JS with embedded WASM base64
 The first argument to function callbacks is the `Scope`, providing access to everything:
 
 ```typescript
-.fn('example', ['u32'], 'void', (s, arg) => {
+import { Module, array, type UnsignedType } from '@awasm/compiler/module.js';
+
+const mod = new Module('scope')
+  .mem('buffer', array('u32', {}, 8))
+  .importFn('helper', ['u32'], 'u32')
+  .importFn('sideEffect', ['u32'], 'void')
+  .fn('example', ['u32'], 'void', (s, arg) => {
   // Type operations
   const { u32, f64, u32x4 } = s.types;
 
   // Dynamic type access
-  const T = s.getType('u32', lanes);           // concrete type
+  const T = s.getType('u32', 4);           // concrete type
   // OR
-  const T = s.getTypeGeneric<UnsignedType, T>(type, lanes);  // generic
+  const Generic = s.getTypeGeneric<UnsignedType, 'u32'>('u32');  // generic
 
   // Memory access
-  s.memory.buffer[i].get();
-  s.memory.buffer[i].set(value);
+  const value = u32.add(arg, u32.const(1));
+  s.memory.buffer[0].get();
+  s.memory.buffer[0].set(value);
 
   // Call other functions
   const [result] = s.functions.helper.call(arg);
+  const cond = u32.eq(result, u32.const(0));
   s.functions.sideEffect.callIf(cond, arg);  // conditional, no return
 
   // Control flow
-  s.doN(state, count, body);
-  s.ifElse(cond, state, ifBody, elseBody);
+  s.doN([value], 2, (i, cur) => [u32.add(cur, i)]);
+  s.ifElse(cond, [value], (cur) => [u32.add(cur, arg)], (cur) => [cur]);
   // ... see Control Flow section
 
   // Debug
   s.print('value =', value);
-})
+});
 ```
 
 **Important concept:** Values like `arg`, `val`, etc. are compile-time handles (symbolic representations), not actual runtime values. Operations build a computation graph that gets compiled to WASM/JS. You cannot inspect their values at definition time — they only exist at runtime.
@@ -599,8 +684,14 @@ The first argument to function callbacks is the `Scope`, providing access to eve
 **laneOffsets example:**
 
 ```typescript
-u32.laneOffsets(10); // → 10
-u32x4.laneOffsets(10); // → [10, 11, 12, 13]
+import { Module } from '@awasm/compiler/module.js';
+
+const mod = new Module('lane_offsets')
+  .fn('demo', [], 'void', (s) => {
+    const { u32, u32x4 } = s.types;
+    u32.laneOffsets(10); // → 10
+    u32x4.laneOffsets(10); // → [10, 11, 12, 13]
+  });
 ```
 
 ### Type Conversions
@@ -763,6 +854,9 @@ After `interleave([A,B,C,D])`:
 Sometimes you want the same algorithm for different types — say, a hash that works on both `u32` and `u64`. The challenge: memory and operations must use the _same_ concrete type, but TypeScript doesn't automatically track that connection.
 
 ```ts
+import { Module, array } from '@awasm/compiler/module.js';
+import type { UnsignedType } from '@awasm/compiler/types.js';
+
 // WITHOUT generics — broken: memory is u32, but T could be u64!
 function broken<T extends UnsignedType>(type: T) {
   return new Module('oops')
@@ -772,12 +866,15 @@ function broken<T extends UnsignedType>(type: T) {
       // ... what if T was u64?
     });
 }
+
+broken('u32');
 ```
 
 Use `toGeneric` for memory specs and `getTypeGeneric` for operations — both preserve the type parameter `T`:
 
 ```ts
-import { toGeneric } from '@awasm/compiler/module.js';
+import { Module, array, toGeneric } from '@awasm/compiler/module.js';
+import type { UnsignedType } from '@awasm/compiler/types.js';
 
 function gen<T extends UnsignedType>(type: T) {
   const memType = toGeneric<UnsignedType, T>(type);
@@ -805,24 +902,40 @@ The `<UnsignedType, T>` part tells TypeScript: "T is some unsigned type, give me
 ### Basic Access
 
 ```typescript
-// Indexing
-s.memory.buffer[i].get(); // load
-s.memory.buffer[i].set(val); // store
+import { Module, array, struct } from '@awasm/compiler/module.js';
 
-// Multidimensional
-s.memory.matrix[i][j].get();
+const mod = new Module('access')
+  .mem('buffer', array('u32', {}, 8))
+  .mem('matrix', array('u32', {}, 2, 2))
+  .mem('state', struct({ counter: 'u32', data: array('u32', {}, 2) }))
+  .fn('demo', ['u32'], 'void', (s, i) => {
+    const val = s.types.u32.const(1);
 
-// Struct fields
-s.memory.state.counter.get();
-s.memory.state.data[0].set(val);
+    // Indexing
+    s.memory.buffer[i].get(); // load
+    s.memory.buffer[i].set(val); // store
+
+    // Multidimensional
+    s.memory.matrix[0][1].get();
+
+    // Struct fields
+    s.memory.state.counter.get();
+    s.memory.state.data[0].set(val);
+  });
 ```
 
 For arrays, `get()` returns nested arrays matching shape.
 For structs, `get()` returns a JS object where keys are field names and values are symbolic handles:
 
 ```typescript
-const point = s.memory.point.get(); // { x: , y:  }
-const sum = u32.add(point.x, point.y); // use fields in operations
+import { Module, struct } from '@awasm/compiler/module.js';
+
+const mod = new Module('point')
+  .mem('point', struct({ x: 'u32', y: 'u32' }))
+  .fn('sum', [], 'u32', (s) => {
+    const point = s.memory.point.get(); // { x: , y:  }
+    return s.types.u32.add(point.x, point.y); // use fields in operations
+  });
 ```
 
 Partial struct updates supported.
@@ -830,11 +943,17 @@ Partial struct updates supported.
 **Symbolic indexing:** Array indices and sizes can be runtime values (`Val<'u32'>`), not just constants:
 
 ```typescript
-// Index with runtime value
-const val = s.memory.buffer[idx].get(); // idx can be u32 constant or variable
+import { Module, array } from '@awasm/compiler/module.js';
 
-// Range with runtime values
-const slice = s.memory.buffer.range(start, len);
+const mod = new Module('symbolic_index')
+  .mem('buffer', array('u32', {}, 16))
+  .fn('read', ['u32', 'u32', 'u32'], 'void', (s, idx, start, len) => {
+    // Index with runtime value
+    const val = s.memory.buffer[idx].get(); // idx can be u32 constant or variable
+
+    // Range with runtime values
+    const slice = s.memory.buffer.range(start, len);
+  });
 ```
 
 **No bounds checking:** There are no runtime bounds checks for symbolic/dynamic indices. WASM may trap on significantly out-of-bounds access (page faults), but JS will silently read/write garbage or return undefined. The only guaranteed error is WASM trap on division by zero.
@@ -868,12 +987,18 @@ On `.as8()` views:
 `.lanes(n)` enables strided SIMD access:
 
 ```typescript
-// array[N, M, K]
-const view = s.memory.data[streamIdx]; // shape [M, K]
-const strided = view.lanes(4)[pos]; // access pos, pos+1, pos+2, pos+3 in M
+import { Module, array } from '@awasm/compiler/module.js';
 
-const vectors = strided.get(); // auto-interleaved for SIMD
-strided.set(vectors); // auto-deinterleaved back
+const mod = new Module('simd_lanes')
+  .mem('data', array('u32', {}, 8, 8, 8))
+  .fn('copy', ['u32', 'u32'], 'void', (s, streamIdx, pos) => {
+    // array[N, M, K]
+    const view = s.memory.data[streamIdx]; // shape [M, K]
+    const strided = view.lanes(4)[pos]; // access pos, pos+1, pos+2, pos+3 in M
+
+    const vectors = strided.get(); // auto-interleaved for SIMD
+    strided.set(vectors); // auto-deinterleaved back
+  });
 ```
 
 ### Atomics
@@ -881,24 +1006,51 @@ strided.set(vectors); // auto-deinterleaved back
 On scalar integer locations:
 
 ```typescript
-loc.atomics.load();
-loc.atomics.store(value);
-loc.atomics.exchange(value);
-loc.atomics.compareExchange(expected, replacement);
-loc.atomics.add(value); // also: sub, and, or, xor
-// `wait`/`notify` follow standard [WebAssembly atomics semantics](https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/Wait).
-loc.atomics.wait(expected, timeout);
-loc.atomics.notify(count);
-loc.atomics.fence();
+import { Module, struct } from '@awasm/compiler/module.js';
+
+const mod = new Module('atomics')
+  .mem('state', struct({ counter: 'u32' }))
+  .fn(
+    'demo',
+    ['u32', 'u32'],
+    'void',
+    (s, expected, replacement) => {
+      const loc = s.memory.state.counter;
+      const value = s.types.u32.const(1);
+      loc.atomics.load();
+      loc.atomics.store(value);
+      loc.atomics.exchange(value);
+      loc.atomics.compareExchange(expected, replacement);
+      loc.atomics.add(value); // also: sub, and, or, xor
+      // `wait`/`notify` follow standard WebAssembly atomics semantics:
+      // https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/Wait
+      loc.atomics.wait(expected, -1);
+      loc.atomics.notify(1);
+      loc.atomics.fence();
+    }
+  );
 ```
 
 ### Mut (Non-Atomic RMW)
 
 ```typescript
-loc.mut.exchange(value);
-loc.mut.compareExchange(expected, replacement);
-loc.mut.add(x); // val += x, returns old
-// ... all type ops available
+import { Module, struct } from '@awasm/compiler/module.js';
+
+const mod = new Module('mut')
+  .mem('state', struct({ counter: 'u32' }))
+  .fn(
+    'demo',
+    ['u32', 'u32'],
+    'void',
+    (s, expected, replacement) => {
+      const loc = s.memory.state.counter;
+      const value = s.types.u32.const(1);
+      loc.mut.exchange(value);
+      loc.mut.compareExchange(expected, replacement);
+      loc.mut.add(value); // val += x, returns old
+      // ... all type ops available
+    }
+  );
 ```
 
 ---
@@ -910,25 +1062,39 @@ loc.mut.add(x); // val += x, returns old
 All control flow uses state-passing. State flows through, body transforms it, construct returns final state.
 
 ```typescript
-const [sum] = s.doN(
-  [u32.const(0)], // initial state
-  10, // iterations
-  (i, acc) => [u32.add(acc, i)] // body returns new state
-);
+import { Module } from '@awasm/compiler/module.js';
+
+const mod = new Module('state_passing').fn('sum10', [], 'u32', (s) => {
+  const { u32 } = s.types;
+  const [sum] = s.doN(
+    [u32.const(0)], // initial state
+    10, // iterations
+    (i, acc) => [u32.add(acc, i)] // body returns new state
+  );
+  return sum;
+});
 ```
 
 **Important:** JS runs at compile time. Don't modify JS variables inside bodies:
 
 ```typescript
+import { Module } from '@awasm/compiler/module.js';
+
 // WRONG
-let x = 0;
-s.doN([], 10, (i) => {
-  x++;
-  return [];
-}); // x++ runs once at compile time!
+const wrong = new Module('wrong_state').fn('wrong', [], 'void', (s) => {
+  let jsCounter = 0;
+  s.doN([], 10, () => {
+    jsCounter++;
+    return [];
+  }); // jsCounter++ runs once at compile time!
+});
 
 // CORRECT - use state
-const [x] = s.doN([u32.const(0)], 10, (i, x) => [u32.add(x, u32.const(1))]);
+const correct = new Module('correct_state').fn('correct', [], 'u32', (s) => {
+  const { u32 } = s.types;
+  const [counter] = s.doN([u32.const(0)], 10, (i, x) => [u32.add(x, u32.const(1))]);
+  return counter;
+});
 ```
 
 ### Loops
@@ -941,58 +1107,105 @@ const [x] = s.doN([u32.const(0)], 10, (i, x) => [u32.add(x, u32.const(1))]);
 | `forLoop(state, cond, inc, body)` | 0+ times     | Before body |
 
 ```typescript
+import { Module } from '@awasm/compiler/module.js';
+
 // doN: 0..N iterations
-const [sum] = s.doN([u32.const(0)], 10, (i, acc) => [u32.add(acc, i)]);
+const mod = new Module('loops')
+  .fn('doNSum', [], 'u32', (s) => {
+    const { u32 } = s.types;
+    const [sum] = s.doN([u32.const(0)], 10, (i, acc) => [u32.add(acc, i)]);
+    return sum;
+  })
 
-// doWhile: at least once
-const [val] = s.doWhile(
-  [u32.const(1)],
-  (val) => u32.lt(val, u32.const(100)),
-  (val) => [u32.mul(val, u32.const(2))]
-);
+  // doWhile: at least once
+  .fn('doWhileVal', [], 'u32', (s) => {
+    const { u32 } = s.types;
+    const [val] = s.doWhile(
+      [u32.const(1)],
+      (val) => u32.lt(val, u32.const(100)),
+      (val) => [u32.mul(val, u32.const(2))]
+    );
+    return val;
+  })
 
-// forLoop: traditional for
-const [sum] = s.forLoop(
-  [u32.const(0), u32.const(0)], // [sum, i]
-  (sum, i) => u32.lt(i, u32.const(10)), // condition
-  (sum, i) => [sum, u32.add(i, u32.const(1))], // increment
-  (sum, i) => [u32.add(sum, i), i] // body
-);
+  // forLoop: traditional for
+  .fn('forLoopSum', [], 'u32', (s) => {
+    const { u32 } = s.types;
+    const [sum] = s.forLoop(
+      [u32.const(0), u32.const(0)], // [sum, i]
+      (sum, i) => u32.lt(i, u32.const(10)), // condition
+      (sum, i) => [sum, u32.add(i, u32.const(1))], // increment
+      (sum, i) => [u32.add(sum, i), i] // body
+    );
+    return sum;
+  });
 ```
 
 ### Conditionals
 
 ```typescript
-// With else
-const [result] = s.ifElse(
-  condition,
-  [initialValue],
-  (val) => [computeIfTrue(val)],
-  (val) => [computeIfFalse(val)]
-);
+import { Module } from '@awasm/compiler/module.js';
 
-// Without else (state unchanged if false)
-const [result] = s.ifElse(condition, [value], (val) => [transform(val)]);
+// With else
+const mod = new Module('conditionals')
+  .fn('withElse', ['u32'], 'u32', (s, initialValue) => {
+    const { u32 } = s.types;
+    const condition = u32.gt(initialValue, u32.const(0));
+    const [result] = s.ifElse(
+      condition,
+      [initialValue],
+      (val) => [u32.add(val, u32.const(1))],
+      (val) => [u32.const(0)]
+    );
+    return result;
+  })
+
+  // Without else (state unchanged if false)
+  .fn('withoutElse', ['u32'], 'u32', (s, value) => {
+    const { u32 } = s.types;
+    const condition = u32.gt(value, u32.const(0));
+    const [result] = s.ifElse(condition, [value], (val) => [u32.add(val, u32.const(1))]);
+    return result;
+  });
 ```
 
 ### Low-Level Control
 
 ```typescript
+import { Module } from '@awasm/compiler/module.js';
+
 // Named blocks for complex control flow
-const [x, y] = s.namedBlock('outer', [a, b], (x, y) => {
-  s.breakIf(cond, 'outer', x, y);
-  return [newX, newY];
-});
+const mod = new Module('control')
+  .fn('named', ['u32', 'u32', 'u32'], ['u32', 'u32'], (s, a, b, flag) => {
+    const { u32 } = s.types;
+    const cond = u32.ne(flag, u32.const(0));
+    const [x, y] = s.namedBlock('outer', [a, b], (x, y) => {
+      s.breakIf(cond, 'outer', x, y);
+      return [u32.add(x, u32.const(1)), u32.add(y, u32.const(1))];
+    });
+    return [x, y];
+  })
 
-// Branch behavior depends on block type:
-// - block: br exits (like break)
-// - loop: br jumps to start (like continue)
+  // Branch behavior depends on block type:
+  // - block: br exits (like break)
+  // - loop: br jumps to start (like continue)
 
-// High-level loop control (inside doN/forLoop/doWhile)
-s.continue(); // next iteration
-s.continueIf(cond);
-s.break(); // exit loop
-s.breakIf(cond);
+  // High-level loop control (inside doN/forLoop/doWhile)
+  .fn('loopControl', ['u32'], 'u32', (s, limit) => {
+    const { u32 } = s.types;
+    const [sum] = s.forLoop(
+      [u32.const(0), u32.const(0)], // [i, sum]
+      (i) => u32.lt(i, limit),
+      (i, sum) => [u32.add(i, u32.const(1)), sum],
+      (i, sum) => {
+        const next = u32.add(sum, i);
+        s.continueIf(u32.eq(i, u32.const(3)), undefined, i, sum);
+        s.breakIf(u32.gt(i, u32.const(8)), undefined, i, next);
+        return [i, next];
+      }
+    );
+    return sum;
+  });
 ```
 
 ---

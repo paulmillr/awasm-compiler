@@ -1,6 +1,7 @@
 // Small runtime executor
 // Runs stull in runtime instead of compilation. Useful for debug and if
 // you want to run module in very slow mode without compilation
+import type { TArg } from '@scure/base';
 import type { CompilerOpts, ModuleGraph } from './codegen.ts';
 import { allocateMemSpec, memoryProxy } from './memory.ts';
 import { Module, array } from './module.ts';
@@ -8,10 +9,13 @@ import type { TypeName } from './types.ts';
 import * as types from './types.ts';
 import { IntType, ScalarType, SignedType, Width64, opsForType } from './types.ts';
 
+const _32n = /* @__PURE__ */ BigInt(32);
+const U32_MASK_N = /* @__PURE__ */ BigInt(0xffffffff);
+
 const split64 = (signed: boolean, x: bigint): { r0: number; r1: number } => {
   const u = BigInt.asUintN(64, x);
-  const lo = Number(u & 0xffffffffn) >>> 0;
-  const hiU = Number((u >> 32n) & 0xffffffffn) >>> 0;
+  const lo = Number(u & U32_MASK_N) >>> 0;
+  const hiU = Number((u >> _32n) & U32_MASK_N) >>> 0;
   return { r0: lo, r1: signed ? hiU | 0 : hiU };
 };
 /**
@@ -256,12 +260,12 @@ function getTypes(mod: any) {
         if (!isI64Lane) return types.TypeCoders[vTypeName].encode(vals as any);
         const bigs = vals.map((v) =>
           laneSigned
-            ? BigInt.asIntN(64, (BigInt(v.r1) << 32n) | BigInt(v.r0 >>> 0))
-            : BigInt.asUintN(64, (BigInt(v.r1) << 32n) | BigInt(v.r0 >>> 0))
+            ? BigInt.asIntN(64, (BigInt(v.r1) << _32n) | BigInt(v.r0 >>> 0))
+            : BigInt.asUintN(64, (BigInt(v.r1) << _32n) | BigInt(v.r0 >>> 0))
         );
         return types.TypeCoders[vTypeName].encode(bigs as any);
       };
-      const decodeVals = (bytes: Uint8Array) => {
+      const decodeVals = (bytes: TArg<Uint8Array>) => {
         const vals = types.TypeCoders[vTypeName].decode(bytes as any);
         if (!isI64Lane) return vals;
         return vals.map((v: bigint) => split64(laneSigned, v));
@@ -271,6 +275,7 @@ function getTypes(mod: any) {
       const maskIs64 = Width64.has(maskLaneType);
       const MASK_TRUE = maskIs64 ? { r0: 0xffff_ffff, r1: 0xffff_ffff } : 0xffffffff;
       const MASK_FALSE = maskIs64 ? { r0: 0, r1: 0 } : 0;
+      const checkLane = (lane: number) => types.SIMDUtils.checkLane(lanes, lane);
       for (const op of opsForType(vTypeName)) {
         if (op === 'swapEndianness') {
           if (types.Width8.has(vTypeName)) {
@@ -352,10 +357,10 @@ function getTypes(mod: any) {
         ...virt,
         laneOffsets: (offset = 0) => lanesArr.map((_i, j) => T.const(offset + j)),
         splat: (x: number) => new Array(lanes).fill(x),
-        extractLane: (val: any[], idx: number) => val[idx],
+        extractLane: (val: any[], idx: number) => val[checkLane(idx)],
         replaceLane: (val: any[], idx: number, value: any) => {
           const res = Array.from(val);
-          res[idx] = value;
+          res[checkLane(idx)] = value;
           return res;
         },
         interleave: (vectors: any[]) => {
@@ -385,7 +390,7 @@ function getTypes(mod: any) {
         ror: (v: any[], k: number) => rol(v, -k),
         shuffleLanes: (lhs: any[], rhs: any[], pattern: number[]) => {
           const concat = lhs.concat(rhs);
-          return pattern.map((i) => concat[i]);
+          return pattern.map((i) => concat[types.SIMDUtils.checkLane(lanes * 2, i)]);
         },
         swizzle: (lhs: any[], mask: any[]) => {
           // Byte-level swizzle with per-16B chunk semantics, matching i8x16.swizzle.
@@ -400,8 +405,21 @@ function getTypes(mod: any) {
           }
           return decodeVals(out);
         },
-        shuffle: () => {
-          throw new Error('not implemented');
+        shuffle: (lhs: any[], rhs: any[], pattern: number[]) => {
+          const a = encodeVals(lhs as any);
+          const b = encodeVals(rhs as any);
+          if (pattern.length !== a.length) throw new Error('shuffle: wrong pattern length');
+          const src = new Uint8Array(a.length + b.length);
+          src.set(a);
+          src.set(b, a.length);
+          const out = new Uint8Array(a.length);
+          for (let i = 0; i < pattern.length; i++) {
+            const p = pattern[i];
+            if (!Number.isInteger(p) || p < 0 || p >= src.length)
+              throw new Error('shuffle: wrong pattern index');
+            out[i] = src[p];
+          }
+          return decodeVals(out);
         },
       });
     }
@@ -421,7 +439,7 @@ const getPosLanes = (region: any, pos?: number) => {
  * Runtime version of 'memory.ts/memOps'
  */
 function memOps(
-  { view, buf }: { view: DataView; buf: Uint8Array },
+  { view, buf }: TArg<{ view: DataView; buf: Uint8Array }>,
   f: ModuleGraph,
   name: string,
   region: any,
@@ -565,12 +583,43 @@ function memOps(
     };
   }
   const atomicOp = (
-    _type: TypeName,
-    _op: string,
-    _width: 1 | 2 | 4 | undefined,
-    ..._args: number[]
+    type: TypeName,
+    op: string,
+    width: 1 | 2 | 4 | undefined,
+    ...args: number[]
   ) => {
-    throw new Error('not implemented');
+    // Runtime is single-threaded; model atomic memory effects without blocking/thread scheduling.
+    if (op === 'fence') return;
+    if (op === 'notify') return 0;
+    if (op === 'wait') throw new Error('runtime atomic wait is not implemented');
+    const size = width === undefined ? undefined : width * 8;
+    const cell = tmp(
+      region,
+      size === undefined ? {} : { size },
+      undefined,
+      type,
+      region.opts.swapEndianness
+    );
+    const old = cell.load();
+    if (op === 'load') return old;
+    if (op === 'store') return void cell.store(args[0]);
+    if (op === 'xchg') {
+      cell.store(args[0]);
+      return old;
+    }
+    if (op === 'cmpxchg') {
+      if (old === args[0]) cell.store(args[1]);
+      return old;
+    }
+    let next;
+    if (op === 'add') next = old + args[0];
+    else if (op === 'sub') next = old - args[0];
+    else if (op === 'and') next = old & args[0];
+    else if (op === 'or') next = old | args[0];
+    else if (op === 'xor') next = old ^ args[0];
+    else throw new Error('runtime atomic op is not implemented: ' + op);
+    cell.store(next);
+    return old;
   };
   function getMut(type: TypeName) {
     const T = (f.types as any)[type];
@@ -785,7 +834,7 @@ function memOps(
 /**
  * Runtime version of 'codegen.ts/genScope'
  */
-function genScope(typeMod: any, _mod: Module, memoryExport: Uint8Array, segments: any) {
+function genScope(typeMod: any, _mod: Module, memoryExport: TArg<Uint8Array>, segments: any) {
   const isBr = (e: any): e is BrSentinel => !!e && e.__br === 1;
   type BrSentinel = { __br: 1; depth: number | string; values: any[] };
   const mkBr = (depth: number | string, values: any[]): BrSentinel => ({ __br: 1, depth, values });
@@ -809,6 +858,24 @@ function genScope(typeMod: any, _mod: Module, memoryExport: Uint8Array, segments
     if (d0 === 0 || d0 === 2) return { kind: d0, state: e.values as State };
     if (d0 > 2) throw mkBr(d0 - 3, e.values);
     throw mkBr(d0, e.values);
+  };
+  const doNCounterState = <State extends any[]>(
+    e: any,
+    label: string | undefined,
+    state: State,
+    width: number
+  ): State => {
+    // Codegen doN/doN1 carries [counter, ...state] internally, but runtime
+    // exposes the counter as a callback argument and must strip it on labeled branches.
+    if (
+      isBr(e) &&
+      typeof e.depth === 'string' &&
+      label &&
+      (e.depth === label || e.depth === `${label}.loop.body`) &&
+      state.length === width + 1
+    )
+      return state.slice(1) as State;
+    return state;
   };
   const normState = <State extends any[]>(s: any): State => (s ? (s as State) : ([] as any));
   // Runtime scalarizes batchFn kernels with `lanes=1`, so keep the same
@@ -926,13 +993,15 @@ function genScope(typeMod: any, _mod: Module, memoryExport: Uint8Array, segments
       label?: string
     ) {
       const n = N as number;
+      const width = state.length;
       for (let i = 0; i < n; i++) {
         try {
           state = normState<State>(body(i, ...state));
         } catch (e) {
           const h = handleLoopBr<State>(e, label);
-          if (h.kind === 2) return h.state;
-          state = h.state; // continue
+          const s = doNCounterState(e, label, h.state, width);
+          if (h.kind === 2) return s;
+          state = s; // continue
         }
       }
       return state;
@@ -944,13 +1013,15 @@ function genScope(typeMod: any, _mod: Module, memoryExport: Uint8Array, segments
       label?: string
     ) {
       let cnt = 0;
+      const width = state.length;
       for (;;) {
         try {
           state = normState<State>(body(cnt, ...state));
         } catch (e) {
           const h = handleLoopBr<State>(e, label);
-          if (h.kind === 2) return h.state;
-          state = h.state; // continue
+          const s = doNCounterState(e, label, h.state, width);
+          if (h.kind === 2) return s;
+          state = s; // continue
         }
         if (++cnt >= N) return state;
       }
@@ -961,7 +1032,8 @@ function genScope(typeMod: any, _mod: Module, memoryExport: Uint8Array, segments
       ifBody: (...s: State) => State,
       elseBody?: (...s: State) => State
     ): State {
-      const asState = (x: any): State => (Array.isArray(x) ? (x as any) : ([x] as any));
+      const asState = (x: any): State =>
+        x === undefined ? ([] as any) : Array.isArray(x) ? (x as any) : ([x] as any);
       if (!elseBody) {
         return cond ? asState(ifBody(...state)) : state;
       }
@@ -980,10 +1052,37 @@ function genScope(typeMod: any, _mod: Module, memoryExport: Uint8Array, segments
   return scope;
 }
 
-export function toRuntime(typeModFn: any, mod: any, _opts: CompilerOpts = {}, debug = false) {
+/**
+ * Builds the scalar runtime interpreter for a module.
+ *
+ * @param typeModFn - Factory returning runtime type helper functions.
+ * @param mod - Source module definition.
+ * @param _opts - Compiler options. {@link CompilerOpts}
+ * @param debug - Whether runtime argument count checks are enabled.
+ * @returns Factory returning the cached runtime instance.
+ * @throws If memory allocation or runtime import resolution fails. {@link Error}
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { genRuntimeTypes } from '@awasm/compiler/types.js';
+ * import { toRuntime } from '@awasm/compiler/runtime.js';
+ *
+ * const mod = new Module('demo')
+ *   .fn('zero', [], 'u32', (f) => f.types.u32.const(0));
+ * toRuntime(genRuntimeTypes, mod)();
+ * ```
+ */
+export function toRuntime(
+  typeModFn: any,
+  mod: any,
+  _opts: CompilerOpts = {},
+  debug = false
+): () => any {
   const typeMod = typeModFn();
   // Memory
   const memory: Record<any, any> = {};
+  // Runtime is scalar interpretation, not compiled SIMD/threads output;
+  // batch callbacks run with lanes=1.
   const BATCH_SIZE = 1;
   let memPos = 0;
   for (const [name, def] of Object.entries(mod.memory) as any) {
@@ -997,10 +1096,16 @@ export function toRuntime(typeModFn: any, mod: any, _opts: CompilerOpts = {}, de
   }
   const memoryU8 = new Uint8Array(memPos);
   const functions: any = {};
+  const exports: any = {};
   const scope = genScope(typeMod, mod, memoryU8, memory);
   for (const name in mod.functions) {
-    const { inputs, cb, batch } = mod.functions[name];
-    if (batch) {
+    const { inputs, cb, batch, import: isImport } = mod.functions[name];
+    if (isImport) {
+      functions[name] = (...args: any[]) => {
+        if (!cb) throw new Error(`runtime import missing callback: ${name}`);
+        return cb(...args);
+      };
+    } else if (batch) {
       functions[name] = (
         batchPos: number,
         batchLen: number,
@@ -1019,6 +1124,7 @@ export function toRuntime(typeModFn: any, mod: any, _opts: CompilerOpts = {}, de
         return Array.isArray(res) && res.length === 1 ? res[0] : res;
       };
     }
+    if (!isImport) exports[name] = functions[name];
     (scope.functions as any)[name] = {
       call: (...args: any[]) => {
         const res = functions[name](...args);
@@ -1048,6 +1154,7 @@ export function toRuntime(typeModFn: any, mod: any, _opts: CompilerOpts = {}, de
       segments[`${regionName}_chunks`] = Object.freeze(chunks);
     }
   }
-  const res = Object.freeze({ memory: memoryU8, segments: Object.freeze(segments), ...functions });
+  // Runtime intentionally caches one interpreter instance, like compiled reuseModule mode.
+  const res = Object.freeze({ memory: memoryU8, segments: Object.freeze(segments), ...exports });
   return () => res;
 }

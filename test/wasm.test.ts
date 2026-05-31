@@ -14,6 +14,20 @@ function getWasm(code) {
   const jsCode = js.wrapWASM(mod, code);
   return js.exec(js.wrapModule(mod, jsCode, []).raw);
 }
+function oneFn(...instructions) {
+  return {
+    functions: [
+      {
+        name: 'test',
+        inputs: [],
+        outputs: [],
+        export: true,
+        locals: [],
+        instructions: [...instructions, { TAG: 'end', data: undefined }],
+      },
+    ],
+  };
+}
 
 describe('WASM', () => {
   should('LEB128', () => {
@@ -289,6 +303,50 @@ describe('WASM', () => {
       },
     ]);
   });
+  should('function signature rejects void valtype', () => {
+    const def = (field) => ({
+      functions: [
+        {
+          name: 'bad',
+          export: true,
+          inputs: field === 'inputs' ? ['void'] : [],
+          outputs: field === 'outputs' ? ['void'] : [],
+          locals: [],
+          instructions: [{ TAG: 'end', data: undefined }],
+        },
+      ],
+    });
+    throws(() => wasm.createWasm(def('inputs')), /void.*function.*signature/i);
+    throws(() => wasm.createWasm(def('outputs')), /void.*function.*signature/i);
+  });
+  should('locals reject void valtype', () => {
+    const def = (type) => ({
+      functions: [
+        {
+          name: 'bad',
+          export: true,
+          inputs: [],
+          outputs: [],
+          locals: [{ count: 1n, type }],
+          instructions: [{ TAG: 'end', data: undefined }],
+        },
+      ],
+    });
+    deepStrictEqual(WebAssembly.validate(wasm.createWasm(def('i32'))), true);
+    throws(() => wasm.createWasm(def('void')), /void.*local.*valtype/i);
+  });
+  should('instruction immediates are encoded in their valid domain', () => {
+    const fence = wasm.createWasm(oneFn({ TAG: 'atomic.fence', data: undefined }));
+    deepStrictEqual(WebAssembly.validate(fence), true);
+    const validNull = wasm.createWasm(
+      oneFn({ TAG: 'null', data: 'funcref' }, { TAG: 'drop', data: undefined })
+    );
+    deepStrictEqual(WebAssembly.validate(validNull), true);
+    throws(
+      () => wasm.createWasm(oneFn({ TAG: 'null', data: 'i32' }, { TAG: 'drop', data: undefined })),
+      /ref|null|type/i
+    );
+  });
   should('memory basic', () => {
     const w = base64.decode(
       'AGFzbQEAAAABBgFgAX8BfwMCAQAFBAEBAgIHGwIDbWVtAgARbWFuaXB1bGF0ZV9tZW1vcnkAAAoQAQ4AIABBKjYCACAAKAIACwAmBG5hbWUBFAEAEW1hbmlwdWxhdGVfbWVtb3J5AgkBAAEABGFkZHI='
@@ -367,6 +425,14 @@ describe('WASM', () => {
         })
       ).sections[0],
       wasm.wasmBinary.decode(w).sections[2]
+    );
+    throws(
+      () =>
+        wasm.createWasm({
+          functions: [],
+          memory: { size: 10 * 65536, export: true, maximum: 9 * 65536 },
+        }),
+      /initial.*maximum|maximum.*initial|memory/i
     );
   });
   should('simd endianess', () => {
@@ -536,6 +602,36 @@ describe('WASM', () => {
     deepStrictEqual(t2.test(0), 2n);
     deepStrictEqual(t2.test(5), 32n);
     deepStrictEqual(t2.test(10), 1024n);
+  });
+  should('block type index 64', () => {
+    const functions = [];
+    // The block signature below becomes the 65th distinct type, i.e. typeidx 64.
+    for (let i = 0; i < 64; i++) {
+      functions.push({
+        name: `type${i}`,
+        inputs: Array(i).fill('i32'),
+        outputs: [],
+        locals: [],
+        instructions: [{ TAG: 'end', data: undefined }],
+      });
+    }
+    functions.push({
+      name: 'test',
+      inputs: [],
+      outputs: ['i32'],
+      export: true,
+      locals: [],
+      instructions: [
+        { TAG: 'block', data: { inputs: [], outputs: ['i32'] } },
+        { TAG: 'i32.const', data: 7n },
+        { TAG: 'end', data: undefined },
+        { TAG: 'end', data: undefined },
+      ],
+    });
+    const instance = new WebAssembly.Instance(
+      new WebAssembly.Module(wasm.createWasm({ functions }))
+    );
+    deepStrictEqual((instance.exports.test as () => number)(), 7);
   });
   should('atomics', async () => {
     const buf = hex.decode(

@@ -13,7 +13,16 @@ import * as types from './types.ts';
 import { type GetOpsFnOp, type TypeName } from './types.ts';
 import * as utils from './utils.ts';
 
+const _0n = /* @__PURE__ */ BigInt(0);
+const _1n = /* @__PURE__ */ BigInt(1);
+const _32n = /* @__PURE__ */ BigInt(32);
+const U8_MASK_N = /* @__PURE__ */ BigInt(0xff);
+const U32_MASK_N = /* @__PURE__ */ BigInt(0xffffffff);
+const U64_SIGN_N = /* @__PURE__ */ BigInt('0x8000000000000000');
+
+/** Per-node rewrite callback used by `TreeDAG.rewrite`. */
 export type Rewrite = (node: Node, args: FnOp[], idx: NodeIdx) => FnOp | undefined;
+/** Factory shape for rewrites that close over one module graph. */
 export type RewriteFn = (fn: ModuleGraph, opts?: CompilerOpts) => Rewrite;
 
 // These are very self-contained, so even if they small it is reasonable to move out them.
@@ -194,7 +203,21 @@ function loweringUtils(
   return { getConst, isVirtual, prev, mapPrev, getArg, mapBlocks, skipNode, elemwiseVirtual, virt };
 }
 /**
- * Lower u64/i64 into two u32/i32
+ * Lowers wide integer operations into half-width virtual parts.
+ *
+ * @param fn - Function graph whose nodes may be lowered.
+ * @param _opts - Compiler options. {@link CompilerOpts}
+ * @param bits - Wide integer bit width to lower.
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @throws If the requested bit width is unsupported. {@link Error}
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerWideInt } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerWideInt(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
  */
 export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 64): Rewrite {
   if (![64, 128, 256].includes(bits)) throw new Error(`lowerWideInt: unsupported width ${bits}`);
@@ -306,7 +329,7 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
       const carry = opU('shr', [gen, constOf(LT, wordBits - 1)]);
       return cast(LT, carry);
     };
-    const U32 = 0xffff_ffffn;
+    const U32 = U32_MASK_N;
     if (isOp(node, 'arg')) {
       // NOTE: we don't replace node here, instead we create new one and use it everywhere.
       // TODO: Bigint lowering is kinda broken, we cannot call functions with u64 arg anyway.
@@ -324,13 +347,13 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
       const v = node.opts.value;
       if (bits === 64) {
         const loU = v & U32;
-        const hiU = (v >> 32n) & U32;
+        const hiU = (v >> _32n) & U32;
         const l = fn.op(LT, 'const', [], { value: Number(types.u32ToI32(loU)) });
         const h = fn.op(LT, 'const', [], { value: Number(types.u32ToI32(hiU)) });
         return virt(node.type, [l, h], { value: v });
       }
-      const lo = v & ((1n << BigInt(wordBits)) - 1n);
-      const hi = (v >> BigInt(wordBits)) & ((1n << BigInt(wordBits)) - 1n);
+      const lo = v & ((_1n << BigInt(wordBits)) - _1n);
+      const hi = (v >> BigInt(wordBits)) & ((_1n << BigInt(wordBits)) - _1n);
       const l = constOf(LT, lo);
       const h = constOf(LT, hi);
       return virt(node.type, [l, h], { value: v });
@@ -951,6 +974,8 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
         } else throw 'lowerU64/comparisons: not implemented: ' + node.op;
       }
     } else if (isOp(node, 'div', 'rem')) {
+      // UB: callers must ensure integer div/rem operands are valid. Adding traps here
+      // needs an execution-model decision for corrupted state, batch functions, and threads.
       const a = pairOf(0),
         b = pairOf(1);
       if (!a || !b) throw new Error(node.op + '64: missing prev pair(s)');
@@ -1077,13 +1102,38 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
   };
 }
 /**
- * Lower u64/i64 into two u32/i32
+ * Lowers `u64` and `i64` operations into two 32-bit parts.
+ *
+ * @param fn - Function graph whose nodes may be lowered.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @throws If wide-integer lowering sees an unsupported node shape. {@link Error}
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerU64 } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerU64(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
  */
 export function lowerU64(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
   return lowerWideInt(fn, opts, 64);
 }
 /**
- * Basic optimizer with constant folding
+ * Creates the basic constant-folding optimizer rewrite.
+ *
+ * @param fn - Function graph whose nodes may be optimized.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { optimize } from '@awasm/compiler/rewrites.js';
+ *
+ * optimize(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
  */
 export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
   const runtimeTypes = types.genRuntimeTypes();
@@ -1098,10 +1148,10 @@ export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
     if (node.kind !== 'op' || node.op !== 'const') throw new Error('getConst: not const');
     return node.opts.value;
   };
-  const isPow2 = (n: bigint): boolean => n > 0n && (n & (n - 1n)) === 0n;
+  const isPow2 = (n: bigint): boolean => n > _0n && (n & (n - _1n)) === _0n;
   const ctzBig = (n: bigint) => {
     let k = 0;
-    for (; (n & 1n) === 0n; k++, n >>= 1n);
+    for (; (n & _1n) === _0n; k++, n >>= _1n);
     return k;
   };
   return (node, args, _idx) => {
@@ -1173,7 +1223,7 @@ export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
         if (node.op !== 'const') return;
         const value = node.opts.value;
         const rawValue = coder.decode(value) as any as bigint[];
-        for (const v of rawValue) if (v !== 0xffff_ffffn) return false;
+        for (const v of rawValue) if (v !== U32_MASK_N) return false;
         return true;
       };
       const isAnd32 = (idx: string) => {
@@ -1230,11 +1280,11 @@ export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
             if (!isOp(node)) throw new Error('unreachable');
             return fn.op(node.type, node.op, [...argsVar]);
           };
-          // NOTE: for floats: NaN * 0 = NaN, but we will return zero here.
           // a^0 = a, a | 0 = a, a + 0 = a
           if (isOp(node, 'xor', 'or', 'add') && c == 0) return A();
-          // a & 0 = 0, a * 0 = 0
-          if (isOp(node, 'and', 'mul') && c == 0) return T.const(0);
+          // Float multiply by zero preserves NaN, so only integer-ish mul can fold to zero.
+          if (isOp(node, 'and') && c == 0) return T.const(0);
+          if (isOp(node, 'mul') && c == 0 && !types.FloatType.has(node.type)) return T.const(0);
           // a & -1 = a, a & mask = a
           if (types.IntType.has(node.type)) {
             const mask = types.getMask(types.ScalarOf(node.type));
@@ -1255,7 +1305,7 @@ export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
             const abs = c < 0 ? -c : c;
             if (isPow2(BigInt(abs))) {
               const k = ctzBig(BigInt(abs));
-              const mask = (1n << BigInt(k)) - 1n;
+              const mask = (_1n << BigInt(k)) - _1n;
               if (isOp(node, 'mul')) {
                 if (types.SignedType.has(node.type) && c < 0) return T.neg(T.shl(A(), k));
                 else if (c > 0) return T.shl(A(), k);
@@ -1286,7 +1336,20 @@ export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
   };
 }
 /**
- * Lower SIMD operations to scalar ones
+ * Lowers SIMD operations to scalar lane operations.
+ *
+ * @param fn - Function graph whose SIMD nodes may be lowered.
+ * @param _opts - Compiler options. {@link CompilerOpts}
+ * @param filter - Optional predicate selecting which SIMD types are lowered.
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerSIMD } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerSIMD(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
  */
 export function lowerSIMD(
   fn: ModuleGraph,
@@ -1344,7 +1407,7 @@ export function lowerSIMD(
         } else {
           for (let i = 0; i < size; i++) {
             const shifted = i ? U64.shr(bits, I32.const(i * 8)) : bits;
-            const byte64 = U64.and(shifted, U64.const(0xffn));
+            const byte64 = U64.and(shifted, U64.const(U8_MASK_N));
             out.push(fn.op('u32', 'wrap_i64', [byte64]));
           }
         }
@@ -1359,7 +1422,7 @@ export function lowerSIMD(
       for (let lane = 0; lane < count; lane++) {
         const start = lane * size;
         if (size > 4) {
-          let acc = U64.const(0n);
+          let acc = U64.const(_0n);
           for (let i = 0; i < size; i++) {
             const part = U64.shl(U64.fromN('u32', getByte(start + i)), i * 8);
             acc = i ? U64.or(acc, part) : part;
@@ -1486,20 +1549,59 @@ export function lowerSIMD(
     } else if (isOp(node, 'bitselect')) {
       const a = prev[0];
       const b = prev[1];
-      const cond = prev[2]; // EXPECT per-lane mask: 0 or all-ones
+      const cond = prev[2];
       const maskType = types.maskType(node.type);
       const lmaskType = types.ScalarOf(maskType);
       const mT = fn.types[lmaskType];
       if (!a || !b || !cond) throw new Error('lowerSIMD/bitselect: missing args');
       if (!Array.isArray(cond)) throw new Error('lowerSIMD/bitselect: mask must be vector');
+      const maskWidth = types.sizeof(lmaskType) * 8;
+      const maskFull = BigInt.asUintN(maskWidth, BigInt(types.getMask(lmaskType)));
+      const constMask = (op: FnOp) => {
+        const n = as(fn.ops.get(op.idx), 'op');
+        if (n.op !== 'const') return;
+        const retType = types.nodeRetType(fn, op);
+        if (!types.IntType.has(retType) || types.sizeof(retType) !== types.sizeof(lmaskType))
+          return;
+        const value = n.opts.value;
+        if (typeof value !== 'number' && typeof value !== 'bigint') return;
+        if (typeof value === 'number' && !Number.isInteger(value)) return;
+        const bits = BigInt.asUintN(maskWidth, typeof value === 'bigint' ? value : BigInt(value));
+        if (bits === _0n) return 'zero';
+        if (bits === maskFull) return 'full';
+        return;
+      };
+      const isBooleanMask = (op: FnOp): boolean => {
+        const constKind = constMask(op);
+        if (constKind) return true;
+        const n = as(fn.ops.get(op.idx), 'op');
+        if (n.op !== 'select') return false;
+        const left = isBooleanMask(fn.byIdx(n.args[0]));
+        const right = isBooleanMask(fn.byIdx(n.args[1]));
+        return left && right;
+      };
+      const bitselFloat = (lane: number) => {
+        const aBits = laneBits(lType, a[lane]);
+        const bBits = laneBits(lType, b[lane]);
+        const T = aBits.bitsType === 'u64' ? U64 : U32;
+        const axb = T.xor(aBits.bits, bBits.bits);
+        const t = T.and(axb, cond[lane]);
+        const out = T.xor(bBits.bits, t);
+        if (lType === 'f64') return fn.op('f64', 'reinterpret_i64', [out]);
+        return fn.op('f32', 'reinterpret_i32', [out]);
+      };
       const nodePrev = [];
       for (let lane = 0; lane < lanes; lane++) {
-        // this would be easier to catch in optimizer after lowering
-        // // out = b ^ ((a ^ b) & m)
-        // const axb = fn.op(lType, 'xor', [a[lane], b[lane]]);
-        // const t = fn.op(lType, 'and', [axb, m[lane]]);
-        // const out = fn.op(lType, 'xor', [b[lane], t]);
-        nodePrev.push(fn.op(lType, 'select', [b[lane], a[lane], mT.eqz(cond[lane])]));
+        // Keep the old fast scalar select for comparison masks;
+        // arbitrary Wasm masks need bitwise selection.
+        if (isBooleanMask(cond[lane]))
+          nodePrev.push(fn.op(lType, 'select', [b[lane], a[lane], mT.eqz(cond[lane])]));
+        else if (types.FloatType.has(lType)) nodePrev.push(bitselFloat(lane));
+        else {
+          const axb = fn.op(lType, 'xor', [a[lane], b[lane]]);
+          const t = fn.op(lType, 'and', [axb, cond[lane]]);
+          nodePrev.push(fn.op(lType, 'xor', [b[lane], t]));
+        }
       }
       return virt(node.type, nodePrev);
     } else if (isOp(node, 'load')) {
@@ -1623,6 +1725,10 @@ export function lowerSIMD(
       node.op === 'extend_low_i16x8_u' ||
       node.op === 'extend_high_i16x8_s' ||
       node.op === 'extend_high_i16x8_u' ||
+      node.op === 'extend_low_i32x4_s' ||
+      node.op === 'extend_low_i32x4_u' ||
+      node.op === 'extend_high_i32x4_s' ||
+      node.op === 'extend_high_i32x4_u' ||
       node.op === 'extmul_low_i8x16_s' ||
       node.op === 'extmul_low_i8x16_u' ||
       node.op === 'extmul_high_i8x16_s' ||
@@ -1630,7 +1736,11 @@ export function lowerSIMD(
       node.op === 'extmul_low_i16x8_s' ||
       node.op === 'extmul_low_i16x8_u' ||
       node.op === 'extmul_high_i16x8_s' ||
-      node.op === 'extmul_high_i16x8_u'
+      node.op === 'extmul_high_i16x8_u' ||
+      node.op === 'extmul_low_i32x4_s' ||
+      node.op === 'extmul_low_i32x4_u' ||
+      node.op === 'extmul_high_i32x4_s' ||
+      node.op === 'extmul_high_i32x4_u'
     ) {
       const p = prev[0];
       const p2 = prev[1];
@@ -1639,20 +1749,30 @@ export function lowerSIMD(
         ? node.op.endsWith('_s')
           ? 'i8'
           : 'u8'
-        : node.op.endsWith('_s')
-          ? 'i16'
-          : 'u16';
+        : node.op.includes('i16x8')
+          ? node.op.endsWith('_s')
+            ? 'i16'
+            : 'u16'
+          : node.op.endsWith('_s')
+            ? 'i32'
+            : 'u32';
       const start = node.op.includes('high') ? lanes : 0;
       const nodePrev = [];
       for (let i = 0; i < lanes; i++) {
         const src = p[start + i];
         if (!src) throw new Error('lowerSIMD: extend src missing');
-        const a = fn.op(lType, 'smallCast', [src], { from: fromLane });
+        const widen = (src: FnOp) =>
+          isSmallScalar(fromLane)
+            ? fn.op(lType, 'smallCast', [src], { from: fromLane })
+            : fn.op(lType, `extend_i32${node.op.endsWith('_s') ? '_s' : '_u'}`, [src]);
+        // 32-bit sources widen through scalar i64 ops; lowerWideInt
+        // splits those after SIMD lowering.
+        const a = widen(src);
         if (node.op.startsWith('extmul_')) {
           if (!p2) throw new Error('lowerSIMD: extmul missing arg');
           const srcB = p2[start + i];
           if (!srcB) throw new Error('lowerSIMD: extmul src missing');
-          const b = fn.op(lType, 'smallCast', [srcB], { from: fromLane });
+          const b = widen(srcB);
           nodePrev.push(fn.op(lType, 'mul', [a, b]));
         } else {
           nodePrev.push(a);
@@ -1663,11 +1783,41 @@ export function lowerSIMD(
   };
 }
 
+/**
+ * Lowers bigint SIMD helper nodes.
+ *
+ * @param fn - Function graph whose nodes may be lowered.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerBigIntSIMD } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerBigIntSIMD(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
+ */
 export function lowerBigIntSIMD(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
   return lowerSIMD(fn, opts, (type) => types.BigIntType.has(types.ScalarOf(type)));
 }
 
 // Remove no-op casts so single-use analysis sees the real producer.
+/**
+ * Lowers 8-bit and 16-bit integer operations through 32-bit operations.
+ *
+ * @param fn - Function graph whose nodes may be lowered.
+ * @param _opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerSmallInt } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerSmallInt(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
+ */
 export function lowerSmallInt(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite {
   const isSmall = (t: TypeName) => types.SmallIntType.has(t) && types.ScalarType.has(t);
   const info = (t: TypeName) => {
@@ -1758,7 +1908,13 @@ export function lowerSmallInt(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrit
       return norm(
         fn.op(base, 'arg', [], { type: base, pos: node.opts.pos, scope: node.opts.scope })
       );
-    if (isOp(node, 'nodeOutput')) return fn.op(base, 'nodeOutput', [args[0]], node.opts);
+    if (isOp(node, 'nodeOutput')) {
+      const out = fn.op(base, 'nodeOutput', [args[0]], node.opts);
+      const src = fn.ops.get(args[0].idx);
+      // Imported JS callbacks can return out-of-range numbers; keep the declared small domain.
+      if (isOp(src, 'call') && src.opts.isImport) return norm(out);
+      return out;
+    }
     if (isOp(node, 'load')) {
       const size = node.opts.size !== undefined ? node.opts.size : width;
       return fn.op(base, 'load', [args[0]], { ...node.opts, size });
@@ -1857,6 +2013,21 @@ function addWeak(fn: ModuleGraph, oldIdx: NodeIdx, newIdx: NodeIdx) {
 /**
  * Lower virtual SIMD types based on multiple native elements (u32x8 (virtual) over 2xu32x4 (native))
  */
+/**
+ * Lowers virtual SIMD pair values to native SIMD chunks.
+ *
+ * @param fn - Function graph whose virtual SIMD nodes may be lowered.
+ * @param _opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerVirtualSIMDPairs } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerVirtualSIMDPairs(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
+ */
 export function lowerVirtualSIMDPairs(fn: ModuleGraph, _opts?: CompilerOpts): Rewrite {
   return (node, args, idx) => {
     const isPairType = (type: TypeName) =>
@@ -1881,6 +2052,7 @@ export function lowerVirtualSIMDPairs(fn: ModuleGraph, _opts?: CompilerOpts): Re
     const nativeType = getNativeType(node.type);
     const nativeT = fn.types[nativeType] as any;
     const lanesNative = types.lanesOf(nativeType);
+    const lanes = types.lanesOf(node.type);
     const count = T.pairCount!;
     const typeAlign = utils.wasmAlign(types.sizeof(node.type));
     const getLane = (lane: number) => ({
@@ -1987,7 +2159,44 @@ export function lowerVirtualSIMDPairs(fn: ModuleGraph, _opts?: CompilerOpts): Re
     } else if (node.op === 'shuffle') {
       // Default 16 bytes pattern for swapEndianness, todo: fix
       if (node.opts.pattern.length === 16) return elemwiseVirtual();
-      throw 'not implemented';
+      const pattern = node.opts.pattern as number[];
+      const laneSize = types.sizeof(types.ScalarOf(node.type));
+      const typeSize = types.sizeof(node.type);
+      if (pattern.length !== typeSize)
+        throw new Error('lowerVirtualSIMDPairs/shuffle: wrong pattern length');
+      if (!prev[0] || !prev[1])
+        throw new Error('lowerVirtualSIMDPairs/shuffle: expected virtual args');
+      const lanePattern = [];
+      for (let outLane = 0; outLane < lanes; outLane++) {
+        const pos = outLane * laneSize;
+        const base = pattern[pos];
+        if (!Number.isInteger(base) || base < 0 || base >= typeSize * 2 || base % laneSize)
+          throw new Error(
+            'lowerVirtualSIMDPairs/shuffle: only lane-aligned patterns are supported'
+          );
+        for (let i = 1; i < laneSize; i++) {
+          if (pattern[pos + i] !== base + i)
+            throw new Error(
+              'lowerVirtualSIMDPairs/shuffle: only lane-aligned patterns are supported'
+            );
+        }
+        lanePattern.push(base / laneSize);
+      }
+      const parts = [];
+      for (let part = 0; part < count; part++) {
+        let out = nativeT.const(0);
+        for (let lane = 0; lane < lanesNative; lane++) {
+          const srcLane = lanePattern[part * lanesNative + lane];
+          const srcArg = srcLane >= lanes ? 1 : 0;
+          const srcParts = prev[srcArg]!;
+          const src = getLane(srcLane % lanes);
+          const srcPart = srcParts[src.laneArg];
+          const value = lanesNative === 1 ? srcPart : nativeT.extractLane(srcPart, src.lane);
+          out = lanesNative === 1 ? value : nativeT.replaceLane(out, lane, value);
+        }
+        parts.push(out);
+      }
+      return virt(node.type, parts);
     } else if (node.op === 'to_i32_low' || node.op === 'to_i32_high') {
       const pattern = node.op === 'to_i32_low' ? [0, 2, 4, 6] : [1, 3, 5, 7];
       const parts = prev[0]!;
@@ -2034,6 +2243,21 @@ export function lowerVirtualSIMDPairs(fn: ModuleGraph, _opts?: CompilerOpts): Re
 /**
  * Lower virtual SIMD types created from masking lanes of native element (u32x2 (virtual) over u32x4 (native))
  */
+/**
+ * Lowers virtual SIMD mask values to native SIMD chunks.
+ *
+ * @param fn - Function graph whose virtual SIMD mask nodes may be lowered.
+ * @param _opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerVirtualSIMDMask } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerVirtualSIMDMask(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
+ */
 export function lowerVirtualSIMDMask(fn: ModuleGraph, _opts?: CompilerOpts): Rewrite {
   return (node, args, _idx) => {
     if (!isOp(node)) return;
@@ -2065,9 +2289,12 @@ export function lowerVirtualSIMDMask(fn: ModuleGraph, _opts?: CompilerOpts): Rew
         //   - need to zero high lanes if we want to "easy convert to u64x2"
         //
         // just load whole thing (16 bytes), ignore stuff that is unsused
+        const activeBytes = types.sizeof(laneType) * T.maskCount;
+        const zeroLoad = activeBytes === 4 || activeBytes === 8 ? activeBytes * 8 : undefined;
         return fn.op(nativeType, 'load', [args[0]], {
           ...utils.deepClone(node.opts),
-          // use32x2: node.type.endsWith('32x2'),
+          // Native zero-loads preserve low active lanes without over-reading the unused half.
+          zeroLoad,
           source: 'lowerVirtualSIMDMask',
         });
       }
@@ -2122,7 +2349,19 @@ export function lowerVirtualSIMDMask(fn: ModuleGraph, _opts?: CompilerOpts): Rew
   };
 }
 /**
- * Lower '.shuffle' like pattern on scalars into load/store in JS for swapEndianness
+ * Lowers scalar byte-pattern operations into backend-friendly operations.
+ *
+ * @param fn - Function graph whose pattern nodes may be lowered.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerPattern } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerPattern(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
  */
 export function lowerPattern(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
   function isswapEndianness(lst: number[]) {
@@ -2179,43 +2418,69 @@ export function lowerPattern(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite 
 /**
  * Lower function arguments/outputs from u64/i64 into two u32/i32
  */
+/**
+ * Lowers imported and exported 64-bit function ABI values to 32-bit pairs.
+ *
+ * @param fn - Function graph whose call ABI nodes may be lowered.
+ * @param _opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerU64Arg } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerU64Arg(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
+ */
 export function lowerU64Arg(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite {
+  type Remap = Record<number, number | number[]>;
+  type FnRemap = {
+    inputsRemap?: Remap;
+    outputsRemap?: Remap;
+    outputTypes?: TypeName[];
+  };
   const normType = (inp: TypeName) => (inp === 'i64' ? 'i32' : 'u32');
-  const perFn: Record<
-    string,
-    {
-      inputsRemap?: Record<number, number | number[]>;
-      outputsRemap?: Record<number, number | number[]>;
+  const isWide = (inp: TypeName) => inp === 'i64' || inp === 'u64';
+  const remapTypes = (lst: TypeName[]) => {
+    const newTypes: TypeName[] = [];
+    const remap: Remap = {};
+    let changed = false;
+    for (let i = 0; i < lst.length; i++) {
+      const inp = lst[i];
+      if (isWide(inp)) {
+        const t = normType(inp);
+        newTypes.push(t, t);
+        remap[i] = [newTypes.length - 2, newTypes.length - 1]; // low, high
+        changed = true;
+      } else {
+        newTypes.push(inp);
+        remap[i] = newTypes.length - 1;
+      }
     }
-  > = {};
+    return { changed, newTypes, remap: changed ? remap : undefined };
+  };
+  const perFn: Record<string, FnRemap> = {};
   const remapped = new Set();
-  const callArgs: Record<string, FnOp[]> = {};
+  const callArgs: Record<string, (() => FnOp)[]> = {};
   return (node, _args, idx) => {
     if (node.kind === 'function') {
-      const newInputs: TypeName[] = [];
-      const inputsRemap: Record<number, number | number[]> = {};
-      let inputsChanged = false;
-      for (let i = 0; i < node.inputs.length; i++) {
-        const inp = node.inputs[i];
-        if (inp === 'i64' || inp === 'u64') {
-          newInputs.push(normType(inp));
-          newInputs.push(normType(inp));
-          inputsRemap[i] = [newInputs.length - 2, newInputs.length - 1]; // low, high
-          inputsChanged = true;
-        } else {
-          newInputs.push(inp);
-          inputsRemap[i] = newInputs.length - 1;
-        }
-      }
+      const {
+        changed: inputsChanged,
+        newTypes: newInputs,
+        remap: inputsRemap,
+      } = remapTypes(node.inputs);
       // Fix outputs
       const newOutputs: NodeIdx[] = [];
-      const outputsRemap: Record<NodeIdx, number | number[]> = {};
+      const outputsRemap: Remap = {};
+      const outputTypes: TypeName[] = [];
       let outputsChanged = false;
       for (let i = 0; i < node.outputs.length; i++) {
         const out = node.outputs[i];
         const n = fn.ops.get(out);
         const retType = types.nodeRetType(fn, fn.byIdx(out));
-        if (n.kind === 'op' && ['i64', 'u64'].includes(retType)) {
+        outputTypes.push(retType);
+        if (n.kind === 'op' && isWide(retType)) {
           fn.ops.scope(idx, () => {
             const T = fn.types[retType];
             const [l, h] = T.to(normType(retType), fn.byIdx(out));
@@ -2232,8 +2497,9 @@ export function lowerU64Arg(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite 
       if (inputsChanged) node.inputs = newInputs;
       if (outputsChanged) node.outputs = newOutputs;
       perFn[node.name] = {
-        inputsRemap: inputsChanged ? inputsRemap : undefined,
+        inputsRemap,
         outputsRemap: outputsChanged ? outputsRemap : undefined,
+        outputTypes: outputsChanged ? outputTypes : undefined,
       };
       // TODO: this will cause moving node to different idx which will break scoping (?!)
       //if (inputsChanged || outputsChanged) return fn.byIdx(idx);
@@ -2256,16 +2522,27 @@ export function lowerU64Arg(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite 
           return fn.byIdx(idx);
         }
       } else if (node.op === 'nodeOutput') {
+        if (node.opts.loweredU64Arg) return;
         if (remapped.has(node)) return;
         const t = callArgs[node.args[0]];
         if (!t) return;
         if (!t[node.opts.pos]) throw new Error('cannot find call arg');
         remapped.add(node);
-        return t[node.opts.pos];
+        return t[node.opts.pos]();
       } else if (node.op === 'call') {
         if (remapped.has(node)) return;
-        if (!perFn[node.opts.name]) return;
-        const { inputsRemap, outputsRemap } = perFn[node.opts.name];
+        const importRemap = (): FnRemap | undefined => {
+          if (!node.opts.isImport) return;
+          const inputTypes = node.opts.inputTypes as TypeName[] | undefined;
+          const outputTypes = node.opts.outputTypes as TypeName[] | undefined;
+          const inputsRemap = inputTypes ? remapTypes(inputTypes).remap : undefined;
+          const outputsRemap = outputTypes ? remapTypes(outputTypes).remap : undefined;
+          if (!inputsRemap && !outputsRemap) return;
+          return { inputsRemap, outputsRemap, outputTypes };
+        };
+        const remapInfo = perFn[node.opts.name] || importRemap();
+        if (!remapInfo) return;
+        const { inputsRemap, outputsRemap, outputTypes } = remapInfo;
         // Fix call args
         if (inputsRemap) {
           const newArgs = [];
@@ -2273,7 +2550,8 @@ export function lowerU64Arg(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite 
             const map = inputsRemap[i];
             if (Array.isArray(map)) {
               const prevArg = node.args[i];
-              const prevType = as(fn.ops.get(prevArg), 'op').type;
+              const inputTypes = node.opts.inputTypes as TypeName[] | undefined;
+              const prevType = inputTypes ? inputTypes[i] : as(fn.ops.get(prevArg), 'op').type;
               const T = fn.types[prevType];
               const newArg = T.to(normType(prevType), fn.byIdx(prevArg));
               newArgs.push(...newArg.map((i: any) => i.idx));
@@ -2290,17 +2568,31 @@ export function lowerU64Arg(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite 
           const newCallArgs = [];
           for (let i = 0; i < node.opts.outTypes.length; i++) {
             const map = outputsRemap[i];
-            const curType = node.opts.outTypes[i];
+            const curType = outputTypes ? outputTypes[i] : node.opts.outTypes[i];
             if (Array.isArray(map)) {
               newOutTypes.push(normType(curType), normType(curType));
-              const l = fn.op(normType(curType), 'nodeOutput', [fn.byIdx(idx)], { pos: map[0] });
-              const h = fn.op(normType(curType), 'nodeOutput', [fn.byIdx(idx)], { pos: map[1] });
-              const T = (fn.types as any)[curType];
-              newCallArgs.push(T.fromN(normType(curType), [l, h]));
+              // Create replacement nodes only when the old nodeOutput is rewritten; cleanup can
+              // otherwise remove pre-created nodes before the original output is visited.
+              newCallArgs.push(() => {
+                const l = fn.op(normType(curType), 'nodeOutput', [fn.byIdx(idx)], {
+                  pos: map[0],
+                  loweredU64Arg: true,
+                });
+                const h = fn.op(normType(curType), 'nodeOutput', [fn.byIdx(idx)], {
+                  pos: map[1],
+                  loweredU64Arg: true,
+                });
+                const T = (fn.types as any)[curType];
+                return T.fromN(normType(curType), [l, h]);
+              });
             } else {
-              newOutTypes.push(node.opts.outTypes[map]);
-              const type = node.opts.outTypes[map];
-              newCallArgs.push(fn.op(type, 'nodeOutput', [fn.byIdx(idx)], { pos: map }));
+              // `map` is the post-split output position; the type still
+              // comes from the original slot.
+              const type = node.opts.outTypes[i];
+              newOutTypes.push(type);
+              newCallArgs.push(() =>
+                fn.op(type, 'nodeOutput', [fn.byIdx(idx)], { pos: map, loweredU64Arg: true })
+              );
             }
           }
           callArgs[idx] = newCallArgs;
@@ -2315,6 +2607,21 @@ export function lowerU64Arg(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite 
 }
 /**
  * Implement operations not available in wasm (such as 'not')
+ */
+/**
+ * Lowers compiler IR nodes to native Wasm instruction shapes.
+ *
+ * @param fn - Function graph whose nodes may be lowered.
+ * @param _opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerWasm } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerWasm(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
  */
 export function lowerWasm(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite {
   // Handle weirdness inside wasm op encoding
@@ -2386,7 +2693,7 @@ export function lowerWasm(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite {
         (node.op === 'mul' && (node.type === 'i8x16' || node.type === 'u8x16'))
       ) {
         const laneType = types.ScalarOf(node.type);
-        let lanes = types.lanesOf(node.type);
+        let lanes: number = types.lanesOf(node.type);
         if (node.opts.activeLanes) lanes = Math.min(lanes, node.opts.activeLanes);
         const res: FnOp[] = [];
         for (let i = 0; i < lanes; i++) {
@@ -2400,7 +2707,7 @@ export function lowerWasm(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite {
       // No unsigned comparisons in wasm :(
       if (node.type === 'u64x2' && ['lt', 'gt', 'le', 'ge'].includes(node.op)) {
         const { i64x2 } = fn.types;
-        const S = T.const(0x8000_0000_0000_0000n);
+        const S = T.const(U64_SIGN_N);
         return i64x2[node.op as 'lt' | 'gt' | 'le' | 'ge'](T.xor(args[0], S), T.xor(args[1], S));
       }
     }
@@ -2446,6 +2753,21 @@ res = v128.bitselect(b, absA, signMask)
 /**
  * Implement generic 'shuffle'-like pattern on scalars.  Mostly quick hack for runtime typeMod.
  */
+/**
+ * Lowers remaining byte-pattern operations for the JavaScript backend.
+ *
+ * @param fn - Function graph whose pattern nodes may be lowered.
+ * @param _opts - Compiler options. {@link CompilerOpts}
+ * @returns Rewrite callback for `TreeDAG.rewrite`.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { lowerPatternJS } from '@awasm/compiler/rewrites.js';
+ *
+ * lowerPatternJS(new ModuleGraph('demo', {}, new Module('demo'), {}));
+ * ```
+ */
 export function lowerPatternJS(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite {
   return (node, args, _idx) => {
     if (node.kind !== 'op') return;
@@ -2457,13 +2779,20 @@ export function lowerPatternJS(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewri
     const pattern = node.opts.pattern as number[];
     const size = types.sizeof(node.type);
     if (!pattern || pattern.length !== size) throw new Error('pattern: wrong length');
-    let value = args[0];
-    if (types.FloatType.has(node.type))
-      value = U.fromN(iType, fn.op(iType, `reinterpret_${node.type}`, [value]));
-    else if (node.type !== uType) value = U.fromN(node.type, value);
+    const values = args.map((arg) => {
+      if (types.FloatType.has(node.type))
+        return U.fromN(iType, fn.op(iType, `reinterpret_${node.type}`, [arg]));
+      if (node.type !== uType) return U.fromN(node.type, arg);
+      return arg;
+    });
     let acc = U.const(0);
     for (let outByte = 0; outByte < size; outByte++) {
-      let b = U.and(U.shr(value, pattern[outByte] * 8), U.const(0xff));
+      const pat = pattern[outByte];
+      if (!Number.isInteger(pat) || pat < 0 || pat >= args.length * size)
+        throw new Error(`pattern: wrong index ${pat}`);
+      const value = values[Math.floor(pat / size)];
+      const byteIdx = pat % size;
+      let b = U.and(U.shr(value, byteIdx * 8), U.const(0xff));
       if (outByte) b = U.shl(b, outByte * 8);
       acc = outByte ? U.or(acc, b) : b;
     }

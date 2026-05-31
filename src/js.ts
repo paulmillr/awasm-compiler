@@ -1,4 +1,4 @@
-import { base64, hex } from '@scure/base';
+import { base64, hex, type TArg } from '@scure/base';
 import type { CompilerOpts } from './codegen.ts';
 import type { MemOpts } from './memory.ts';
 import { chunks, type ElementOf } from './utils.ts';
@@ -28,21 +28,38 @@ class Stack extends Array<string> {
 }
 
 // basic utils
+/**
+ * Serializes a plain object into a JavaScript object literal.
+ *
+ * @param obj - Object whose values are already JavaScript expressions.
+ * @param deep - Whether nested object values should be serialized recursively.
+ * @returns JavaScript object literal source.
+ * @example
+ * ```js
+ * genObject({ answer: 42 });
+ * ```
+ */
 export function genObject(obj: Record<string, any>, deep = true): string {
   const res = Object.entries(obj)
-    .map(
-      ([k, v]) =>
-        `${k.includes('.') ? `"${k}"` : k}: ${deep && typeof v === 'object' && v !== null ? genObject(v, true) : v}`
-    )
+    .map(([k, v]) => {
+      // `__proto__:` is a prototype setter in object literals, even when the key is quoted.
+      const key =
+        k === '__proto__'
+          ? `[${JSON.stringify(k)}]`
+          : /^[A-Za-z_$][0-9A-Za-z_$]*$/.test(k)
+            ? k
+            : JSON.stringify(k);
+      return `${key}: ${deep && typeof v === 'object' && v !== null ? genObject(v, true) : v}`;
+    })
     .join(', ');
   return `{${res}}`;
 }
 
+/** Generated memory segment view descriptors keyed by segment name. */
 export type Segments = Record<string, MemOpts>;
 
-const HEX_LINE_CHARS = 100;
-const HEX_LINE_BYTES = Math.floor((HEX_LINE_CHARS + 1) / 3);
-const hexLiteral = (code: Uint8Array) =>
+const HEX_LINE_BYTES = 33;
+const hexLiteral = (code: TArg<Uint8Array>) =>
   chunks(hex.encode(code).match(/../g) || [], HEX_LINE_BYTES)
     .map((line) => line.join(' '))
     .join('\n');
@@ -71,22 +88,72 @@ function memSegment(name: string, s: MemOpts, opts: CompilerOpts = {}) {
   return res;
 }
 
-export function memViews(segments: Segments) {
+/**
+ * Generates JavaScript expressions for public segment views.
+ *
+ * @param segments - Allocated memory segment metadata.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns Object mapping segment view names to JavaScript source expressions.
+ * @example
+ * ```js
+ * memViews({});
+ * ```
+ */
+export function memViews(segments: Segments, opts: CompilerOpts = {}): Record<string, string> {
   const res: Record<string, string> = {};
-  for (const [name, s] of Object.entries(segments)) Object.assign(res, memSegment(name, s));
+  for (const [name, s] of Object.entries(segments)) Object.assign(res, memSegment(name, s, opts));
   return res;
 }
 
-const isLiveAfter = (instructions: Instr[], pos: number, id: number) => {
-  for (let i = pos; i < instructions.length; i++) {
+const controlEnd = (instructions: Instr[], pos: number): number => {
+  let depth = 0;
+  for (let i = pos + 1; i < instructions.length; i++) {
+    const it = instructions[i];
+    if (['block', 'loop', 'if'].includes(it.TAG)) depth++;
+    if (it.TAG !== 'end') continue;
+    if (depth === 0) return i;
+    depth--;
+  }
+  return pos;
+};
+const readsBeforeSet = (instructions: Instr[], start: number, end: number, id: number): boolean => {
+  for (let i = start; i < end; i++) {
     const it = instructions[i];
     if (it.TAG === 'local.get' && Number(it.data) === id) return true;
     if ((it.TAG === 'local.set' || it.TAG === 'local.tee') && Number(it.data) === id) return false;
+    if (!['block', 'loop', 'if'].includes(it.TAG)) continue;
+    const next = controlEnd(instructions, i);
+    if (readsBeforeSet(instructions, i + 1, next, id)) return true;
+    i = next;
+  }
+  return false;
+};
+const isLiveAfter = (
+  instructions: Instr[],
+  pos: number,
+  id: number,
+  crossed?: () => void
+): boolean => {
+  let crossedControl = false;
+  for (let i = pos; i < instructions.length; i++) {
+    const it = instructions[i];
+    if (it.TAG === 'local.get' && Number(it.data) === id) {
+      if (crossedControl) crossed?.();
+      return true;
+    }
+    if ((it.TAG === 'local.set' || it.TAG === 'local.tee') && Number(it.data) === id) return false;
+    if (!['block', 'loop', 'if'].includes(it.TAG)) continue;
+    const end = controlEnd(instructions, i);
+    if (readsBeforeSet(instructions, i + 1, end, id)) return true;
+    crossedControl = true;
+    i = end;
   }
   return false;
 };
 
-export const __TEST = { isLiveAfter };
+export const __TEST: Readonly<{ isLiveAfter: typeof isLiveAfter }> = /* @__PURE__ */ Object.freeze({
+  isLiveAfter,
+});
 
 function isNumber(n: string | number) {
   if (typeof n === 'number') return true;
@@ -101,13 +168,36 @@ type Instr = any;
 function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string | undefined {
   // byteSize -> shift
   const SH = (bs: 1 | 2 | 4 | 8) => (bs === 1 ? 0 : bs === 2 ? 1 : bs === 4 ? 2 : 3);
+  // Stack i32 operands used by memory ops are unsigned wasm32 values.
+  const U32 = (value: string) => (isNumber(value) ? `${+value >>> 0}` : `((${value}) >>> 0)`);
+  // Wasm memory addresses are unsigned i32 values, and memarg offsets are unsigned.
+  // Signed JS arithmetic aliases high-bit in-bounds addresses on memories above 2GiB.
+  // OOB memory access is UB for this JS target; it does not synthesize Wasm traps.
   const OFF = (addr: string, offset: number) =>
-    isNumber(addr) ? `${+addr + (offset | 0)}` : `${addr} + ${offset | 0}`;
+    isNumber(addr) ? `${(+addr >>> 0) + (offset >>> 0)}` : `((${addr}) >>> 0) + ${offset >>> 0}`;
+  const ALIGNED = (byte: string, bs: 2 | 4) => isNumber(byte) && (+byte & (bs - 1)) === 0;
   // address -> element index with memarg offset
-  const IDX = (addr: string, offset: number, shift: number) => {
+  const IDX_BYTE = (byte: string, shift: number) =>
+    isNumber(byte) ? `${+byte >>> shift}` : `(${byte}) >>> ${shift}`;
+  const IDX = (addr: string, offset: number, shift: number) => IDX_BYTE(OFF(addr, offset), shift);
+  const ATOMIC_THROW = `(()=>{throw new Error('unaligned atomic access')})()`;
+  const ATOMIC = (addr: string, offset: number, bs: 1 | 2 | 4, expr: (idx: string) => string) => {
     const byte = OFF(addr, offset);
-    return isNumber(byte) ? `${+byte >>> shift}` : `(${byte}) >>> ${shift}`;
+    const shift = SH(bs);
+    if (bs === 1) return expr(IDX_BYTE(byte, shift));
+    const mask = bs - 1;
+    if (isNumber(byte)) return +byte & mask ? ATOMIC_THROW : expr(IDX_BYTE(byte, shift));
+    // Plain Error is intentional: unaligned atomics mean the fixed JS memory model is corrupt.
+    return `((__addr)=>((__addr & ${mask}) ? ${ATOMIC_THROW} : (${expr(
+      `__addr >>> ${shift}`
+    )})))(${byte})`;
   };
+  const ATOMIC_STMT = (
+    addr: string,
+    offset: number,
+    bs: 1 | 2 | 4,
+    expr: (idx: string) => string
+  ) => `${ATOMIC(addr, offset, bs, expr)};`;
   if (['i32.const', 'f32.const', 'f64.const'].includes(instr.TAG)) stack.push(`${instr.data}`);
   else if (instr.TAG === 'i32.xor') stack.push(`(${stack.pop()} ^ ${stack.pop()})`);
   else if (instr.TAG === 'i32.add') stack.push(`((${stack.pop()} + ${stack.pop()}) | 0)`);
@@ -195,8 +285,10 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
   } else if (instr.TAG === 'f64.convert_i32_u') {
     stack.push(`((${stack.pop()}) >>> 0)`);
   } else if (['i32.trunc_f32_u', 'i32.trunc_f64_u'].includes(instr.TAG)) {
+    // UB: callers must keep trunc inputs finite/in range; JS output has no trap model.
     stack.push(`(Math.trunc(${stack.pop()}) >>> 0) | 0`);
   } else if (['i32.trunc_f32_s', 'i32.trunc_f64_s'].includes(instr.TAG)) {
+    // UB: callers must keep trunc inputs finite/in range; JS output has no trap model.
     stack.push(`(Math.trunc(${stack.pop()}) | 0)`);
   } else if (instr.TAG === 'f64.promote_f32') {
     stack.push(`${stack.pop()}`);
@@ -216,7 +308,10 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
     stack.push(`Math.floor(${stack.pop()})`);
   } else if (['f32.trunc', 'f64.trunc'].includes(instr.TAG)) {
     stack.push(`Math.trunc(${stack.pop()})`);
-  } else if (['f32.sqrt', 'f64.sqrt'].includes(instr.TAG)) {
+  } else if (instr.TAG === 'f32.sqrt') {
+    // f32 operations must round back to binary32; Math.sqrt returns f64.
+    stack.push(`Math.fround(Math.sqrt(${stack.pop()}))`);
+  } else if (instr.TAG === 'f64.sqrt') {
     stack.push(`Math.sqrt(${stack.pop()})`);
   } else if (instr.TAG === 'f64.nearest') {
     stack.push(
@@ -276,27 +371,28 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
     const offset2 = IDX(addr, instr.data.offset, 1);
     const offset4 = IDX(addr, instr.data.offset, 2);
     const useTA = isLE && !instr.data.swapEndianness;
+    // Raw Wasm memarg align is only an immediate. Internal IR memory ops are
+    // trusted to carry correct align; bad rawFn/rewrite nodes are already invalid IR.
+    const align2 = instr.data.trustedAlign ? instr.data['align'] >= 1 : ALIGNED(offset, 2);
+    const align4 = instr.data.trustedAlign ? instr.data['align'] >= 2 : ALIGNED(offset, 4);
+    const useTA2 = useTA && align2;
+    const useTA4 = useTA && align4;
     const LE = instr.data.swapEndianness ? 'false' : 'true';
     // load, swap endianess
-    if (instr.TAG === 'i32.load' && useTA && instr.data['align'] >= 2)
-      stack.push(`memory_i32[${offset4}]`);
-    else if (instr.TAG === 'i32.load16_u' && useTA && instr.data['align'] >= 1)
-      stack.push(`memory_u16[${offset2}]`);
-    else if (instr.TAG === 'i32.load16_s' && useTA && instr.data['align'] >= 1)
-      stack.push(`memory_i16[${offset2}]`);
+    if (instr.TAG === 'i32.load' && useTA4) stack.push(`memory_i32[${offset4}]`);
+    else if (instr.TAG === 'i32.load16_u' && useTA2) stack.push(`memory_u16[${offset2}]`);
+    else if (instr.TAG === 'i32.load16_s' && useTA2) stack.push(`memory_i16[${offset2}]`);
     else if (instr.TAG === 'i32.load8_u') stack.push(`memory[${offset}]`);
     else if (instr.TAG === 'i32.load8_s') stack.push(`memory_i8[${offset}]`);
     // load fallback
-    else if (instr.TAG === 'i32.load') stack.push(`memory_view.getUint32(${offset}, ${LE})`);
+    else if (instr.TAG === 'i32.load') stack.push(`memory_view.getInt32(${offset}, ${LE})`);
     else if (instr.TAG === 'f32.load') stack.push(`memory_view.getFloat32(${offset}, ${LE})`);
     else if (instr.TAG === 'f64.load') stack.push(`memory_view.getFloat64(${offset}, ${LE})`);
     else if (instr.TAG === 'i32.load16_u') stack.push(`memory_view.getUint16(${offset}, ${LE})`);
     else if (instr.TAG === 'i32.load16_s') stack.push(`memory_view.getInt16(${offset}, ${LE})`);
     // store, aligned
-    else if (instr.TAG === 'i32.store' && useTA && instr.data['align'] >= 2)
-      return `memory_i32[${offset4}] = ${val};`;
-    else if (instr.TAG === 'i32.store16' && useTA && instr.data['align'] >= 1)
-      return `memory_i16[${offset2}] = ${val};`;
+    else if (instr.TAG === 'i32.store' && useTA4) return `memory_i32[${offset4}] = ${val};`;
+    else if (instr.TAG === 'i32.store16' && useTA2) return `memory_i16[${offset2}] = ${val};`;
     else if (instr.TAG === 'i32.store8') return `memory[${offset}] = ${val};`;
     // store, fallback
     else if (instr.TAG === 'i32.store') return `memory_view.setInt32(${offset}, ${val}, ${LE});`;
@@ -325,6 +421,7 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
   } else if (instr.TAG === 'i64.extend_i32_s') {
     stack.push(`BigInt(${stack.pop()} | 0)`);
   } else if (instr.TAG === 'i32.wrap_i64') {
+    // Raw i64 BigInt paths are unsupported; compiler JS lowers wide ints before emission.
     stack.push(`(Number(${stack.pop()}) & 0xffffffff)`);
   } else if (instr.TAG === 'i32.eqz') {
     const x = stack.pop();
@@ -396,6 +493,7 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
   } else if (instr.TAG === 'i32.div_s') {
     const a = stack.pop(),
       b = stack.pop();
+    // UB: callers must keep integer div/rem operands valid; JS output has no trap/error model.
     stack.push(`(((((${b})|0)/(((${a})|0)))|0))`);
   } else if (instr.TAG === 'i32.div_u') {
     const a = stack.pop(),
@@ -429,16 +527,23 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
     stack.push(
       `(()=>{let x=((${a})>>>0);x-=((x>>>1)&0x55555555);x=(x&0x33333333)+((x>>>2)&0x33333333);x=(x+(x>>>4))&0x0f0f0f0f;return (Math.imul(x,0x01010101)>>>24)|0;})()`
     );
+  } else if (instr.TAG === 'memory.size') {
+    // Wasm reports memory size in 64KiB pages; native Wasm rounds byte memory up to pages.
+    stack.push(`(Math.ceil(__buf.byteLength / 65536) | 0)`);
+  } else if (instr.TAG === 'memory.grow') {
+    // JS output keeps const typed-array views for performance; grow replaces or
+    // detaches the backing buffer, so silently emitting it would leave stale views.
+    throw new Error('memory.grow is not supported by JS output with fixed-size memory views');
   } else if (instr.TAG === 'memory.fill') {
-    const len = stack.pop();
-    const value = stack.pop();
-    const pos = stack.pop();
+    const len = U32(stack.pop()!);
+    const value = stack.pop()!;
+    const pos = U32(stack.pop()!);
     return `memory.fill(${value}, ${pos}, ${pos} + ${len})`;
   } else if (instr.TAG === 'memory.copy') {
     // [dstPos, srcPos, len]
-    const len = stack.pop();
-    const srcPos = stack.pop();
-    const dstPos = stack.pop();
+    const len = U32(stack.pop()!);
+    const srcPos = U32(stack.pop()!);
+    const dstPos = U32(stack.pop()!);
     //exp.copyWithin(dst, src, src + len)
     return `memory.copyWithin(${dstPos}, ${srcPos}, ${srcPos}+${len});`;
     // lines.push(`memory.subarray(${dstPos}).set(memory.subarray(${srcPos}, ${srcPos}+${len}));`);
@@ -450,8 +555,10 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
   } else if (instr.TAG === 'atomic.notify') {
     const count = stack.pop()!;
     const addr = stack.pop()!;
-    const idx = IDX(addr, instr.data.offset | 0, SH(4));
-    stack.pushSide(`Atomics.notify(memory_i32, ${idx}, ${count}|0)`);
+    const offset = instr.data.offset;
+    stack.pushSide(
+      ATOMIC(addr, offset, 4, (idx) => `Atomics.notify(memory_i32, ${idx}, ${count}|0)`)
+    );
   } else if (instr.TAG === 'atomic.fence') {
     // JS Atomics are seq-cst; fence is a no-op here.
     return `/* atomic.fence (seq-cst) */`;
@@ -462,9 +569,9 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
       const timeoutLo = stack.pop()!;
       const expected = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
+      const offset = instr.data.offset;
       // negative if sign bit of hi is set; omit timeout (infinite) in that case
-      const res =
+      const res = (idx: string) =>
         `(((${timeoutHi}|0) < 0) ? ` +
         // infinite wait: no timeout parameter
         `Atomics.wait(memory_i32, ${idx}, (${expected}|0)) : ` +
@@ -474,164 +581,184 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
         `)`;
 
       // map 'ok'|'not-equal'|'timed-out' to 0/1/2 like Wasm
-      stack.pushSide(`({ok:0,'not-equal':1,'timed-out':2}[${res}])`);
+      stack.pushSide(
+        ATOMIC(addr, offset, 4, (idx) => `({ok:0,'not-equal':1,'timed-out':2}[${res(idx)}])`)
+      );
     }
     // ---- loads (push) ----
     else if (instr.TAG === 'i32.atomic.load') {
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
-      stack.pushSide(`Atomics.load(memory_i32, ${idx})|0`);
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 4, (idx) => `Atomics.load(memory_i32, ${idx})|0`));
     } else if (instr.TAG === 'i32.atomic.load8_u') {
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(1));
-      stack.pushSide(`Atomics.load(memory_u8, ${idx})|0`);
+      const offset = instr.data.offset;
+      // 8-bit atomics use the existing Uint8Array view emitted as `memory`.
+      stack.pushSide(ATOMIC(addr, offset, 1, (idx) => `Atomics.load(memory, ${idx})|0`));
     } else if (instr.TAG === 'i32.atomic.load16_u') {
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(2));
-      stack.pushSide(`Atomics.load(memory_u16, ${idx})|0`);
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 2, (idx) => `Atomics.load(memory_u16, ${idx})|0`));
     }
     // ---- stores (return statement) ----
     else if (instr.TAG === 'i32.atomic.store') {
       const val = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
-      return `Atomics.store(memory_i32, ${idx}, (${val}|0));`;
+      const offset = instr.data.offset;
+      return ATOMIC_STMT(addr, offset, 4, (idx) => `Atomics.store(memory_i32, ${idx}, (${val}|0))`);
     } else if (instr.TAG === 'i32.atomic.store8') {
       const val = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(1));
-      return `Atomics.store(memory_u8, ${idx}, ${val});`;
+      const offset = instr.data.offset;
+      return ATOMIC_STMT(addr, offset, 1, (idx) => `Atomics.store(memory, ${idx}, ${val})`);
     } else if (instr.TAG === 'i32.atomic.store16') {
       const val = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(2));
-      return `Atomics.store(memory_u16, ${idx}, ${val});`;
+      const offset = instr.data.offset;
+      return ATOMIC_STMT(addr, offset, 2, (idx) => `Atomics.store(memory_u16, ${idx}, ${val})`);
     }
 
     // ---- RMW (push previous value, wasm semantics) ----
     else if (instr.TAG === 'i32.atomic.add') {
       const val = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
-      stack.pushSide(`Atomics.add(memory_i32, ${idx}, (${val}|0))|0`);
+      const offset = instr.data.offset;
+      stack.pushSide(
+        ATOMIC(addr, offset, 4, (idx) => `Atomics.add(memory_i32, ${idx}, (${val}|0))|0`)
+      );
     } else if (instr.TAG === 'i32.atomic.add8_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.add(memory_u8,  ${IDX(addr, instr.data.offset | 0, SH(1))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 1, (idx) => `Atomics.add(memory,  ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.add16_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.add(memory_u16, ${IDX(addr, instr.data.offset | 0, SH(2))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 2, (idx) => `Atomics.add(memory_u16, ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.sub') {
       const val = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
-      stack.pushSide(`Atomics.sub(memory_i32, ${idx}, (${val}|0))|0`);
+      const offset = instr.data.offset;
+      stack.pushSide(
+        ATOMIC(addr, offset, 4, (idx) => `Atomics.sub(memory_i32, ${idx}, (${val}|0))|0`)
+      );
     } else if (instr.TAG === 'i32.atomic.sub8_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.sub(memory_u8,  ${IDX(addr, instr.data.offset | 0, SH(1))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 1, (idx) => `Atomics.sub(memory,  ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.sub16_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.sub(memory_u16, ${IDX(addr, instr.data.offset | 0, SH(2))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 2, (idx) => `Atomics.sub(memory_u16, ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.and') {
       const val = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
-      stack.pushSide(`Atomics.and(memory_i32, ${idx}, (${val}|0))|0`);
+      const offset = instr.data.offset;
+      stack.pushSide(
+        ATOMIC(addr, offset, 4, (idx) => `Atomics.and(memory_i32, ${idx}, (${val}|0))|0`)
+      );
     } else if (instr.TAG === 'i32.atomic.and8_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.and(memory_u8,  ${IDX(addr, instr.data.offset | 0, SH(1))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 1, (idx) => `Atomics.and(memory,  ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.and16_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.and(memory_u16, ${IDX(addr, instr.data.offset | 0, SH(2))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 2, (idx) => `Atomics.and(memory_u16, ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.or') {
       const val = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
-      stack.pushSide(`Atomics.or(memory_i32, ${idx}, (${val}|0))|0`);
+      const offset = instr.data.offset;
+      stack.pushSide(
+        ATOMIC(addr, offset, 4, (idx) => `Atomics.or(memory_i32, ${idx}, (${val}|0))|0`)
+      );
     } else if (instr.TAG === 'i32.atomic.or8_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.or(memory_u8,  ${IDX(addr, instr.data.offset | 0, SH(1))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 1, (idx) => `Atomics.or(memory,  ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.or16_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.or(memory_u16, ${IDX(addr, instr.data.offset | 0, SH(2))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 2, (idx) => `Atomics.or(memory_u16, ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.xor') {
       const val = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
-      stack.pushSide(`Atomics.xor(memory_i32, ${idx}, (${val}|0))|0`);
+      const offset = instr.data.offset;
+      stack.pushSide(
+        ATOMIC(addr, offset, 4, (idx) => `Atomics.xor(memory_i32, ${idx}, (${val}|0))|0`)
+      );
     } else if (instr.TAG === 'i32.atomic.xor8_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.xor(memory_u8,  ${IDX(addr, instr.data.offset | 0, SH(1))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 1, (idx) => `Atomics.xor(memory,  ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.xor16_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
-      stack.pushSide(
-        `Atomics.xor(memory_u16, ${IDX(addr, instr.data.offset | 0, SH(2))}, ${val})|0`
-      );
+      const offset = instr.data.offset;
+      stack.pushSide(ATOMIC(addr, offset, 2, (idx) => `Atomics.xor(memory_u16, ${idx}, ${val})|0`));
     } else if (instr.TAG === 'i32.atomic.xchg') {
       const val = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
-      stack.pushSide(`Atomics.exchange(memory_i32, ${idx}, (${val}|0))|0`);
+      const offset = instr.data.offset;
+      stack.pushSide(
+        ATOMIC(addr, offset, 4, (idx) => `Atomics.exchange(memory_i32, ${idx}, (${val}|0))|0`)
+      );
     } else if (instr.TAG === 'i32.atomic.xchg8_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
+      const offset = instr.data.offset;
       stack.pushSide(
-        `Atomics.exchange(memory_u8,  ${IDX(addr, instr.data.offset | 0, SH(1))}, ${val})|0`
+        ATOMIC(addr, offset, 1, (idx) => `Atomics.exchange(memory,  ${idx}, ${val})|0`)
       );
     } else if (instr.TAG === 'i32.atomic.xchg16_u') {
       const val = stack.pop()!,
         addr = stack.pop()!;
+      const offset = instr.data.offset;
       stack.pushSide(
-        `Atomics.exchange(memory_u16, ${IDX(addr, instr.data.offset | 0, SH(2))}, ${val})|0`
+        ATOMIC(addr, offset, 2, (idx) => `Atomics.exchange(memory_u16, ${idx}, ${val})|0`)
       );
     } else if (instr.TAG === 'i32.atomic.cmpxchg') {
       const replacement = stack.pop()!;
       const expected = stack.pop()!;
       const addr = stack.pop()!;
-      const idx = IDX(addr, instr.data.offset | 0, SH(4));
+      const offset = instr.data.offset;
       stack.pushSide(
-        `Atomics.compareExchange(memory_i32, ${idx}, (${expected}|0), (${replacement}|0))|0`
+        ATOMIC(
+          addr,
+          offset,
+          4,
+          (idx) =>
+            `Atomics.compareExchange(memory_i32, ${idx}, (${expected}|0), (${replacement}|0))|0`
+        )
       );
     } else if (instr.TAG === 'i32.atomic.cmpxchg8_u') {
       const r = stack.pop()!,
         e = stack.pop()!,
         addr = stack.pop()!;
+      const offset = instr.data.offset;
       stack.pushSide(
-        `Atomics.compareExchange(memory_u8,  ${IDX(addr, instr.data.offset | 0, SH(1))}, ${e}, ${r})|0`
+        ATOMIC(addr, offset, 1, (idx) => `Atomics.compareExchange(memory,  ${idx}, ${e}, ${r})|0`)
       );
     } else if (instr.TAG === 'i32.atomic.cmpxchg16_u') {
       const r = stack.pop()!,
         e = stack.pop()!,
         addr = stack.pop()!;
+      const offset = instr.data.offset;
       stack.pushSide(
-        `Atomics.compareExchange(memory_u16, ${IDX(addr, instr.data.offset | 0, SH(2))}, ${e}, ${r})|0`
+        ATOMIC(
+          addr,
+          offset,
+          2,
+          (idx) => `Atomics.compareExchange(memory_u16, ${idx}, ${e}, ${r})|0`
+        )
       );
     } else {
       throw new Error('unknown instruction: ' + instr.TAG);
@@ -642,17 +769,21 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
   return;
 }
 
-let stateArrayIdx = 0;
 /**
  * Split generated function into multiple smaller function because after ~60kb limit v8 will refuse to
  * optimize code.
  */
-function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true) {
+function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true, stateArrayIdx = 0) {
   const name = fn.name;
   if (!fn.name) throw new Error('unknown name');
   const { instructions } = fn;
   const inputs = fn.inputs.map((_: any, i: any) => `v${i}`);
-  const vName = opts.jsStateArray ? `SV${stateArrayIdx++}` : undefined;
+  const vName = opts.jsStateArray ? `SV${stateArrayIdx}` : undefined;
+  const stateTypes: string[] = [];
+  if (opts.jsStateArray) {
+    stateTypes.push(...fn.inputs);
+    for (const { count, type } of fn.locals) for (let i = 0; i < count; i++) stateTypes.push(type);
+  }
 
   const LIMIT = opts.jsOpsPerFn || 60_000;
   // 1. collect how much times each variable was set (if 1, then it is immutable)
@@ -680,6 +811,8 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true) {
   let stackArgs: Set<number> = new Set();
   let stackLines: string[] = [];
   let stackProvides: number[] = [];
+  const forcedMutable = new Set<number>();
+  const forcedDeclared = new Set<number>(inputs.map((_: string, i: number) => i));
   const collapseStack: {
     line: string;
     args: typeof stackArgs;
@@ -727,8 +860,26 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true) {
     }
   };
   const getVar = (id: number) => (opts.jsStateArray ? `${vName}[${id}]` : `v${id}`);
+  const stateValue = (id: number, value: string) => {
+    const type = stateTypes[id];
+    if (type === 'i32') return `((${value}) | 0)`;
+    if (type === 'f32') return `Math.fround(${value})`;
+    return value;
+  };
+  const retValue = (pos: number, value: string) => {
+    const type = fn.outputs[pos];
+    if (!opts.jsStateArray || type !== 'i32') return value;
+    return `((${value}) | 0)`;
+  };
   const getSetVar = (id: number, value: string) => {
-    let res = `${getVar(id)} = ${value};`;
+    let res = `${getVar(id)} = ${opts.jsStateArray ? stateValue(id, value) : value};`;
+    if (!opts.jsStateArray && forcedMutable.has(id)) {
+      if (!forcedDeclared.has(id)) {
+        forcedDeclared.add(id);
+        res = `let ${res}`;
+      }
+      return res;
+    }
     if (!varMutable.has(id) && !opts.jsStateArray) res = `const ${res}`;
     return res;
   };
@@ -748,7 +899,7 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true) {
     [];
   for (let pos = 0; pos < instructions.length; pos++) {
     const i = instructions[pos];
-    const eatTail = (outs: string[]) => {
+    const eatTail = (outs: string[], forceMutableOnControl = false) => {
       let line = '';
       const sets = instructions.slice(pos + 1, pos + 1 + outs.length);
       const nextPos = pos + 1 + outs.length;
@@ -761,7 +912,10 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true) {
       idx.reverse(); // they will eat stack in reverse order? (not sure!)
       const live: number[] = [];
       for (let i = 0; i < outs.length; i++) {
-        if (isDeadVar(idx[i]) || !isLiveAfter(instructions, nextPos, idx[i])) continue;
+        let crossesControl = false;
+        const liveAfter = isLiveAfter(instructions, nextPos, idx[i], () => (crossesControl = true));
+        if (isDeadVar(idx[i]) || !liveAfter) continue;
+        if (crossesControl && forceMutableOnControl) forcedMutable.add(idx[i]);
         line += `${getSetVar(idx[i], outs[i])}\n`;
         live.push(idx[i]);
       }
@@ -842,7 +996,12 @@ ${saveState}${jmp}
         flushStack(line, i, idx);
         continue;
       } else if (!opts.jsStateArray && i.hoist.length) {
-        line += `let ${i.hoist.map((i: number) => `v${i}`).join(', ')}\n`; // state array will just write
+        const hoist = i.hoist.filter(
+          (id: number) => !(forcedMutable.has(id) && forcedDeclared.has(id))
+        );
+        for (const id of hoist) if (forcedMutable.has(id)) forcedDeclared.add(id);
+        // State-array mode writes these through array slots instead.
+        if (hoist.length) line += `let ${hoist.map((i: number) => `v${i}`).join(', ')}\n`;
       }
       line += loopLine;
       flushStack(line, i);
@@ -854,11 +1013,12 @@ ${saveState}${jmp}
       } else {
         const tmp = `r${maxCallIdx++}`;
         let line = `const ${tmp} = ${i.data}(${argsArr.join(', ')});\n`;
+        // JS generation expects codegen-normalized call results: call followed by local.set tails.
         // Now, those are weird and we need to mark everything that uses them
         const outs = [];
         if (i.opts.outTypes.length === 1) outs.push(tmp);
         else for (let k = 0; k < i.opts.outTypes.length; k++) outs.push(`${tmp}[${k}]`);
-        const { line: tailLine, idx } = eatTail(outs);
+        const { line: tailLine, idx } = eatTail(outs, true);
         line += tailLine;
         flushStack(line, undefined, idx);
       }
@@ -887,12 +1047,14 @@ ${saveState}${jmp}
       }
       const line =
         stack.length === 1
-          ? `${stack.pop()}`
+          ? retValue(0, stack.pop()!)
           : stack.length === 0
             ? ''
             : opts.jsOutObject
-              ? genObject(Object.fromEntries(stack.map((i, j) => [`r${j}`, i])))
-              : `[${stack.join(', ')}]`;
+              ? genObject(
+                  Object.fromEntries(Array.from(stack, (i, j) => [`r${j}`, retValue(j, i)]))
+                )
+              : `[${Array.from(stack, (i, j) => retValue(j, i)).join(', ')}]`;
       stack.clear();
       flushStack(`return ${line};`, i);
       blockStack.pop();
@@ -1128,14 +1290,20 @@ ${cur.lines}${ret}
     stateInit = '';
   if (opts.jsStateArray) {
     let locals = inputs.length;
-    for (const { count, type } of fn.locals) {
-      if (type !== 'i32') throw new Error('wrong type: ' + type);
-      locals += count;
-    }
-    // Hoist a unique buffer per generated function
-    stateOuter = `const ${vName} = new Uint32Array(${locals});`;
+    for (const { count } of fn.locals) locals += count;
+    // Int32Array preserves signed i32 reads; Float64Array keeps mixed numeric state exact.
+    const stateCtor = stateTypes.every((i) => i === 'i32')
+      ? 'Int32Array'
+      : stateTypes.every((i) => i === 'f32')
+        ? 'Float32Array'
+        : 'Float64Array';
+    // Hoist a unique buffer per generated function.
+    stateOuter = `const ${vName} = new ${stateCtor}(${locals});`;
     // Alias to V inside, then seed params each call
-    stateInit = `${inputs.map((n: string, i: number) => `${vName}[${i}] = ${n};`).join('\n')}`;
+    const init = inputs.map((n: string, i: number) => {
+      return `${vName}[${i}] = ${stateValue(i, n)};`;
+    });
+    stateInit = init.join('\n');
   }
   const res = `
 ${parts.join('\n')}
@@ -1152,22 +1320,52 @@ function ${name}(${inputs.join(', ')}) {
   return res;
 }
 
-export function createJS(mod: WasmModule, importEmbed: ImportEmbed, opts: CompilerOpts = {}) {
+/**
+ * Generates the pure JavaScript fallback implementation for a lowered module.
+ *
+ * @param mod - Lowered Wasm-compatible module description.
+ * @param importEmbed - Embedded import callbacks by module name.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns JavaScript source that builds an instance object without using
+ * the WebAssembly namespace.
+ * @throws If duplicate generated function names are found. {@link Error}
+ * @example
+ * ```js
+ * import { createJS } from '@awasm/compiler/js.js';
+ *
+ * createJS({ name: 'demo', memory: { size: 0 }, functions: [] }, { env: {} });
+ * ```
+ */
+export function createJS(
+  mod: WasmModule,
+  importEmbed: ImportEmbed,
+  opts: CompilerOpts = {}
+): string {
   const modMemory = mod.memory || { size: 0 };
   const bufType = `${modMemory.shared ? 'Shared' : ''}ArrayBuffer`;
+  // JS output consumes compiler-normalized instructions, not arbitrary
+  // raw Wasm control opcodes.
+  // Keep this path free of the WebAssembly namespace; it is the wasm-less fallback target.
+  // Compiler JS should reach here with i64/u64 lowered to i32/u32 parts.
+  // BigInt paths are too slow.
   const createBuf = `new ${bufType}(${modMemory.size})`;
   const fixInstructions = (fn: ElementOf<typeof mod.functions>) => ({
     ...fn,
     instructions: fn.instructions!.map((i) => i),
   });
+  // State-array names are per generated module; process-global counters
+  // make repeated builds drift.
+  let stateArrayIdx = 0;
   const fnBody = mod.functions
     .filter((f) => !f.import)
-    .map((fn) => generateInstructions(fixInstructions(fn), opts))
+    .map((fn) => generateInstructions(fixInstructions(fn), opts, true, stateArrayIdx++))
     .join('\n');
   const need = (name: string) => new RegExp(`\\b${name}\\b`).test(fnBody);
   const needEnv = !!modMemory.import || mod.functions.some((f) => f.import);
   let out = '\n';
   if (needEnv) out += `const env = _imports.env;\n`;
+  // JS fallback/worker-pool paths may not have a WebAssembly.Memory object, so
+  // imported JS memory intentionally accepts any memory-like object with a buffer.
   out += `const __buf = ${modMemory.import ? `env && env._memory ? env._memory.buffer : ${createBuf}` : createBuf};\n`;
   out += `if (!(__buf instanceof ${bufType})) throw new Error('wrong buffer');\n`;
   // Internal stuff
@@ -1179,9 +1377,16 @@ export function createJS(mod: WasmModule, importEmbed: ImportEmbed, opts: Compil
   if (need('memory_u32')) out += `const memory_u32 = new Uint32Array(__buf);\n`;
   if (need('memory_i32')) out += `const memory_i32 = new Int32Array(__buf);\n`;
   if (need('memory_view')) out += `const memory_view = new DataView(__buf);\n`;
-  const importFns = mod.functions.filter((f) => f.import).map((f) => f.name);
-  if (importFns.length) {
-    out += `const {${importFns.join(', ')}} = env;\n`;
+  const importFns: Record<string, string[]> = {};
+  for (const f of mod.functions.filter((f) => f.import)) {
+    const modName = f.module || 'env';
+    if (!importFns[modName]) importFns[modName] = [];
+    importFns[modName].push(f.name);
+  }
+  // Function imports keep the explicit import module; env is just the default.
+  for (const modName in importFns) {
+    const src = modName === 'env' ? 'env' : `_imports[${JSON.stringify(modName)}]`;
+    out += `const {${importFns[modName].join(', ')}} = ${src};\n`;
   }
   const fnNames: Record<string, ElementOf<typeof mod.functions>> = {};
   for (const fn of mod.functions) {
@@ -1207,12 +1412,27 @@ const code = codeFn.toString();
   return out;
 }
 
+/**
+ * Generates a JavaScript prelude that instantiates embedded Wasm bytes.
+ *
+ * @param mod - Lowered Wasm-compatible module description.
+ * @param code - Wasm binary bytes.
+ * @param importEmbed - Embedded import callbacks by module name.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns JavaScript source that creates `module` and `instance` bindings.
+ * @example
+ * ```js
+ * import { wrapWASM } from '@awasm/compiler/js.js';
+ *
+ * wrapWASM({ name: 'demo', memory: { size: 0 }, functions: [] }, new Uint8Array(), { env: {} });
+ * ```
+ */
 export function wrapWASM(
   mod: WasmModule,
-  code: Uint8Array,
+  code: TArg<Uint8Array>,
   importEmbed: ImportEmbed,
   opts: CompilerOpts = {}
-) {
+): string {
   const wasmMem = (mod: WasmModule) => {
     const { opts } = wasmMemoryOpts(mod);
     return `new WebAssembly.Memory(${genObject({ initial: opts.initial, maximum: opts.maximum, shared: opts.flags.shared })})`;
@@ -1235,18 +1455,60 @@ const instance = new WebAssembly.Instance(module, _imports);
 `;
 }
 
+/** Embedded import callback source strings by import module and function name. */
 export type ImportEmbed = Record<string, Record<string, string>>;
+/** Generated wrapper source and declaration strings. */
+export type WrappedModule = {
+  /** Raw IIFE body used by `exec`. */
+  raw: string;
+  /** Generated TypeScript return type body. */
+  typeRaw: string;
+  /** Generated ES module default export source. */
+  modFn: string;
+  /** Generated ES module declaration source. */
+  modFnType: string;
+};
 
+/**
+ * Wraps generated backend source with public exports, memory views, and types.
+ *
+ * @param mod - Lowered Wasm-compatible module description.
+ * @param code - Backend implementation source.
+ * @param segments - Allocated memory segment metadata.
+ * @param importEmbed - Embedded import callbacks by module name.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns Raw wrapper source plus generated type declarations.
+ * @throws If an exported function or memory type cannot be represented. {@link Error}
+ * @example
+ * ```js
+ * import { wrapModule } from '@awasm/compiler/js.js';
+ *
+ * wrapModule({ name: 'demo', memory: { size: 0 }, functions: [] }, '', {}, { env: {} });
+ * ```
+ */
 export function wrapModule(
   mod: WasmModule,
   code: string,
   segments: any,
   importEmbed: ImportEmbed,
   opts: CompilerOpts = {}
-) {
+): WrappedModule {
+  const embed = importEmbed || {};
+  const hasCustomEmbeddedImport = Object.keys(embed).some((k) => k !== 'env');
+  // Custom embedded import modules must merge like env; otherwise caller-provided
+  // functions for the same module replace embedded callbacks instead of extending them.
+  const mergeImports = hasCustomEmbeddedImport
+    ? [
+        `_imports = {..._importsEmbed, ..._imports};`,
+        `for (const k in _importsEmbed) _imports[k] = ` +
+          `{..._importsEmbed[k], ...(_imports[k] || {})};`,
+      ].join('\n')
+    : `_imports = {..._importsEmbed,..._imports, env: {..._importsEmbed.env, ..._imports.env}};`;
+  // Wrapped modules expose memory through exported wasm memory; raw
+  // imported-only memory is unsupported.
   let moduleStr = `
-const _importsEmbed = ${genObject({ env: {}, ...importEmbed })};
-_imports = {..._importsEmbed,..._imports, env: {..._importsEmbed.env, ..._imports.env}};
+const _importsEmbed = ${genObject({ env: {}, ...embed })};
+${mergeImports}
 
 ${code}
 ${opts.useThreads ? '_imports.env.initWorkers()' : ''};
@@ -1256,7 +1518,8 @@ const memoryExport = new Uint8Array(buffer, 0, ${mod.memory ? mod.memory.size : 
 `;
   if (opts.useThreads) moduleStr = `\nconst workers = [];\n${moduleStr}`;
   //  const types = genTypes(fns, segments, opts);
-  const views = memViews(segments);
+  // Freeze applies to generated wrapper containers, including segment chunk arrays.
+  const views = memViews(segments, opts);
   moduleStr += `const segments = ${freeze(genObject(views), opts)};\n`;
   // Build types
   let segmentsType = `{\n`;
@@ -1289,8 +1552,8 @@ ${fnsType}}`;
   const iifeRaw = `${moduleStr}\nreturn ${freeze(`{ ..._exports, memory: memoryExport, segments ${opts.useThreads ? ', workers, initWorkers' : ''} }`, opts)};`;
   // IIFE vs top level:
   // - IIFE can be instantiated on call site: opt specialization, each instance has own memory
-  // - top level: code re-use (maybe more time to opt?), same memory, maybe less 'deopt huge function' since
-  //   huge function is now module? (not sure)
+  // - top level: code re-use, same memory, maybe less 'deopt huge function' since huge function
+  //   is now module? (not sure)
   let modFn = `export default function ${mod.name}(_imports = {}, pool){${iifeRaw}}`;
   if (opts.reuseModule) {
     modFn = `
@@ -1310,7 +1573,19 @@ export default function ${mod.name}(_imports = {}, pool){
   return res;
 }
 
-export function exec(code: string | ReturnType<typeof wrapModule>, _imports = {}, pool?: any) {
+/**
+ * Executes generated wrapper source immediately.
+ *
+ * @param code - Raw wrapper source or object returned by `wrapModule`.
+ * @param _imports - Imports passed to the wrapper.
+ * @param pool - Optional worker pool object for threaded modules.
+ * @returns The generated module exports.
+ * @example
+ * ```js
+ * exec('return { value: 1 };');
+ * ```
+ */
+export function exec(code: string | WrappedModule, _imports: {} = {}, pool?: any): any {
   if (typeof code !== 'string') code = code.raw;
   return new Function('_imports', 'pool', code)(_imports, pool);
 }

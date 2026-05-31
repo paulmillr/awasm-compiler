@@ -1,11 +1,44 @@
 import { toJs, toWasm, type CompilerOpts } from './codegen.ts';
 import { genObject, type ImportEmbed } from './js.ts';
-import type { Scope } from './module.ts';
+import type { ArraySpec, FnDef, Scope, StructSpec, Val } from './module.ts';
 import { array, Module, scalar, struct } from './module.ts';
 import { sizeof } from './types.ts';
 
+export type { ArraySpec, FnDef, StructSpec, Val };
+
 const CACHE_LINE_ALIGN = { align: 128, alignEnd: 128 };
 //const CACHE_LINE_ALIGN = {};
+
+type WorkerStack = ReturnType<typeof array<'u32', [number]>>;
+type U32Spec = ReturnType<typeof scalar<'u32'>>;
+type WorkerMemory = {
+  _worker: StructSpec<{
+    online: U32Spec;
+    next: U32Spec;
+    total: U32Spec;
+    perBatch: U32Spec;
+    workers: ArraySpec<
+      StructSpec<{
+        online: U32Spec;
+        done: U32Spec;
+        cmd: U32Spec;
+        pos: U32Spec;
+        len: U32Spec;
+        perBatch: U32Spec;
+      }>,
+      readonly [32]
+    >;
+    stack: WorkerStack;
+  }>;
+};
+type WorkerFunctions = {
+  _worker_notifyBridge: FnDef<['u32', 'u32'], any> & { out: ['u32'] };
+  _worker_onlineBridge: FnDef<[], any> & { out: ['u32'] };
+  _worker_online: FnDef<[], Val<'u32'>>;
+  _worker_notify: FnDef<['u32', 'u32'], Val<'u32'>>;
+  stopWorker: FnDef<['u32'], void>;
+};
+type WorkerPool = { js: ReturnType<typeof toJs>; wasm: ReturnType<typeof toWasm> };
 
 const workerBit = (f: Scope, wid: any) => {
   const { u32 } = f.types;
@@ -39,8 +72,21 @@ for (let wid=0, curMask=mask, processed = 0, processedMask = 0; wid++, curMask>>
   return processedMask;
 };
 
-// Add batch function (loop or simdified)
-export function addBatch(mod: Module, opts: CompilerOpts) {
+/**
+ * Rewrites batch functions into scalar or SIMD loop entrypoints.
+ *
+ * @param mod - Source module with batch function declarations.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns Module clone with batch functions rewritten.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { addBatch } from '@awasm/compiler/workers.js';
+ *
+ * addBatch(new Module('demo'), {});
+ * ```
+ */
+export function addBatch(mod: Module, opts: CompilerOpts): Module<{}, {}> {
   let res = mod.clone();
   for (const [name, fn] of Object.entries(mod.functions) as any) {
     if (!fn.batch) continue;
@@ -88,13 +134,24 @@ export function addBatch(mod: Module, opts: CompilerOpts) {
     curFn.opts = fn.opts;
     curFn.origInputs = fn.inputs;
   }
-  return res;
+  return res as Module<{}, {}>;
 }
 
 /**
- *  Add thread support to batch functions
+ * Adds worker-thread coordination functions around batch functions.
+ *
+ * @param mod - Source module with batch function declarations.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns Module clone with worker support functions and memory.
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { addThreads } from '@awasm/compiler/workers.js';
+ *
+ * addThreads(new Module('demo'), {});
+ * ```
  */
-export function addThreads(mod: Module, opts: CompilerOpts) {
+export function addThreads(mod: Module, opts: CompilerOpts): Module<WorkerMemory, WorkerFunctions> {
   const prevFunctions = mod.functions as Record<string, any>;
   // Get stack size
   let STACK_SIZE = 1; // empty memory array not allowed
@@ -112,60 +169,71 @@ export function addThreads(mod: Module, opts: CompilerOpts) {
     batchFnIds[name] = batchFnId++;
   }
   // Memory
-  let res = mod
-    .clone()
-    .mem(
-      '_worker',
-      struct({
-        online: scalar('u32', CACHE_LINE_ALIGN),
-        next: scalar('u32', CACHE_LINE_ALIGN),
-        total: scalar('u32', CACHE_LINE_ALIGN),
-        perBatch: scalar('u32', CACHE_LINE_ALIGN),
-        workers: array(
-          struct(
-            {
-              online: scalar('u32', CACHE_LINE_ALIGN),
-              done: scalar('u32', CACHE_LINE_ALIGN),
-              cmd: scalar('u32', CACHE_LINE_ALIGN),
-              pos: scalar('u32', CACHE_LINE_ALIGN),
-              len: scalar('u32', CACHE_LINE_ALIGN),
-              perBatch: scalar('u32', CACHE_LINE_ALIGN),
-            },
-            CACHE_LINE_ALIGN
-          ),
-          CACHE_LINE_ALIGN,
-          32
+  // Public return type documents the worker additions; implementation keeps the
+  // chain shallow because Deno over-expands exact Scope<M, F> callback types here.
+  let res = mod.clone().mem(
+    '_worker',
+    struct({
+      online: scalar('u32', CACHE_LINE_ALIGN),
+      next: scalar('u32', CACHE_LINE_ALIGN),
+      total: scalar('u32', CACHE_LINE_ALIGN),
+      perBatch: scalar('u32', CACHE_LINE_ALIGN),
+      workers: array(
+        struct(
+          {
+            online: scalar('u32', CACHE_LINE_ALIGN),
+            done: scalar('u32', CACHE_LINE_ALIGN),
+            cmd: scalar('u32', CACHE_LINE_ALIGN),
+            pos: scalar('u32', CACHE_LINE_ALIGN),
+            len: scalar('u32', CACHE_LINE_ALIGN),
+            perBatch: scalar('u32', CACHE_LINE_ALIGN),
+          },
+          CACHE_LINE_ALIGN
         ),
-        stack: array('u32', {}, STACK_SIZE),
-      })
-    )
+        CACHE_LINE_ALIGN,
+        32
+      ),
+      stack: array('u32', {}, STACK_SIZE),
+    })
+  ) as Module;
+  res = res
     // Generic utils
     .importFn('_worker_notifyBridge', ['u32', 'u32'], ['u32'])
     .importFn('_worker_onlineBridge', [], ['u32'])
-    .fn('_worker_online', [], 'u32', (f) => {
-      const { u32 } = f.types;
+    .fn('_worker_online', [], 'u32', (scope: Scope) => {
+      // Keep the exported worker type precise while avoiding Deno's deep
+      // expansion of the exact memory shape inside this implementation loop.
+      const { u32 } = scope.types;
+      const { workers } = (scope.memory as any)._worker;
       // workers id starts with 1, 0== main, there is up to 31 worker, but we have
       // 32 in array
       let onlineMask = u32.const(0);
-      [onlineMask] = f.doN([onlineMask], 31, (i, onlineMask) => {
+      [onlineMask] = scope.doN([onlineMask], 31, (i, onlineMask) => {
         const wid = u32.add(i, u32.const(1)); // 1..31
-        const bit = workerBit(f, wid); // 1<<
-        const online = f.memory._worker.workers[wid].online.atomics.load();
+        const bit = workerBit(scope, wid); // 1<<
+        const online = workers[wid].online.atomics.load();
         return [u32.or(onlineMask, u32.select(online, bit, u32.const(0)))];
       });
       return onlineMask;
     })
-    .fn('_worker_notify', ['u32', 'u32'], 'u32', (f, cmd, mask) => {
-      const { workers } = f.memory._worker;
-      const { u32 } = f.types;
-      return workerIter(f, mask, (wid, _wbit) => {
-        workers[wid].cmd.atomics.store(cmd); // cmd id
-        workers[wid].cmd.atomics.notify(u32.const(1));
-      });
-    })
+    .fn(
+      '_worker_notify',
+      ['u32', 'u32'],
+      'u32',
+      (scope: Scope, cmd: Val<'u32'>, mask: Val<'u32'>) => {
+        // The public return type keeps the exact worker memory shape, but Deno's
+        // publish checker over-expands it inside this callback.
+        const { workers } = (scope.memory as any)._worker;
+        const { u32 } = scope.types;
+        return workerIter(scope, mask, (wid, _wbit) => {
+          workers[wid].cmd.atomics.store(cmd); // cmd id
+          workers[wid].cmd.atomics.notify(u32.const(1));
+        });
+      }
+    )
     .fn('stopWorker', ['u32'], 'void', (f, id) => {
       const { u32 } = f.types;
-      const { workers } = f.memory._worker;
+      const { workers } = (f.memory as any)._worker;
       const { online } = workers[id];
       online.atomics.store(u32.const(0));
     });
@@ -214,7 +282,7 @@ export function addThreads(mod: Module, opts: CompilerOpts) {
             [],
             () => void f.functions[oldName].call(pos, len, perBatch, ...args),
             () => {
-              const { workers, stack } = f.memory._worker;
+              const { workers, stack } = (f.memory as any)._worker;
               // write args (before command)
               // pos, len (default batch), ...actual args
               const inputs = fn.origInputs;
@@ -291,7 +359,7 @@ export function addThreads(mod: Module, opts: CompilerOpts) {
                 (curMask) => [curMask],
                 (curMask) => {
                   workerIter(f, curMask, (wid, wbit) => {
-                    const prev = f.memory._worker.workers[wid].done.atomics.exchange(u32.const(0));
+                    const prev = workers[wid].done.atomics.exchange(u32.const(0));
                     // if prev != 0, mark this worker as complete: clear bit
                     f.continueIf(u32.ne(prev, u32.const(0)), 'spin', u32.xor(curMask, wbit));
                   });
@@ -359,7 +427,7 @@ export function addThreads(mod: Module, opts: CompilerOpts) {
       }
     );
   }
-  return res;
+  return res as Module<WorkerMemory, WorkerFunctions>;
 }
 
 function genPool(_opts: CompilerOpts) {
@@ -483,9 +551,15 @@ if (msg.data.type==='install') {
 };
 
 /**
- * Compile worker pool modules in js/wasm
+ * Builds the worker-pool helper modules for JS and Wasm backends.
+ *
+ * @returns Generated JS and Wasm worker-pool sources.
+ * @example
+ * ```js
+ * buildPool();
+ * ```
  */
-export function buildPool() {
+export function buildPool(): WorkerPool {
   return {
     js: toJs(genPool(POOL_OPTS), POOL_OPTS),
     wasm: toWasm(genPool(POOL_OPTS), POOL_OPTS),
@@ -493,9 +567,22 @@ export function buildPool() {
 }
 
 /**
- * Main worker initialization boilerplate
+ * Generates worker initialization boilerplate for threaded wrappers.
+ *
+ * @param platform - Backend platform whose worker instances will be created.
+ * @param importEmbed - Embedded import callbacks by module name.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns JavaScript source for worker setup, or an empty string when threads are disabled.
+ * @example
+ * ```js
+ * initWorkers('js', { env: {} }, {});
+ * ```
  */
-export function initWorkers(platform: 'wasm' | 'js', importEmbed: ImportEmbed, opts: CompilerOpts) {
+export function initWorkers(
+  platform: 'wasm' | 'js',
+  importEmbed: ImportEmbed,
+  opts: CompilerOpts
+): string {
   if (!opts.useThreads) return '';
   let modInit = `const getInstance = (code, _imports)=>`;
   if (platform === 'wasm')
@@ -540,6 +627,8 @@ export function initWorkers(platform: 'wasm' | 'js', importEmbed: ImportEmbed, o
   // - limit is 31 workers, probably should do less? (+main thread)
   //   this is max what we can push in u32 bitmasks. Not sure we need support more
   //   cores for now at least.
+  // - external pools install code+memory only; non-env custom imports are unsupported
+  //   there unless the pool contract starts carrying imports too.
   return `
 let _poolId;
 _imports.env._worker_notifyBridge = (cmd, mask)=>{
@@ -591,7 +680,7 @@ function initWorkers(limit = 32) {
           catch {}
         }
         if (NodeWorker) {
-          // Node ESM eval workers don't expose require(), so parentPort must come from an import fallback.
+          // Node ESM eval workers lack require(); parentPort comes from import fallback.
           initWorker = ()=>new NodeWorker("(typeof require==='function' ? Promise.resolve(require('node:worker_threads')) : import('node:worker_threads')).then(({ parentPort }) => ("+workerSrc+")(parentPort));", { eval: true });
         }
       }

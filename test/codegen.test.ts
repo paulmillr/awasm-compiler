@@ -1,14 +1,24 @@
 import { describe, should } from '@paulmillr/jsbt/test.js';
 import * as P from 'micro-packed';
 import { deepStrictEqual, throws } from 'node:assert';
-import { FnOp, toJs, toWasm } from '../src/codegen.ts';
+import { FnOp, ModuleGraph, toJs, toMod, toWasm } from '../src/codegen.ts';
 import * as js from '../src/js.ts';
-import { exec } from '../src/js.ts';
+import { createJS, exec, wrapModule, wrapWASM } from '../src/js.ts';
 import * as memory from '../src/memory.ts';
+import { PosExpr } from '../src/memory.ts';
 import { Module, array, scalar, struct } from '../src/module.ts';
-import { genRuntimeTypes, lanesOf, minSimdType } from '../src/types.ts';
+import { toRuntime } from '../src/runtime.ts';
+import {
+  genRuntimeTypeMod,
+  genRuntimeTypes,
+  lanesOf,
+  minSimdType,
+  TYPE_MOD_OPTS,
+  TypeCoders,
+} from '../src/types.ts';
 import * as utils from '../src/utils.ts';
 import { concatBytes } from '../src/utils.ts';
+import * as wasm from '../src/wasm.ts';
 import { testBoth, testBothOpts } from './utils.ts';
 export const runtimeTypes = genRuntimeTypes();
 
@@ -6106,6 +6116,996 @@ describe('Codegen', () => {
         });
       });
     });
+  });
+});
+
+describe('Review regressions', () => {
+  should('batchFn lanes are positive', () => {
+    const mod = new Module('batch_lanes');
+    throws(() => mod.batchFn('zero', { lanes: 0 }, [], () => {}), /wrong lanes/);
+    throws(() => mod.batchFn('negative', { lanes: -1 }, [], () => {}), /wrong lanes/);
+  });
+
+  should('ModuleGraph output edges distinguish sibling path prefixes', () => {
+    const mg = new ModuleGraph('prefix_edge', {}, new Module('prefix_edge'), {});
+    mg.subgraph(
+      'function',
+      'main',
+      { inputs: [], outputs: [], memOps: {}, opts: {}, embedFns: {}, embedPos: 0 },
+      () => {
+        const first = mg.op('u32', 'const', [], { value: 0 });
+        const blockIdx = mg.subgraph(
+          'block',
+          'prefix',
+          { args: [], outputs: [], opts: {}, shape: undefined },
+          () => {}
+        );
+        for (let i = 0; i < 8; i++) mg.op('u32', 'const', [], { value: i });
+        const sibling = mg.op('u32', 'add', [first, first]);
+        const block = mg.ops.get(blockIdx) as any;
+        block.outputs = [sibling.idx];
+        deepStrictEqual(
+          { blockIdx, sibling: sibling.idx, edges: Array.from(mg.ops.getEdges(blockIdx, false)) },
+          { blockIdx: '0.1', sibling: '0.10', edges: ['0.10'] }
+        );
+      }
+    );
+  });
+
+  should('PosExpr eval includes numeric base products', () => {
+    deepStrictEqual(PosExpr.eval({ base: 5, baseMul: [6], syms: [], coeffs: [] }, []), 11);
+    throws(
+      () => PosExpr.eval({ base: 0, baseMul: [[new FnOp('0')]], syms: [], coeffs: [] }, []),
+      /cannot evaluate symbolic product/
+    );
+  });
+
+  should('array dimensions are positive safe integers', () => {
+    throws(() => array('u32', {}, 2, 0), /wrong array size/);
+    throws(() => array('u32', {}, 2, 1.5), /wrong array size/);
+  });
+
+  should('array dimensions reject negative sizes', () => {
+    throws(() => array('u32', {}, 2, -1), /wrong array size/);
+  });
+
+  should('array dimensions reject unsafe total size', () => {
+    throws(() => array('u8', {}, Number.MAX_SAFE_INTEGER, 2), /wrong array size/);
+  });
+
+  should('symbolic reshape casts keep dynamic dimensions', () => {
+    const mod = new Module('symbolic_reshape_cast');
+    mod.mem('buffer', array('u32', {}, 64, 4));
+    mod.fn('run', ['u32', 'u32'], 'void', (f, p, max) => {
+      const view = f.memory.buffer.reshape(p, max, 4)[p].as('u64x2').reshape(max);
+      view[0].get();
+    });
+    toMod(mod);
+  });
+
+  should('runtime reshape keeps dynamic zero-valued dimensions symbolic', () => {
+    const mod = new Module('runtime_dynamic_reshape')
+      .mem('buffer', array('u32', {}, 64, 4))
+      .fn('run', ['u32', 'u32'], 'u32', (f, p, max) => {
+        const { u32 } = f.types;
+        f.memory.buffer.reshape(p, max, 4)[p];
+        return u32.const(7);
+      });
+    const typeMod = exec(toJs(genRuntimeTypeMod(), TYPE_MOD_OPTS));
+    deepStrictEqual(toRuntime(() => typeMod, mod)().run(0, 16), 7);
+  });
+
+  should('reshape dimensions are positive safe integers', () => {
+    const mod = new Module('negative_reshape');
+    mod.mem('buf', array('u8', {}, 4));
+    mod.fn('bad', [], 'void', (f) => {
+      f.memory.buf.reshape(-1, -4);
+    });
+    throws(() => toMod(mod, { optimize: false }), /wrong reshape dimension/);
+  });
+
+  should('reshape symbolic dimensions are integer expressions', () => {
+    const mod = new Module('float_reshape');
+    mod.mem('buf', array('u8', {}, 4));
+    mod.fn('bad', ['f32'], 'void', (f, x) => {
+      f.memory.buf.reshape(x as any);
+    });
+    throws(() => toMod(mod, { optimize: false }), /wrong reshape dimension/);
+  });
+
+  should('reshape dimensions reject non-expression values', () => {
+    const mod = new Module('string_reshape');
+    mod.mem('buf', array('u8', {}, 4));
+    mod.fn('bad', [], 'void', (f) => {
+      f.memory.buf.reshape('4' as any);
+    });
+    throws(() => toMod(mod, { optimize: false }), /wrong reshape dimension/);
+  });
+
+  should('statically unaligned scalar atomics are rejected', () => {
+    const mod = new Module('atomic_align');
+    mod.mem('mem', struct({ pad: scalar('u8'), x: scalar('u32', { align: 1 }) }));
+    mod.fn('test', [], 'void', (f) => {
+      const { u32 } = f.types;
+      f.memory.mem.x.atomics.add(u32.const(1));
+    });
+    throws(() => toMod(mod, { useThreads: true }), /unaligned atomic/);
+  });
+
+  should('JS atomics reject unaligned effective addresses', () => {
+    const run = (instructions: any[], outputs: string[] = ['i32']) => {
+      const mod = {
+        memory: { size: 1024, maximum: 1024, shared: true, export: true },
+        functions: [{ name: 'run', export: true, inputs: [], outputs, locals: [], instructions }],
+      };
+      return exec(wrapModule(mod as any, createJS(mod as any), {})).run;
+    };
+    throws(
+      () =>
+        run([
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.atomic.load', data: { align: 2, offset: 0 } },
+          { TAG: 'end' },
+        ])(),
+      /unaligned atomic access/
+    );
+    throws(
+      () =>
+        run([
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.atomic.load16_u', data: { align: 1, offset: 0 } },
+          { TAG: 'end' },
+        ])(),
+      /unaligned atomic access/
+    );
+    throws(
+      () =>
+        run(
+          [
+            { TAG: 'i32.const', data: 1n },
+            { TAG: 'i32.const', data: 7n },
+            { TAG: 'i32.atomic.store', data: { align: 2, offset: 0 } },
+            { TAG: 'end' },
+          ],
+          []
+        )(),
+      /unaligned atomic access/
+    );
+    deepStrictEqual(
+      run([
+        { TAG: 'i32.const', data: 1n },
+        { TAG: 'i32.atomic.load8_u', data: { align: 0, offset: 0 } },
+        { TAG: 'end' },
+      ])(),
+      0
+    );
+  });
+
+  should('JS integer memory fast paths handle unaligned effective addresses', () => {
+    const fn = (name: string, instructions: any[]) => ({
+      name,
+      export: true,
+      inputs: ['i32'],
+      outputs: ['i32'],
+      locals: [],
+      instructions,
+    });
+    const mod = {
+      memory: { size: 65536, export: true },
+      functions: [
+        fn('dynamicLoad32', [
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.const', data: 0x11223344n },
+          { TAG: 'i32.store', data: { align: 2, offset: 0 } },
+          { TAG: 'local.get', data: 0n },
+          { TAG: 'i32.load', data: { align: 2, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+        fn('load32', [
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.const', data: 0x11223344n },
+          { TAG: 'i32.store', data: { align: 2, offset: 0 } },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.load', data: { align: 2, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+        fn('load16', [
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.const', data: 0x11223344n },
+          { TAG: 'i32.store', data: { align: 2, offset: 0 } },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.load16_u', data: { align: 1, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+        fn('store32', [
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.store', data: { align: 2, offset: 0 } },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.const', data: 0x11223344n },
+          { TAG: 'i32.store', data: { align: 2, offset: 0 } },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.load', data: { align: 0, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+        fn('dynamicStore32', [
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.store', data: { align: 2, offset: 0 } },
+          { TAG: 'local.get', data: 0n },
+          { TAG: 'i32.const', data: 0x11223344n },
+          { TAG: 'i32.store', data: { align: 2, offset: 0 } },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.load', data: { align: 0, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+        fn('store16', [
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.store', data: { align: 2, offset: 0 } },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.const', data: 0x3344n },
+          { TAG: 'i32.store16', data: { align: 1, offset: 0 } },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.load16_u', data: { align: 0, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+      ],
+    };
+    const native = exec(
+      wrapModule(mod as any, wrapWASM(mod as any, wasm.createWasm(mod as any)), {})
+    );
+    const generated = exec(wrapModule(mod as any, createJS(mod as any), {}));
+    deepStrictEqual(
+      {
+        native: [
+          native.dynamicLoad32(1),
+          native.load32(0),
+          native.load16(0),
+          native.store32(0),
+          native.dynamicStore32(1),
+          native.store16(0),
+        ],
+        generated: [
+          generated.dynamicLoad32(1),
+          generated.load32(0),
+          generated.load16(0),
+          generated.store32(0),
+          generated.dynamicStore32(1),
+          generated.store16(0),
+        ],
+      },
+      {
+        native: [0x00112233, 0x00112233, 0x2233, 0x11223344, 0x11223344, 0x3344],
+        generated: [0x00112233, 0x00112233, 0x2233, 0x11223344, 0x11223344, 0x3344],
+      }
+    );
+  });
+
+  should('JS f32.sqrt rounds results to binary32', () => {
+    const mod = {
+      functions: [
+        {
+          name: 'run',
+          export: true,
+          inputs: [],
+          outputs: ['f32'],
+          locals: [],
+          instructions: [{ TAG: 'f32.const', data: 2 }, { TAG: 'f32.sqrt' }, { TAG: 'end' }],
+        },
+      ],
+    };
+    const native = exec(
+      wrapModule(mod as any, wrapWASM(mod as any, wasm.createWasm(mod as any)), {})
+    );
+    const generated = exec(wrapModule(mod as any, createJS(mod as any), {}));
+    deepStrictEqual(
+      { native: native.run(), generated: generated.run() },
+      { native: Math.fround(Math.sqrt(2)), generated: Math.fround(Math.sqrt(2)) }
+    );
+  });
+
+  should('JS fallback i32.load keeps signed i32 shape', () => {
+    const mod = {
+      memory: { size: 65536, export: true },
+      functions: [
+        {
+          name: 'run',
+          export: true,
+          inputs: ['i32'],
+          outputs: ['i32'],
+          locals: [],
+          instructions: [
+            { TAG: 'i32.const', data: 0n },
+            { TAG: 'i32.const', data: -1n },
+            { TAG: 'i32.store', data: { align: 2, offset: 0 } },
+            { TAG: 'local.get', data: 0n },
+            { TAG: 'i32.load', data: { align: 0, offset: 0 } },
+            { TAG: 'end' },
+          ],
+        },
+      ],
+    };
+    const native = exec(
+      wrapModule(mod as any, wrapWASM(mod as any, wasm.createWasm(mod as any)), {})
+    );
+    const generated = exec(wrapModule(mod as any, createJS(mod as any), {}));
+    deepStrictEqual(
+      { native: native.run(0), generated: generated.run(0) },
+      { native: -1, generated: -1 }
+    );
+  });
+
+  should('JS memory addresses and offsets use unsigned wasm32 arithmetic', () => {
+    const fn = (name: string, instructions: any[]) => ({
+      name,
+      export: true,
+      inputs: [],
+      outputs: ['i32'],
+      locals: [],
+      instructions,
+    });
+    const mod = {
+      memory: { size: 0, import: true },
+      functions: [
+        fn('dynamicAddress', [
+          { TAG: 'i32.const', data: -2147483648n },
+          { TAG: 'i32.load8_u', data: { align: 0, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+        fn('staticOffset', [
+          { TAG: 'i32.const', data: 0n },
+          { TAG: 'i32.load8_u', data: { align: 0, offset: 0x80000000 } },
+          { TAG: 'end' },
+        ]),
+        fn('computedAddress', [
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.const', data: 2147483647n },
+          { TAG: 'i32.add' },
+          { TAG: 'i32.load8_u', data: { align: 0, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+      ],
+    };
+    const memory = new WebAssembly.Memory({ initial: 32769 });
+    new Uint8Array(memory.buffer)[0x80000000] = 77;
+    const imports = { env: { _memory: memory } };
+    const native = exec(
+      wrapModule(mod as any, wrapWASM(mod as any, wasm.createWasm(mod as any)), {}),
+      imports
+    );
+    const generated = exec(wrapModule(mod as any, createJS(mod as any), {}), imports);
+    deepStrictEqual(
+      {
+        native: [native.dynamicAddress(), native.staticOffset(), native.computedAddress()],
+        generated: [
+          generated.dynamicAddress(),
+          generated.staticOffset(),
+          generated.computedAddress(),
+        ],
+      },
+      { native: [77, 77, 77], generated: [77, 77, 77] }
+    );
+  });
+
+  should('JS bulk memory ops use unsigned wasm32 addresses', () => {
+    const fn = (name: string, instructions: any[]) => ({
+      name,
+      export: true,
+      inputs: [],
+      outputs: ['i32'],
+      locals: [],
+      instructions,
+    });
+    const mod = {
+      memory: { size: 0, import: true },
+      functions: [
+        fn('fillHigh', [
+          { TAG: 'i32.const', data: -2147483648n },
+          { TAG: 'i32.const', data: 91n },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'memory.fill', data: 0 },
+          { TAG: 'i32.const', data: -2147483648n },
+          { TAG: 'i32.load8_u', data: { align: 0, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+        fn('copyHigh', [
+          { TAG: 'i32.const', data: -2147483647n },
+          { TAG: 'i32.const', data: -2147483648n },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'memory.copy', data: { dst: 0, src: 0 } },
+          { TAG: 'i32.const', data: -2147483647n },
+          { TAG: 'i32.load8_u', data: { align: 0, offset: 0 } },
+          { TAG: 'end' },
+        ]),
+      ],
+    };
+    const run = (code: string, name: 'fillHigh' | 'copyHigh') => {
+      const memory = new WebAssembly.Memory({ initial: 32769 });
+      new Uint8Array(memory.buffer)[0x80000000] = 77;
+      return exec(wrapModule(mod as any, code, {}), { env: { _memory: memory } })[name]();
+    };
+    const native = wrapWASM(mod as any, wasm.createWasm(mod as any), {});
+    const generated = createJS(mod as any);
+    deepStrictEqual(
+      {
+        native: [run(native, 'fillHigh'), run(native, 'copyHigh')],
+        generated: [run(generated, 'fillHigh'), run(generated, 'copyHigh')],
+      },
+      { native: [91, 77], generated: [91, 77] }
+    );
+  });
+
+  should('checkFn sees leading call memory barriers', () => {
+    const mod = new Module('checkfn_call_barrier')
+      .mem('mem', array('u32', {}, 1))
+      .importFn('touch', [], 'void')
+      .fn('read_after_call', [], 'u32', (f) => {
+        f.functions.touch.call();
+        const load = f.memory.mem[0].get();
+        f.rawFn.ops.get(load.idx).opts.strong = [];
+        return load;
+      });
+    throws(() => toMod(mod, { optimize: false }), /strong link|missing link/);
+  });
+
+  should('custom import modules are honored by JS and Wasm outputs', () => {
+    const mod = new Module('custom_import')
+      .importFn('inc', ['u32'], 'u32', undefined, 'custom')
+      .fn('run', ['u32'], 'u32', (f, x) => f.functions.inc.call(x));
+    const imports = { custom: { inc: (x: number) => x + 1 } };
+    deepStrictEqual(exec(toJs(mod), imports).run(41), 42);
+    deepStrictEqual(exec(toWasm(mod), imports).run(41), 42);
+  });
+
+  should('embedded custom imports merge with provided custom imports', () => {
+    const mod = new Module('custom_import_mixed')
+      .importFn('inc', ['u32'], 'u32', (x) => x + 1, 'custom')
+      .importFn('dbl', ['u32'], 'u32', undefined, 'custom')
+      .fn('run', ['u32'], 'u32', (f, x) => {
+        const { u32 } = f.types;
+        return u32.add(f.functions.inc.call(x)[0], f.functions.dbl.call(x)[0]);
+      });
+    const imports = { custom: { dbl: (x: number) => x * 2 } };
+    deepStrictEqual(exec(toJs(mod), imports).run(10), 31);
+    deepStrictEqual(exec(toWasm(mod), imports).run(10), 31);
+  });
+
+  should('f64 constants preserve double precision', () => {
+    const value = Math.PI;
+    const mod = new Module('f64_precision').fn('run', [], 'f64', (f) => f.types.f64.const(value));
+    deepStrictEqual(exec(toWasm(mod)).run(), value);
+  });
+
+  should('jsStateArray preserves signed i32 returns', () => {
+    const mod = new Module('state_array_i32').fn('id', ['i32'], 'i32', (_f, x) => x);
+    deepStrictEqual(exec(toJs(mod, { jsStateArray: true })).id(-1), -1);
+  });
+
+  should('jsStateArray preserves f32 and f64 state', () => {
+    const f32 = new Module('state_array_f32').fn('id', ['f32'], 'f32', (_f, x) => x);
+    const f64 = new Module('state_array_f64').fn('id', ['f64'], 'f64', (_f, x) => x);
+    deepStrictEqual(exec(toJs(f32, { jsStateArray: true })).id(1.1), exec(toWasm(f32)).id(1.1));
+    deepStrictEqual(exec(toJs(f64, { jsStateArray: true })).id(1.5), exec(toWasm(f64)).id(1.5));
+  });
+
+  should('jsStateArray output is deterministic across createJS calls', () => {
+    const mod = new Module('state_array_deterministic').fn('id', ['i32'], 'i32', (_f, x) => x);
+    deepStrictEqual(toJs(mod, { jsStateArray: true }), toJs(mod, { jsStateArray: true }));
+  });
+
+  should('runtime SIMD shuffle matches generated JS', () => {
+    const mod = new Module('runtime_shuffle').fn('lanes', [], ['u32', 'u32', 'u32', 'u32'], (f) => {
+      const { u32x4 } = f.types;
+      const src = u32x4.laneOffsets();
+      const out = u32x4.shuffle(src, src, [12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3]);
+      return Array.from({ length: 4 }, (_, lane) => u32x4.extractLane(out, lane));
+    });
+    const expected = exec(toJs(mod, { noRuntime: true } as any)).lanes();
+    const typeMod = exec(toJs(genRuntimeTypeMod(), TYPE_MOD_OPTS));
+    deepStrictEqual(toRuntime(() => typeMod, mod)().lanes(), expected);
+  });
+
+  should('runtime doN labeled break strips internal counter like generated JS', () => {
+    const mod = new Module('runtime_doN_label_break').fn('run', [], ['u32', 'u32'], (f) => {
+      const { u32 } = f.types;
+      const [sum, count] = f.doN(
+        [u32.const(0), u32.const(0)],
+        5,
+        (i, sum, count) => {
+          const nextSum = u32.add(sum, i);
+          const nextCount = u32.add(count, u32.const(1));
+          f.brIf('scan', u32.eq(i, u32.const(3)), i, nextSum, nextCount);
+          return [nextSum, nextCount];
+        },
+        'scan'
+      );
+      return [sum, count];
+    });
+    const expected = exec(toJs(mod, { noRuntime: true } as any)).run();
+    const typeMod = exec(toJs(genRuntimeTypeMod(), TYPE_MOD_OPTS));
+    deepStrictEqual(toRuntime(() => typeMod, mod)().run(), expected);
+  });
+
+  should('runtime ifElse treats void branch as empty state', () => {
+    const mod = new Module('runtime_ifElse_void_state').fn('run', [], 'u32', (f) => {
+      const { u32 } = f.types;
+      const out = f.ifElse(u32.const(1), [], () => {});
+      return u32.const(out.length);
+    });
+    const expected = exec(toJs(mod, { noRuntime: true } as any)).run();
+    const typeMod = exec(toJs(genRuntimeTypeMod(), TYPE_MOD_OPTS));
+    deepStrictEqual(toRuntime(() => typeMod, mod)().run(), expected);
+  });
+
+  should('runtime memOps executes scalar atomic store/load', () => {
+    const mod = new Module('runtime_memops_atomics')
+      .mem('state', struct({ value: 'u32' }))
+      .fn('run', [], 'u32', (f) => {
+        const { u32 } = f.types;
+        f.memory.state.value.atomics.store(u32.const(7));
+        return f.memory.state.value.atomics.load();
+      });
+    const expected = exec(toJs(mod, { useThreads: true } as any)).run();
+    const typeMod = exec(toJs(genRuntimeTypeMod(), TYPE_MOD_OPTS));
+    deepStrictEqual(toRuntime(() => typeMod, mod, { useThreads: true } as any)().run(), expected);
+  });
+
+  should('runtime does not export imported helper functions', () => {
+    const mod = new Module('runtime_import_export_shape')
+      .importFn('inc', ['u32'], 'u32', (x: number) => x + 1)
+      .fn('run', ['u32'], 'u32', (f, x) => {
+        const [y] = f.functions.inc.call(x);
+        return y;
+      });
+    const typeMod = exec(toJs(genRuntimeTypeMod(), TYPE_MOD_OPTS));
+    const runtime = toRuntime(() => typeMod, mod)();
+    deepStrictEqual(runtime.run(41), 42);
+    deepStrictEqual(Object.keys(runtime).sort(), ['memory', 'run', 'segments']);
+  });
+
+  should('runtime SIMD shifts pass scalar shift arguments', () => {
+    const coder = TypeCoders.u32x4;
+    const input = coder.encode([1, 2, 0x8000_0000, 0xffff_ffff]);
+    const mod = new Module('runtime_simd_shifts').mem('state', struct({ A: 'u32x4', D: 'u32x4' }));
+    for (const op of ['shl', 'shr', 'rotl', 'rotr'] as const) {
+      mod.fn(op, ['i32'], 'void', (f, shift) => {
+        const { u32x4 } = f.types;
+        const { A, D } = f.memory.state;
+        D.set((u32x4 as any)[op](A.get(), shift));
+      });
+    }
+    const native = exec(toWasm(mod, { optimize: false }));
+    const runtime = genRuntimeTypes().u32x4;
+    for (const [op, shift] of [
+      ['shl', 1],
+      ['shr', 1],
+      ['rotl', 7],
+      ['rotr', 7],
+    ] as const) {
+      native.segments['state.A'].set(input);
+      native[op](shift);
+      deepStrictEqual(
+        { op, shift, lanes: coder.decode(runtime[op](input, shift)) },
+        { op, shift, lanes: coder.decode(native.segments['state.D']) }
+      );
+    }
+  });
+
+  should('SIMD lane immediates reject out-of-range lanes', () => {
+    const rawShuffle = (lane: number) => ({
+      functions: [
+        {
+          name: 's',
+          export: true,
+          inputs: [],
+          outputs: ['i32'],
+          locals: [],
+          instructions: [
+            { TAG: 'v128.const', data: 0n },
+            { TAG: 'v128.const', data: 0n },
+            {
+              TAG: 'i8x16.shuffle',
+              data: [lane, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            },
+            { TAG: 'i8x16.extract_lane_u', data: 0 },
+            { TAG: 'end', data: undefined },
+          ],
+        },
+      ],
+    });
+    const rawExtract = (lane: number) => ({
+      functions: [
+        {
+          name: 'e',
+          export: true,
+          inputs: [],
+          outputs: ['i32'],
+          locals: [],
+          instructions: [
+            { TAG: 'v128.const', data: 0n },
+            { TAG: 'i32x4.extract_lane', data: lane },
+            { TAG: 'end', data: undefined },
+          ],
+        },
+      ],
+    });
+    const rawLaneMem = (tag: string, lane: number) => ({
+      memory: { export: true, size: 65_536 },
+      functions: [
+        {
+          name: 'lane',
+          export: true,
+          inputs: ['i32'],
+          outputs: tag.includes('load') ? ['i32'] : [],
+          locals: [],
+          instructions: tag.includes('load')
+            ? [
+                { TAG: 'local.get', data: 0n },
+                { TAG: 'v128.const', data: 0n },
+                { TAG: tag, data: { mem: { align: 2n, offset: 0n }, lane } },
+                { TAG: 'i32x4.extract_lane', data: 0 },
+                { TAG: 'end', data: undefined },
+              ]
+            : [
+                { TAG: 'local.get', data: 0n },
+                { TAG: 'v128.const', data: 0n },
+                { TAG: tag, data: { mem: { align: 2n, offset: 0n }, lane } },
+                { TAG: 'end', data: undefined },
+              ],
+        },
+      ],
+    });
+    deepStrictEqual(WebAssembly.validate(wasm.createWasm(rawShuffle(31) as any)), true);
+    deepStrictEqual(WebAssembly.validate(wasm.createWasm(rawExtract(3) as any)), true);
+    deepStrictEqual(
+      WebAssembly.validate(wasm.createWasm(rawLaneMem('v128.load32_lane', 3) as any)),
+      true
+    );
+    deepStrictEqual(
+      WebAssembly.validate(wasm.createWasm(rawLaneMem('v128.store32_lane', 3) as any)),
+      true
+    );
+    throws(() => wasm.createWasm(rawShuffle(32) as any), /lane|range|invalid/i);
+    throws(() => wasm.createWasm(rawExtract(4) as any), /lane|range|invalid/i);
+    throws(() => wasm.createWasm(rawLaneMem('v128.load32_lane', 4) as any), /lane|range|invalid/i);
+    throws(() => wasm.createWasm(rawLaneMem('v128.store32_lane', 4) as any), /lane|range|invalid/i);
+    const badExtract = new Module('bad_extract_lane').fn('run', [], 'u32', (f) => {
+      const { u32x4 } = f.types;
+      return [u32x4.extractLane(u32x4.const(0), 4)];
+    });
+    const badReplace = new Module('bad_replace_lane').fn('run', [], 'u32x4', (f) => {
+      const { u32, u32x4 } = f.types;
+      return [u32x4.replaceLane(u32x4.const(0), 4, u32.const(1))];
+    });
+    throws(() => toMod(badExtract, { optimize: false }), /lane|range|invalid/i);
+    throws(() => toMod(badReplace, { optimize: false }), /lane|range|invalid/i);
+    const runtime = genRuntimeTypes().u32x4;
+    throws(() => runtime.extractLane([0, 1, 2, 3], 4), /lane|range|invalid/i);
+    throws(() => runtime.replaceLane([0, 1, 2, 3], 4, 9), /lane|range|invalid/i);
+  });
+
+  should('optimizer preserves NaN for floating multiply by zero', () => {
+    const mod = new Module('float_mul_zero')
+      .fn('f32', ['f32'], 'f32', (f, x) => f.types.f32.mul(x, f.types.f32.const(0)))
+      .fn('f64', ['f64'], 'f64', (f, x) => f.types.f64.mul(x, f.types.f64.const(0)))
+      .fn('f32x4', ['f32'], 'f32', (f, x) => {
+        const { f32x4 } = f.types;
+        return [f32x4.extractLane(f32x4.mul(f32x4.splat(x), f32x4.const(0)), 0)];
+      })
+      .fn('f64x2', ['f64'], 'f64', (f, x) => {
+        const { f64x2 } = f.types;
+        return [f64x2.extractLane(f64x2.mul(f64x2.splat(x), f64x2.const(0)), 0)];
+      });
+    const native = exec(toWasm(mod, { optimize: false }));
+    const optimized = exec(toJs(mod, { optimize: true, noRuntime: true } as any));
+    deepStrictEqual(
+      {
+        native: [
+          native.f32(Number.NaN),
+          native.f64(Number.NaN),
+          native.f32x4(Number.NaN),
+          native.f64x2(Number.NaN),
+        ],
+        optimized: [
+          optimized.f32(Number.NaN),
+          optimized.f64(Number.NaN),
+          optimized.f32x4(Number.NaN),
+          optimized.f64x2(Number.NaN),
+        ],
+      },
+      {
+        native: [Number.NaN, Number.NaN, Number.NaN, Number.NaN],
+        optimized: [Number.NaN, Number.NaN, Number.NaN, Number.NaN],
+      }
+    );
+  });
+
+  should('lowerPatternJS validates and reads scalar pattern bytes across args', () => {
+    const invalid = new Module('lower_pattern_js_oob').fn('run', ['u32'], 'u32', (f, x) => {
+      const out = (f as any).rawFn.op('u32', 'pattern', [x], { pattern: [0, 1, 2, 4] });
+      return [out];
+    });
+    throws(
+      () => toJs(invalid, { lowerPattern: false, lowerPatternJS: true, noRuntime: true } as any),
+      /pattern/i
+    );
+    const valid = new Module('lower_pattern_js_multi_arg').fn('run', [], 'u32', (f) => {
+      const { u32 } = f.types;
+      const a = u32.const(0x03020100);
+      const b = u32.const(0x07060504);
+      const out = (f as any).rawFn.op('u32', 'pattern', [a, b], { pattern: [0, 1, 4, 5] });
+      return [out];
+    });
+    deepStrictEqual(
+      exec(
+        toJs(valid, { lowerPattern: false, lowerPatternJS: true, noRuntime: true } as any)
+      ).run(),
+      0x05040100
+    );
+  });
+
+  should('lowerSIMD preserves partial bitselect masks', () => {
+    const mod = new Module('simd_bitselect_mask').fn('lane0', [], 'i32', (f) => {
+      const { i32x4 } = f.types;
+      const a = i32x4.const(-1_431_655_766);
+      const b = i32x4.const(1_431_655_765);
+      const mask = i32x4.const(0x0f0f0f0f);
+      const out = (f as any).rawFn.op('i32x4', 'bitselect', [a, b, mask]);
+      return [i32x4.extractLane(out, 0)];
+    });
+    deepStrictEqual(
+      exec(toJs(mod, { optimize: false, noRuntime: true } as any)).lane0(),
+      exec(toWasm(mod, { optimize: false })).lane0()
+    );
+  });
+
+  should('lowerSIMD supports i32x4 to i64x2 extension', () => {
+    const mod = new Module('simd_i32x4_extend')
+      .fn('signed', [], ['u32', 'u32', 'u32', 'u32'], (f) => {
+        const { i32, i32x4, i64, i64x2 } = f.types;
+        const vec = i32x4.replaceLane(
+          i32x4.replaceLane(i32x4.const(1), 0, i32.const(-1)),
+          2,
+          i32.const(-2)
+        );
+        const [low, high] = i32x4.to('i64x2', vec);
+        const lowParts = i64.to('u32', i64x2.extractLane(low, 0));
+        const highParts = i64.to('u32', i64x2.extractLane(high, 0));
+        return [lowParts[0], lowParts[1], highParts[0], highParts[1]];
+      })
+      .fn('unsigned', [], ['u32', 'u32', 'u32', 'u32'], (f) => {
+        const { u32, u32x4, u64, u64x2 } = f.types;
+        const vec = u32x4.replaceLane(
+          u32x4.replaceLane(u32x4.const(1), 0, u32.const(0xffff_ffff)),
+          2,
+          u32.const(0x8000_0000)
+        );
+        const [low, high] = u32x4.to('u64x2', vec);
+        const lowParts = u64.to('u32', u64x2.extractLane(low, 0));
+        const highParts = u64.to('u32', u64x2.extractLane(high, 0));
+        return [lowParts[0], lowParts[1], highParts[0], highParts[1]];
+      });
+    // Multi-value i32/u32 returns are JS i32-shaped here; signed words still verify the high halves.
+    const expected = {
+      signed: [-1, -1, -2, -1],
+      unsigned: [-1, 0, -0x8000_0000, 0],
+    };
+    const native = exec(toWasm(mod, { optimize: false }));
+    const lowered = exec(toJs(mod, { optimize: false, noRuntime: true } as any));
+    deepStrictEqual({ signed: native.signed(), unsigned: native.unsigned() }, expected);
+    deepStrictEqual({ signed: lowered.signed(), unsigned: lowered.unsigned() }, expected);
+  });
+
+  should('lowerSIMD supports i32x4 to i64x2 extmul', () => {
+    const mod = new Module('simd_i32x4_extmul')
+      .fn('lowUnsigned', [], ['u32', 'u32'], (f) => {
+        const { u32, u32x4, u64, u64x2 } = f.types;
+        const a = u32x4.replaceLane(u32x4.const(2), 1, u32.const(0xffff_ffff));
+        const b = u32x4.replaceLane(u32x4.const(3), 1, u32.const(2));
+        const out = (f as any).rawFn.op('u64x2', 'extmul_low_i32x4_u', [a, b]);
+        return u64.to('u32', u64x2.extractLane(out, 1));
+      })
+      .fn('highSigned', [], ['u32', 'u32'], (f) => {
+        const { i32, i32x4, i64, i64x2 } = f.types;
+        const a = i32x4.replaceLane(i32x4.const(1), 2, i32.const(-2));
+        const b = i32x4.replaceLane(i32x4.const(1), 2, i32.const(3));
+        const out = (f as any).rawFn.op('i64x2', 'extmul_high_i32x4_s', [a, b]);
+        return i64.to('u32', i64x2.extractLane(out, 0));
+      });
+    const expected = { lowUnsigned: [-2, 1], highSigned: [-6, -1] };
+    const native = exec(toWasm(mod, { optimize: false }));
+    const lowered = exec(toJs(mod, { optimize: false, noRuntime: true } as any));
+    deepStrictEqual(
+      { lowUnsigned: native.lowUnsigned(), highSigned: native.highSigned() },
+      expected
+    );
+    deepStrictEqual(
+      { lowUnsigned: lowered.lowUnsigned(), highSigned: lowered.highSigned() },
+      expected
+    );
+  });
+
+  should('lowerSmallInt normalizes imported small-int call results', () => {
+    const mod = new Module('small_import_result')
+      .importFn('byte', [], 'u8', () => 0x1ff)
+      .fn('local', [], 'u8', (f) => [f.types.u8.fromN('u32', f.types.u32.const(0x1ff))])
+      .fn('run', [], 'u8', (f) => f.functions.byte.call()[0]);
+    const out = exec(toJs(mod, { optimize: false, noRuntime: true }));
+    deepStrictEqual(out.local(), 0xff);
+    deepStrictEqual(out.run(), 0xff);
+  });
+
+  should('lowerU64Arg handles imported u64 call arguments', () => {
+    const mod = new Module('lower_u64_arg_import')
+      .importFn('sink', ['u64'], 'void')
+      .fn('run', ['u64'], 'void', (f, x) => {
+        f.functions.sink.call(x);
+      });
+    for (const compile of [toJs, toWasm]) {
+      const calls: number[][] = [];
+      const out = exec(compile(mod, { lowerU64Arg: true, noRuntime: true } as any), {
+        env: { sink: (lo: number, hi: number) => calls.push([lo, hi]) },
+      });
+      out.run(2, 1);
+      deepStrictEqual(calls, [[2, 1]]);
+    }
+  });
+
+  should('lowerU64Arg preserves mixed outputs after wide outputs', () => {
+    const mod = new Module('lower_u64_arg_mixed_outputs')
+      .importFn('impPair', [], ['u64', 'u32'])
+      .fn('pair', [], ['u64', 'u32'], (f) => {
+        const { u32, u64 } = f.types;
+        return [u64.fromN('u32', [u32.const(5), u32.const(6)]), u32.const(7)];
+      })
+      .fn('run', [], ['u32', 'u32', 'u32'], (f) => {
+        const { u64 } = f.types;
+        const [wide, tail] = f.functions.pair.call();
+        const parts = u64.to('u32', wide);
+        return [parts[0], parts[1], tail];
+      })
+      .fn('runImport', [], ['u32', 'u32', 'u32'], (f) => {
+        const { u64 } = f.types;
+        const [wide, tail] = f.functions.impPair.call();
+        const parts = u64.to('u32', wide);
+        return [parts[0], parts[1], tail];
+      });
+    for (const compile of [toJs, toWasm]) {
+      const out = exec(compile(mod, { lowerU64Arg: true, noRuntime: true } as any), {
+        env: { impPair: () => [9, 10, 11] },
+      });
+      deepStrictEqual(out.run(), [5, 6, 7]);
+      deepStrictEqual(out.runImport(), [9, 10, 11]);
+    }
+  });
+
+  should('lowerVirtualSIMDMask loads only active lanes', () => {
+    const mod = new Module('virtual_mask_load_width')
+      .mem('buf', array('u32', {}, 16_384))
+      .fn('scalar', [], ['u32', 'u32'], (f) => {
+        const src = f.memory.buf.range(16_382, 2).get();
+        return [src[0], src[1]];
+      })
+      .fn('masked', [], ['u32', 'u32'], (f) => {
+        const { u32x2 } = f.types;
+        const [src] = f.memory.buf.range(16_382, 2).as('u32x2').get();
+        return [u32x2.extractLane(src, 0), u32x2.extractLane(src, 1)];
+      });
+    for (const compile of [toJs, toWasm]) {
+      const out = exec(compile(mod, { optimize: false, noRuntime: true } as any));
+      const buf = new Uint32Array(
+        out.segments.buf.buffer,
+        out.segments.buf.byteOffset,
+        out.segments.buf.byteLength / 4
+      );
+      buf.set([1, 2], 16_382);
+      deepStrictEqual(out.scalar(), [1, 2]);
+      deepStrictEqual(out.masked(), [1, 2]);
+    }
+  });
+
+  should('lowerVirtualSIMDPairs lowers lane shuffles across native parts', () => {
+    const expect = (lanes: number, rhsOffset: number, pattern: number[]) =>
+      pattern.map((lane) => (lane < lanes ? lane : rhsOffset + lane - lanes));
+    const u32x8Pat = [7, 0, 8, 15, 3, 12, 4, 11];
+    const u32x16Pat = [31, 0, 22, 9, 16, 15, 24, 7, 8, 23, 14, 17, 30, 1, 20, 11];
+    const f64x4Pat = [5, 0, 3, 4];
+    const mod = new Module('virtual_pair_shuffle')
+      .fn('u32x8', [], new Array(8).fill('u32') as any, (f) => {
+        const { u32x8 } = f.types;
+        const out = u32x8.shuffleLanes(u32x8.laneOffsets(), u32x8.laneOffsets(100), u32x8Pat);
+        return Array.from({ length: 8 }, (_, lane) => u32x8.extractLane(out, lane));
+      })
+      .fn('u32x16', [], new Array(16).fill('u32') as any, (f) => {
+        const { u32x16 } = f.types;
+        const out = u32x16.shuffleLanes(u32x16.laneOffsets(), u32x16.laneOffsets(100), u32x16Pat);
+        return Array.from({ length: 16 }, (_, lane) => u32x16.extractLane(out, lane));
+      })
+      .fn('f64x4', [], new Array(4).fill('f64') as any, (f) => {
+        const { f64x4 } = f.types;
+        const out = f64x4.shuffleLanes(f64x4.laneOffsets(), f64x4.laneOffsets(100), f64x4Pat);
+        return Array.from({ length: 4 }, (_, lane) => f64x4.extractLane(out, lane));
+      });
+    const expected = {
+      u32x8: expect(8, 100, u32x8Pat),
+      u32x16: expect(16, 100, u32x16Pat),
+      f64x4: expect(4, 100, f64x4Pat),
+    };
+    for (const compile of [toJs, toWasm]) {
+      const out = exec(compile(mod, { optimize: false, noRuntime: true } as any));
+      deepStrictEqual({ u32x8: out.u32x8(), u32x16: out.u32x16(), f64x4: out.f64x4() }, expected);
+    }
+  });
+
+  should('JS output rejects memory.grow because memory views are fixed-size', () => {
+    throws(
+      () =>
+        createJS(
+          {
+            memory: { size: 65536, maximum: 131072, export: true },
+            functions: [
+              {
+                name: 'grow',
+                export: true,
+                inputs: [],
+                outputs: [],
+                locals: [],
+                instructions: [
+                  { TAG: 'i32.const', data: 1n },
+                  { TAG: 'memory.grow' },
+                  { TAG: 'drop' },
+                  { TAG: 'end' },
+                ],
+              },
+            ],
+          } as any,
+          {}
+        ),
+      /memory\.grow.*fixed-size memory views/
+    );
+  });
+
+  should('JS memory.size returns wasm page count', () => {
+    const mod = {
+      memory: { size: 65537, maximum: 131072, export: true },
+      functions: [
+        {
+          name: 'size',
+          export: true,
+          inputs: [],
+          outputs: ['i32'],
+          locals: [],
+          instructions: [{ TAG: 'memory.size' }, { TAG: 'end' }],
+        },
+      ],
+    };
+    const native = exec(
+      wrapModule(mod as any, wrapWASM(mod as any, wasm.createWasm(mod as any)), {})
+    );
+    const generated = exec(wrapModule(mod as any, createJS(mod as any), {}));
+    deepStrictEqual(
+      { native: native.size(), generated: generated.size() },
+      { native: 2, generated: 2 }
+    );
+  });
+
+  should('function name memory is reserved for exported module memory', () => {
+    throws(() => new Module('reserved').fn('memory', [], 'void', () => {}), /reserved.*memory/);
+    throws(() => new Module('reserved').importFn('memory', [], 'void'), /reserved.*memory/);
+    throws(
+      () => new Module('reserved').batchFn('memory', { lanes: 1 }, [], () => {}),
+      /reserved.*memory/
+    );
+  });
+
+  should('function name segments is reserved for wrapper segment views', () => {
+    throws(() => new Module('reserved').fn('segments', [], 'void', () => {}), /reserved.*segments/);
+    throws(() => new Module('reserved').importFn('segments', [], 'void'), /reserved.*segments/);
+    throws(
+      () => new Module('reserved').batchFn('segments', { lanes: 1 }, [], () => {}),
+      /reserved.*segments/
+    );
   });
 });
 

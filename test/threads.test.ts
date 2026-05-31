@@ -47,6 +47,7 @@ const CODERS_BE = {
 };
 
 const SLOW = false;
+const BENCH_OPTS = { maxRunTimeSec: 0.1 };
 
 describe('threads', () => {
   should('basic', async () => {
@@ -214,7 +215,7 @@ describe('threads', () => {
       if (pool) await pool.waitOnline();
 
       for (let i = 0; i < 20; i++) {
-        await bench(`${k} add`, () => inst.tmp_cmd(0, CNT, A, B), 2_000_000);
+        await bench(`${k} add`, () => inst.tmp_cmd(0, CNT, A, B), BENCH_OPTS);
         checkOnline(inst);
         await check(inst, `${k} bench(${i})`);
       }

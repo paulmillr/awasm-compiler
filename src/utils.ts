@@ -1,7 +1,9 @@
-import { utils as baseUtils } from '@scure/base';
+import { utils as baseUtils, type TArg, type TRet } from '@scure/base';
 import * as P from 'micro-packed';
 
+/** Extracts the element type from a readonly array. */
 export type ElementOf<T> = T extends readonly (infer U)[] ? U : never;
+/** Recursive nested-data helper used by APIs that accept trees of values. */
 export type ND<T> = T | readonly ND<T>[];
 
 /** Generic type encompassing 8/16/32-byte arrays - but not 64-byte. */
@@ -9,25 +11,99 @@ export type ND<T> = T | readonly ND<T>[];
 export type TypedArray = Int8Array | Uint8ClampedArray | Uint8Array |
   Uint16Array | Int16Array | Uint32Array | Int32Array;
 
-/** Cast u8 / u16 / u32 to u8. */
-export function u8(arr: TypedArray): Uint8Array {
-  return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+/**
+ * Recursively freezes an object graph in place.
+ *
+ * @param obj - Value to freeze.
+ * @returns The same value after freezing every reachable array or object value.
+ * @example
+ * ```ts
+ * deepFreeze({ a: [{ b: 1 }] });
+ * ```
+ */
+export function deepFreeze<T>(obj: T): T {
+  if (obj === null || typeof obj !== 'object' || isBytes(obj)) return obj;
+  if (Object.isFrozen(obj)) return obj;
+  Object.freeze(obj);
+  if (Array.isArray(obj)) {
+    for (const item of obj) deepFreeze(item);
+  } else {
+    for (const value of Object.values(obj)) deepFreeze(value);
+  }
+  return obj;
 }
 
-/** Cast u8 / u16 / u32 to u32. */
-export function u32(arr: TypedArray): Uint32Array {
-  return new Uint32Array(arr.buffer, arr.byteOffset, Math.floor(arr.byteLength / 4));
+/**
+ * Reinterprets a typed array as bytes without copying.
+ *
+ * @param arr - Typed array whose backing buffer is reused.
+ * @returns A `Uint8Array` view over the same backing buffer region.
+ * @example
+ * ```js
+ * u8(new Uint16Array([0x1234]));
+ * ```
+ */
+export function u8(arr: TArg<TypedArray>): TRet<Uint8Array> {
+  return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength) as TRet<Uint8Array>;
 }
 
-export function createView(arr: TypedArray): DataView {
+/**
+ * Reinterprets a typed array as 32-bit words without copying.
+ *
+ * @param arr - Typed array whose backing buffer is reused.
+ * @returns A `Uint32Array` view over complete 32-bit words in the same backing buffer region.
+ * @example
+ * ```js
+ * u32(new Uint8Array([1, 0, 0, 0]));
+ * ```
+ */
+export function u32(arr: TArg<TypedArray>): TRet<Uint32Array> {
+  return new Uint32Array(
+    arr.buffer,
+    arr.byteOffset,
+    Math.floor(arr.byteLength / 4)
+  ) as TRet<Uint32Array>;
+}
+
+/**
+ * Creates a `DataView` over a typed array backing buffer region.
+ *
+ * @param arr - Typed array whose backing buffer is reused.
+ * @returns A `DataView` spanning the same bytes as the input array.
+ * @example
+ * ```js
+ * createView(new Uint8Array([1, 2, 3]));
+ * ```
+ */
+export function createView(arr: TArg<TypedArray>): DataView {
   return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
 }
 
+/**
+ * Converts a byte alignment value into the WebAssembly memarg alignment exponent.
+ *
+ * @param addr - Power-of-two byte alignment.
+ * @returns The base-2 exponent used by Wasm memory immediates.
+ * @example
+ * ```js
+ * wasmAlign(16);
+ * ```
+ */
 export function wasmAlign(addr: number): number {
   const lsb = addr & -addr;
   return Math.clz32(lsb) ^ 31;
 }
 
+/**
+ * Clones ordinary data containers used by compiler graphs.
+ *
+ * @param value - Value to clone.
+ * @returns A cloned value preserving the original outer shape.
+ * @example
+ * ```js
+ * deepClone({ items: [1, 2, 3] });
+ * ```
+ */
 export function deepClone<T>(value: T): T {
   // if (Array.isArray(value)) return value.map(deepClone) as T;
   // if (typeof value === 'object' && value !== null)
@@ -46,6 +122,11 @@ export function deepClone<T>(value: T): T {
     return out as unknown as T;
   }
   if (value instanceof Set) return new Set(value) as T;
+  if (value instanceof Map) {
+    const out = new Map();
+    for (const [k, v] of value) out.set(k, v && typeof v === 'object' ? deepClone(v) : v);
+    return out as T;
+  }
   // plain object clone
   const src = value as unknown as Record<string, any>;
   const out: Record<string, any> = {};
@@ -58,61 +139,56 @@ export function deepClone<T>(value: T): T {
   return out as T;
 }
 
-// Deep readonly type (keeps functions as-is)
-type Primitive = string | number | boolean | bigint | symbol | null | undefined;
-export type DeepReadonly<T> = T extends Primitive | ((...a: any[]) => any)
-  ? T
-  : T extends Array<infer U>
-    ? ReadonlyArray<DeepReadonly<U>>
-    : T extends Map<infer K, infer V>
-      ? ReadonlyMap<DeepReadonly<K>, DeepReadonly<V>>
-      : T extends Set<infer U>
-        ? ReadonlySet<DeepReadonly<U>>
-        : { readonly [K in keyof T]: DeepReadonly<T[K]> };
-
-// Deep freeze with cycle protection
-export function deepFreeze<T>(obj: T, _seen = new WeakSet<object>()): DeepReadonly<T> {
-  if (obj === null || typeof obj !== 'object') return obj as DeepReadonly<T>;
-  const o = obj as unknown as object;
-  if (_seen.has(o) || Object.isFrozen(o)) return obj as DeepReadonly<T>;
-  _seen.add(o);
-  // Collections
-  if (o instanceof Map) {
-    // freeze entries first, then the container
-    for (const [k, v] of o) {
-      deepFreeze(k as any, _seen);
-      deepFreeze(v as any, _seen);
-    }
-    Object.freeze(o);
-    return o as DeepReadonly<T>;
-  }
-  if (o instanceof Set) {
-    for (const v of o) deepFreeze(v as any, _seen);
-    Object.freeze(o);
-    return o as DeepReadonly<T>;
-  }
-  // Typed arrays (DataView handled as plain object below)
-  // Freezes the view object; underlying buffer remains mutable by spec.
-  if (ArrayBuffer.isView(o) && !(o instanceof DataView)) {
-    Object.freeze(o);
-    return o as DeepReadonly<T>;
-  }
-  // Plain objects / arrays / class instances
-  // Recurse into own data properties (ignores accessors to avoid invoking getters)
-  for (const k of Reflect.ownKeys(o)) {
-    const d = Object.getOwnPropertyDescriptor(o, k as PropertyKey);
-    if (!d) continue;
-    if ('value' in d) deepFreeze((d as PropertyDescriptor & { value: any }).value, _seen);
-  }
-  // Finally freeze the container itself
-  Object.freeze(o);
-  return o as DeepReadonly<T>;
-}
-
-// Reverses key<->values
 type RevObj<T extends Record<string, string | number>> = {
   [K in T[keyof T]]: Extract<keyof T, string>;
 };
+/** Bidirectional string mapping helper returned by `mapCoder`. */
+export type MapCoder<T extends Record<string, string>> = {
+  /** Forward mapping from source names to encoded names. */
+  direct: T;
+  /** Reverse mapping from encoded names back to source names. */
+  reverse: RevObj<T>;
+  /**
+   * Encodes a known source name, throwing on unknown input.
+   *
+   * @param from - Source name to encode.
+   * @returns Encoded name.
+   */
+  encode(from: keyof T): T[keyof T];
+  /**
+   * Decodes a known encoded name, throwing on unknown input.
+   *
+   * @param to - Encoded name to decode.
+   * @returns Source name.
+   */
+  decode(to: T[keyof T]): RevObj<T>[T[keyof T]];
+  /**
+   * Encodes a source name, returning `undefined` on unknown input.
+   *
+   * @param from - Source name to encode.
+   * @returns Encoded name or `undefined`.
+   */
+  encodeSilent(from: string): T[keyof T] | undefined;
+  /**
+   * Decodes an encoded name, returning `undefined` on unknown input.
+   *
+   * @param to - Encoded name to decode.
+   * @returns Source name or `undefined`.
+   */
+  decodeSilent(to: string): RevObj<T>[T[keyof T]] | undefined;
+};
+
+/**
+ * Reverses a string or number mapping, rejecting duplicate output keys.
+ *
+ * @param obj - Mapping to reverse.
+ * @returns Object whose keys are the original values and whose values are the original keys.
+ * @throws If two input keys map to the same output key. {@link Error}
+ * @example
+ * ```js
+ * reverseObject({ read: 'r', write: 'w' });
+ * ```
+ */
 export function reverseObject<T extends Record<string, string | number>>(obj: T): RevObj<T> {
   const res = {} as any;
   for (const k in obj) {
@@ -121,19 +197,32 @@ export function reverseObject<T extends Record<string, string | number>>(obj: T)
   }
   return res;
 }
-export function mapCoder<T extends Record<string, string>>(obj: T) {
+
+/**
+ * Builds a bidirectional micro-packed coder from a string mapping.
+ *
+ * @param obj - Mapping from source names to encoded names.
+ * @returns Coder with direct, reverse, throwing, and silent conversion helpers.
+ * @throws If decoding or encoding sees an unknown element. {@link Error}
+ * @example
+ * ```js
+ * const coder = mapCoder({ read: 'r', write: 'w' });
+ * coder.encode('read');
+ * ```
+ */
+export function mapCoder<T extends Record<string, string>>(obj: T): MapCoder<T> {
   const r = reverseObject(obj);
   return {
     direct: obj,
     reverse: r,
-    encode(from) {
+    encode(from: keyof T) {
       if (obj[from] === undefined)
         throw new Error(
           `mapCoder: unknown element=${from.toString()} expected ${Object.keys(obj)}`
         );
       return obj[from];
     },
-    decode(to) {
+    decode(to: T[keyof T]) {
       if (r[to] === undefined)
         throw new Error(`mapCoder: unknown element=${to} expected ${Object.keys(r)}`);
       return r[to];
@@ -148,11 +237,18 @@ export function mapCoder<T extends Record<string, string>>(obj: T) {
   };
 }
 
-export function log2(x: number) {
-  if (x <= 0 || (x & (x - 1)) !== 0) throw new Error('Not a power of two');
-  return 31 - Math.clz32(x);
-}
-
+/**
+ * Splits an array into contiguous chunks.
+ *
+ * @param a - Array-like input to split.
+ * @param size - Positive chunk size.
+ * @returns Array of chunks preserving input order.
+ * @throws If `size` is not positive. {@link RangeError}
+ * @example
+ * ```js
+ * chunks([1, 2, 3], 2);
+ * ```
+ */
 export const chunks = <T>(a: readonly T[], size: number): T[][] => {
   const n = size | 0;
   if (n <= 0) throw new RangeError('size must be > 0');
@@ -161,7 +257,19 @@ export const chunks = <T>(a: readonly T[], size: number): T[][] => {
   return out;
 };
 
-export function chunkBytes(a: Uint8Array, size: number): Uint8Array[] {
+/**
+ * Splits bytes into full chunks using the historical padded stride rule.
+ *
+ * @param a - Bytes to split.
+ * @param size - Positive byte length for each returned subarray.
+ * @returns `Uint8Array` subarrays over the original buffer.
+ * @throws If `size` is not positive. {@link RangeError}
+ * @example
+ * ```js
+ * chunkBytes(new Uint8Array([1, 2, 3, 4]), 2);
+ * ```
+ */
+export function chunkBytes(a: TArg<Uint8Array>, size: number): TRet<Uint8Array[]> {
   if (size <= 0) throw new RangeError('size must be > 0');
   const full = Math.floor(a.length / size); // number of full chunks (floor)
   const paddedChunkSize = Math.floor(a.length / full);
@@ -170,11 +278,32 @@ export function chunkBytes(a: Uint8Array, size: number): Uint8Array[] {
     res.push(a.subarray(pos, pos + size));
     pos += paddedChunkSize;
   }
-  return res;
+  return res as TRet<Uint8Array[]>;
 }
 
-export const seq = (length: number) => Array.from({ length }, (_, i) => i);
+/**
+ * Creates an integer sequence from `0` to `length - 1`.
+ *
+ * @param length - Number of entries to create.
+ * @returns Sequential zero-based numbers.
+ * @example
+ * ```js
+ * seq(3);
+ * ```
+ */
+export const seq = (length: number): number[] => Array.from({ length }, (_, i) => i);
 
+/**
+ * Copies an object while dropping selected keys.
+ *
+ * @param obj - Source object.
+ * @param keys - Keys to remove from the copy.
+ * @returns A shallow object copy without the selected keys.
+ * @example
+ * ```js
+ * omit({ a: 1, b: 2 }, 'a');
+ * ```
+ */
 export function omit<T extends object, K extends keyof T>(
   obj: T,
   ...keys: readonly K[]
@@ -185,13 +314,51 @@ export function omit<T extends object, K extends keyof T>(
   >;
 }
 
+/**
+ * Returns the last array element.
+ *
+ * @param xs - Non-empty array.
+ * @returns Final element of `xs`.
+ * @throws If the array is empty. {@link Error}
+ * @example
+ * ```js
+ * last([1, 2, 3]);
+ * ```
+ */
 export function last<T>(xs: T[]): T {
   if (xs.length === 0) throw new Error('last(): empty array');
   return xs[xs.length - 1];
 }
 
-// Nd matrix like ops to reduce complexity of simd stuff
-export const named = <const N extends string[]>(names: N) => {
+/** Name-based encoder for fixed-order tuples. */
+export type Named<N extends readonly string[]> = {
+  /**
+   * Converts a tuple into a record keyed by the configured names.
+   *
+   * @param lst - Tuple values in configured order.
+   * @returns Record keyed by configured names.
+   */
+  encode<T>(lst: T[]): Record<N[number], T>;
+  /**
+   * Converts a keyed record back into tuple order.
+   *
+   * @param obj - Record keyed by configured names.
+   * @returns Tuple values in configured order.
+   */
+  decode<T>(obj: Record<N[number], T>): T[];
+};
+/**
+ * Creates name-based encoders for fixed-order tuples.
+ *
+ * @param names - Tuple field names in encoding order.
+ * @returns Object with tuple-to-record and record-to-tuple conversion helpers.
+ * @example
+ * ```js
+ * const xy = named(['x', 'y']);
+ * xy.encode([1, 2]);
+ * ```
+ */
+export const named = <const N extends string[]>(names: N): Named<N> => {
   type K = N[number];
   return {
     encode<T>(lst: T[]): Record<K, T> {
@@ -207,14 +374,76 @@ export const named = <const N extends string[]>(names: N) => {
     },
   } as const;
 };
+type Nest<T, D extends readonly unknown[]> = D extends readonly [any, ...infer R]
+  ? Array<Nest<T, R>>
+  : T;
+/** Helper bundle returned by `Dimensions`. */
+export type DimensionsRes<D extends readonly number[]> = {
+  /** Dimension sizes in row-major order. */
+  readonly dims: D;
+  /** Total element count. */
+  readonly cardinality: number;
+  /** Row-major stride for each dimension. */
+  readonly strides: number[];
+  /**
+   * Reads a nested value at multidimensional coordinates.
+   *
+   * @param obj - Nested array to read.
+   * @param keys - Coordinates to read.
+   * @returns Value at `keys`.
+   */
+  readonly get: <T>(obj: Nest<T, D>, keys: number[]) => T;
+  /**
+   * Writes a nested value at multidimensional coordinates.
+   *
+   * @param obj - Nested array to update.
+   * @param keys - Coordinates to write.
+   * @param value - Replacement value.
+   */
+  readonly set: <T>(obj: Nest<T, D>, keys: number[], value: T) => void;
+  /** Converts between multidimensional coordinates and flat indexes. */
+  readonly key: {
+    /** Encodes coordinates into a flat index. */
+    readonly encode: (idx: number[]) => number;
+    /** Decodes a flat index into coordinates. */
+    readonly decode: (i: number) => number[];
+  };
+  /** Converts between nested arrays and flat value lists. */
+  readonly flat: {
+    /** Flattens a nested array in row-major order. */
+    readonly encode: <T>(x: Nest<T, D>) => T[];
+    /** Rebuilds a nested array from a flat row-major list. */
+    readonly decode: <T>(lst: T[]) => Nest<T, D>;
+  };
+  /**
+   * Iterates all coordinates with their flat index.
+   *
+   * @param cb - Callback receiving flat index and coordinates.
+   */
+  readonly iter: (cb: (flat: number, idx: number[]) => void) => void;
+};
 
-export function Dimensions<const D extends number[]>(...dims: D) {
-  type Nest<T, D extends unknown[]> = D extends [any, ...infer R] ? Array<Nest<T, R>> : T;
+/**
+ * Creates row-major index helpers for fixed multidimensional arrays.
+ *
+ * @param dims - Positive safe-integer dimension sizes.
+ * @returns Helpers for flat keys, nested-array flattening, and coordinate iteration.
+ * @throws If dimensions or coordinates are outside the valid integer domain. {@link Error}
+ * @example
+ * ```js
+ * const d = Dimensions(2, 3);
+ * d.key.encode([1, 2]);
+ * ```
+ */
+export function Dimensions<const D extends number[]>(...dims: D): DimensionsRes<D> {
   if (dims.length === 0) throw new Error('no dimensions');
   let cardinality = 1;
   for (const d of dims) {
-    if (d < 1) throw new Error('wrong dimension size: ' + d);
+    // Fractional coordinates produce fractional flat keys, which are not array positions.
+    if (!Number.isSafeInteger(d) || d < 1) throw new Error('wrong dimension size: ' + d);
     cardinality *= d;
+    if (!Number.isSafeInteger(cardinality))
+      throw new Error('wrong dimension cardinality: ' + cardinality);
   }
   const L = dims.length;
   // strides[i] = product(dims[i+1..])
@@ -230,7 +459,8 @@ export function Dimensions<const D extends number[]>(...dims: D) {
     if (idx.length !== L) throw new Error('wrong number of dimensions');
     for (let i = 0; i < L; i++) {
       const v = idx[i] as number;
-      if (v < 0 || v >= dims[i]) throw new Error('wrong dimension position');
+      if (!Number.isSafeInteger(v) || v < 0 || v >= dims[i])
+        throw new Error('wrong dimension position');
     }
   };
   const flatKey = {
@@ -242,7 +472,7 @@ export function Dimensions<const D extends number[]>(...dims: D) {
       return acc;
     },
     decode(i: number): number[] {
-      if (i < 0 || i >= cardinality) throw new Error('idx key bounds');
+      if (!Number.isSafeInteger(i) || i < 0 || i >= cardinality) throw new Error('idx key bounds');
       const out = [];
       for (let k = 0; k < L; k++) out.push(Math.trunc(i / strides[k]) % dims[k]) as number;
       checkIdx(out);
@@ -254,11 +484,13 @@ export function Dimensions<const D extends number[]>(...dims: D) {
     for (let i = 0; i < cardinality; i++) cb(i, flatKey.decode(i));
   };
   const getAt = <T>(obj: Nest<T, D>, keys: number[]): T => {
+    checkIdx(keys);
     let o: any = obj;
     for (let k = 0; k < L; k++) o = o[keys[k] as number];
     return o as T;
   };
   const setAt = <T>(obj: Nest<T, D>, keys: number[], value: T): void => {
+    checkIdx(keys);
     let o: any = obj;
     for (let k = 0; k < L - 1; k++) {
       const key = keys[k] as number | string;
@@ -297,9 +529,32 @@ export function Dimensions<const D extends number[]>(...dims: D) {
     iter,
   } as const;
 }
-export function NamedDimensions<const O extends Record<string, number>>(o: O) {
+type NamedIndex<O extends Record<string, number>> = { [P in keyof O & string]: number };
+/** Helper bundle returned by `NamedDimensions`. */
+export type NamedDimensionsRes<O extends Record<string, number>> = Omit<
+  DimensionsRes<readonly number[]>,
+  'key' | 'iter'
+> & {
+  readonly key: P.Coder<NamedIndex<O>, number>;
+  readonly iter: (cb: (flat: number, idx: NamedIndex<O>) => void) => void;
+  readonly chunks: <T>(name: keyof O & string, lst: T[]) => T[][];
+};
+/**
+ * Creates row-major index helpers whose coordinates are named object fields.
+ *
+ * @param o - Mapping from coordinate names to positive safe-integer dimension sizes.
+ * @returns Dimension helpers that encode and iterate named coordinates.
+ * @throws If dimensions or coordinates are outside the valid integer domain. {@link Error}
+ * @example
+ * ```js
+ * const d = NamedDimensions({ row: 2, col: 3 });
+ * d.key.encode({ row: 1, col: 2 });
+ * ```
+ */
+export function NamedDimensions<const O extends Record<string, number>>(
+  o: O
+): NamedDimensionsRes<O> {
   type K = keyof O & string;
-  type NamedIndex = { [P in K]: number };
 
   const names = Object.keys(o) as K[];
   const dims = names.map((k) => o[k]) as unknown as readonly number[];
@@ -307,14 +562,14 @@ export function NamedDimensions<const O extends Record<string, number>>(o: O) {
   const nd = named(names as K[]);
   const d = Dimensions(...dims);
   const keyNamed = baseUtils.chain(P.coders.reverse(nd) as any, d.key) as P.Coder<
-    NamedIndex,
+    NamedIndex<O>,
     number
   >;
   return {
     ...d,
     key: keyNamed,
-    iter: (cb: (flat: number, idx: NamedIndex) => void) => {
-      d.iter((flat, tIdx) => cb(flat, nd.encode<number>(tIdx as any) as NamedIndex));
+    iter: (cb: (flat: number, idx: NamedIndex<O>) => void) => {
+      d.iter((flat, tIdx) => cb(flat, nd.encode<number>(tIdx as any) as NamedIndex<O>));
     },
     chunks<T>(name: K, lst: T[]) {
       const dim = names.indexOf(name);
@@ -324,7 +579,17 @@ export function NamedDimensions<const O extends Record<string, number>>(o: O) {
   };
 }
 
-// By default we align everything to v128, since there is no larger SIMD, it should work.
+/**
+ * Rounds a byte position up to an alignment boundary.
+ *
+ * @param pos - Byte position to align.
+ * @param alignment - Positive byte alignment, defaulting to the v128-friendly 16-byte boundary.
+ * @returns The next byte position divisible by `alignment`.
+ * @example
+ * ```js
+ * align(17, 16);
+ * ```
+ */
 export const align = (pos: number, alignment: number = 16): number =>
   Math.ceil(pos / alignment) * alignment;
 
@@ -337,7 +602,44 @@ function retryIfChanged(fn: () => boolean) {
   return changed;
 }
 
-export const Shape = <T>(isVal: (val: unknown) => val is T) => {
+/** Shape encoder returned by `Shape`. */
+export type ShapeCoder<T> = {
+  /**
+   * Extracts a shape and flat leaf values from nested input.
+   *
+   * @param input - Nested input value.
+   * @returns Shape plus flat leaf values.
+   */
+  decode<S>(input: S): { shape: unknown; flat: T[] };
+  /**
+   * Rebuilds nested input from a shape and flat leaf values.
+   *
+   * @param shape - Shape produced by `decode`.
+   * @param flat - Flat leaf values.
+   * @returns Rebuilt nested input.
+   */
+  encode<S>(shape: unknown, flat: readonly T[]): S;
+  /**
+   * Checks that a candidate value matches a previously decoded shape.
+   *
+   * @param shape - Shape produced by `decode`.
+   * @param candidate - Value to compare against the shape.
+   * @returns Whether the candidate has the same shape.
+   */
+  validate(shape: unknown, candidate: unknown): boolean;
+};
+/**
+ * Encodes nested arrays and plain objects into a reusable shape plus a flat value list.
+ *
+ * @param isVal - Predicate deciding which values are leaves in the shape.
+ * @returns Shape coder with decode, encode, and validation helpers.
+ * @example
+ * ```js
+ * const s = Shape((x): x is number => typeof x === 'number');
+ * s.decode([1, { a: 2 }]);
+ * ```
+ */
+export const Shape = <T>(isVal: (val: unknown) => val is T): ShapeCoder<T> => {
   const isPlain = (o: unknown): o is Record<string, unknown> =>
     !!o && Object.getPrototypeOf(o) === Object.prototype;
   type Flat = T[];
@@ -406,62 +708,114 @@ export const Shape = <T>(isVal: (val: unknown) => val is T) => {
   };
 };
 
-const BitSet = <K extends string>(domain: readonly K[]) => {
-  const key2bit = {} as Record<K, number>;
-  let MASK = 0 >>> 0;
-  if (domain.length > 31) throw new Error('only 31 flags supprted');
-  for (let i = 0; i < domain.length; i++) {
-    const b = 1 << i; // up to 31 flags; for 32+ use two u32s or BigInt
-    key2bit[domain[i]] = b;
-    MASK |= b;
-  }
-  return {
-    domain,
-    key2bit,
-    encode: (s: Iterable<K>) => {
-      let m = 0;
-      for (const k of s) m |= key2bit[k];
-      return m >>> 0;
-    },
-    decode: (m: number) => {
-      const out = new Set<K>();
-      for (let i = 0; i < domain.length; i++) if (m & (1 << i)) out.add(domain[i]);
-      return out;
-    },
-    ZERO: 0,
-    MASK,
-    has: (m: number, k: K) => (m & key2bit[k]) !== 0,
-    add: (m: number, k: K) => (m | key2bit[k]) >>> 0,
-    delete: (m: number, k: K) => (m & ~key2bit[k]) >>> 0,
-    toggle: (m: number, k: K) => (m ^ key2bit[k]) >>> 0,
-    or: (...ms: number[]) => ms.reduce((a, b) => (a | b) >>> 0, 0) >>> 0,
-    and: (...ms: number[]) => ms.reduce((a, b) => (a & b) >>> 0, MASK) & MASK,
-    xor: (...ms: number[]) => ms.reduce((a, b) => (a ^ b) >>> 0, 0) >>> 0,
-    not: (m: number) => (~m & MASK) >>> 0,
-    maskOf: (...ks: K[]) => ks.reduce((m, k) => (m | key2bit[k]) >>> 0, 0) >>> 0,
-    combine: (AND: number, OR: number, ...ms: number[]) => {
-      let andAcc = MASK,
-        orAcc = 0;
-      for (let i = 0; i < ms.length; i++) {
-        const m = ms[i] >>> 0;
-        andAcc &= m;
-        orAcc |= m;
-      }
-      return ((andAcc & AND) | (orAcc & OR)) >>> 0;
-    },
+type BitSetOps<K extends string> = {
+  domain: readonly K[];
+  key2bit: Record<K, number>;
+  encode(s: Iterable<K>): number;
+  decode(m: number): Set<K>;
+  ZERO: number;
+  MASK: number;
+  has(m: number, k: K): boolean;
+  add(m: number, k: K): number;
+  delete(m: number, k: K): number;
+  toggle(m: number, k: K): number;
+  or(...ms: number[]): number;
+  and(...ms: number[]): number;
+  xor(...ms: number[]): number;
+  not(m: number): number;
+  maskOf(...ks: K[]): number;
+  combine(AND: number, OR: number, ...ms: number[]): number;
+};
+
+type PathFlags = { w: 'weak'; s: 'sticky' };
+type PathFlag = PathFlags[keyof PathFlags];
+type PathDecoded = { path: number[]; mask: number };
+type PathParent = { parent: string; current: number; mask: number };
+type PathScan = { split: number; mask: number };
+type PathAPI = {
+  flags: MapCoder<PathFlags>;
+  bs: BitSetOps<PathFlag>;
+  cache: {
+    decode: Map<string, PathDecoded>;
+    parent: Map<string, PathParent>;
+    noFlags: Map<string, string>;
   };
+  encode(path: number[], mask?: number): string;
+  _scanSuffix(token: string): PathScan;
+  _flagsSuffix(mask: number): string;
+  _setFlagsOnBase(base: string, mask: number): string;
+  _base(token: string): string;
+  decode(token: string): PathDecoded;
+  getFlags(flags: string[]): number;
+  addFlags(token: string, toAdd?: number): string;
+  stripFlags(token: string, remove?: Iterable<string>): string;
+  parent(token: string): PathParent;
+  cmp(a: string, b: string): number;
+  merge(...args: string[]): Set<string>;
+  isParent(parent: string, child: string): boolean;
+  isSiblings(paths: Set<string>): boolean;
+  mapParent(oldParent: string, newParent: string, child: string): string;
+  normDepth(cur: string, n: string): string;
+  hasFlag(idx: string, flag: string): boolean;
+  addFlagsFrom(idx: string, from: string): string;
+  cleanCache(): void;
 };
 
 /**
- * Utils to work with human readable indices for nodes in TreeDAG
+ * Utilities for human-readable `TreeDAG` node path strings.
+ *
+ * @example
+ * ```js
+ * const token = Path.encode([1, 2], Path.bs.maskOf('weak'));
+ * Path.decode(token);
+ * ```
  */
-export const Path = {
+export const Path: PathAPI = /* @__PURE__ */ deepFreeze({
   flags: /* @__PURE__ */ mapCoder({ w: 'weak', s: 'sticky' } as const),
-  bs: /* @__PURE__ */ BitSet(['weak', 'sticky']),
+  bs: /* @__PURE__ */ ((): BitSetOps<PathFlag> => {
+    const domain = ['weak', 'sticky'] as const;
+    const key2bit = { weak: 1, sticky: 2 };
+    const MASK = 3;
+    return {
+      domain,
+      key2bit,
+      encode: (s: Iterable<PathFlag>) => {
+        let m = 0;
+        for (const k of s) m |= key2bit[k];
+        return m >>> 0;
+      },
+      decode: (m: number) => {
+        const out = new Set<PathFlag>();
+        for (let i = 0; i < domain.length; i++) if (m & (1 << i)) out.add(domain[i]);
+        return out;
+      },
+      ZERO: 0,
+      MASK,
+      has: (m: number, k: PathFlag) => (m & key2bit[k]) !== 0,
+      add: (m: number, k: PathFlag) => (m | key2bit[k]) >>> 0,
+      delete: (m: number, k: PathFlag) => (m & ~key2bit[k]) >>> 0,
+      toggle: (m: number, k: PathFlag) => (m ^ key2bit[k]) >>> 0,
+      or: (...ms: number[]) => ms.reduce((a, b) => (a | b) >>> 0, 0) >>> 0,
+      and: (...ms: number[]) => ms.reduce((a, b) => (a & b) >>> 0, MASK) & MASK,
+      xor: (...ms: number[]) => ms.reduce((a, b) => (a ^ b) >>> 0, 0) >>> 0,
+      not: (m: number) => (~m & MASK) >>> 0,
+      maskOf: (...ks: PathFlag[]) => ks.reduce((m, k) => (m | key2bit[k]) >>> 0, 0) >>> 0,
+      combine: (AND: number, OR: number, ...ms: number[]) => {
+        let andAcc = MASK,
+          orAcc = 0;
+        for (let i = 0; i < ms.length; i++) {
+          const m = ms[i] >>> 0;
+          andAcc &= m;
+          orAcc |= m;
+        }
+        return ((andAcc & AND) | (orAcc & OR)) >>> 0;
+      },
+    };
+  })(),
   // TODO: Those are unbound, works for now, worth cleaning after
   cache: {
-    decode: /* @__PURE__ */ new Map() as Map<string, any>,
-    parent: /* @__PURE__ */ new Map() as Map<string, any>,
+    decode: /* @__PURE__ */ new Map() as Map<string, PathDecoded>,
+    parent: /* @__PURE__ */ new Map() as Map<string, PathParent>,
     noFlags: /* @__PURE__ */ new Map() as Map<string, string>,
   },
   encode(path: number[], mask: number = 0): string {
@@ -641,9 +995,13 @@ export const Path = {
     return true;
   },
   mapParent(oldParent: string, newParent: string, child: string): string {
-    if (!child.startsWith(oldParent))
-      throw new Error(`wrong child=${child} (old=${oldParent} new=${newParent})`);
-    return `${newParent}${child.slice(oldParent.length)}`;
+    const oldPath = this.decode(oldParent).path;
+    const newPath = this.decode(newParent).path;
+    const { path: childPath, mask } = this.decode(child);
+    let ok = oldPath.length <= childPath.length;
+    for (let i = 0; ok && i < oldPath.length; i++) ok = oldPath[i] === childPath[i];
+    if (!ok) throw new Error(`wrong child=${child} (old=${oldParent} new=${newParent})`);
+    return this.encode([...newPath, ...childPath.slice(oldPath.length)], mask);
   },
   normDepth(cur: string, n: string): string {
     const c = Path.decode(cur);
@@ -678,29 +1036,82 @@ export const Path = {
     this.cache.noFlags.clear();
     this.cache.parent.clear();
   },
-};
+});
 
-// Directed Acyclic Graph structure for operations/instructions
+/** Node shape accepted by `TreeDAG`, optionally carrying child nodes. */
 export type TreeNode<T> = T & {
   nodes?: (TreeNode<T> | undefined)[];
 };
 type Subgraph<T> = TreeNode<T> & {
   nodes: (TreeNode<T> | undefined)[];
 };
+/** Mapping from old path tokens to rewritten path tokens. */
 export type TreeMapping = Map<string, string>;
 const EMPTY_MAP: TreeMapping = /* @__PURE__ */ new Map();
+/** Callback used by graph rewrite passes to replace one node path with another. */
 export type Rewrite<T> = (node: TreeNode<T>, idx: string) => string | undefined;
+/** Callback bag that tells `TreeDAG` how to inspect and rewrite user node payloads. */
 export type TreeDAGOpts<T> = {
-  formatNode?: (node: TreeNode<T>) => string; // debug + collapser
-  // Change: we now provide subgraph
-  mapEdges: (g: TreeDAG<T>, node: TreeNode<T>, mapping: TreeMapping, partial: boolean) => void; // toposort + gc
+  /**
+   * Formats a node for debug output and graph snapshots.
+   *
+   * @param node - Node to render.
+   * @returns Human-readable node label.
+   */
+  formatNode?: (node: TreeNode<T>) => string;
+  /**
+   * Rewrites node edge references after graph compaction or explicit remapping.
+   *
+   * @param g - Graph that owns the node.
+   * @param node - Node whose edges are rewritten.
+   * @param mapping - Old path to new path mapping.
+   * @param partial - Whether missing mapping entries may be left unchanged.
+   */
+  mapEdges: (g: TreeDAG<T>, node: TreeNode<T>, mapping: TreeMapping, partial: boolean) => void;
+  /**
+   * Decides whether an edge should keep a child node reachable.
+   *
+   * @param parent - Parent node that owns the edge.
+   * @param node - Candidate child node.
+   * @param idx - Path of the candidate child.
+   * @param flags - Edge flags collected for the path.
+   * @returns `true` when the child should be treated as used.
+   */
   isUsed?: (parent: TreeNode<T>, node: TreeNode<T>, idx: string, flags: Set<string>) => boolean;
+  /**
+   * Returns child path references for a node.
+   *
+   * @param node - Node whose outgoing edges are inspected.
+   * @param idx - Path of the inspected node.
+   * @returns Child path tokens, with `undefined` for empty edge slots.
+   */
   getEdges: (node: TreeNode<T>, idx: string) => (string | undefined)[];
-  getFlags: (node: TreeNode<T>) => (string | undefined)[]; // like 'memStore' (previously isMut)
+  /**
+   * Returns node-local flags that affect rewrite and reachability policy.
+   *
+   * @param node - Node whose flags are inspected.
+   * @returns Flag names or empty slots.
+   */
+  getFlags: (node: TreeNode<T>) => (string | undefined)[];
 };
 /**
- * Core data-structure of compiler, represents code as nested DAG's (Directed Acyclic Graphs)
- * Applies rewrites with reverse edge cache, does toposort and removes unreachable nodes
+ * Core compiler graph structure for nested directed acyclic graphs.
+ *
+ * Applies rewrites with reverse edge caches, computes topological order, and removes unreachable
+ * nodes.
+ *
+ * @param root - Root graph node.
+ * @param opts - Node inspection and edge rewriting callbacks. {@link TreeDAGOpts}
+ * @example
+ * ```js
+ * const root = { name: 'root', nodes: [{ name: 'leaf' }] };
+ * const dag = new TreeDAG(root, {
+ *   mapEdges() {},
+ *   getEdges: () => [],
+ *   getFlags: () => [],
+ * });
+ * dag.get('');
+ * ```
  */
 export class TreeDAG<T> {
   opts: TreeDAGOpts<T>;
@@ -788,7 +1199,7 @@ export class TreeDAG<T> {
     const { path } = Path.decode(idx);
     return this.getPath(path);
   }
-  getStack(idx: string) {
+  getStack(idx: string): { idx: string; node: TreeNode<T> }[] {
     const { path } = Path.decode(idx);
     return this.getPathStack(path);
   }
@@ -802,6 +1213,7 @@ export class TreeDAG<T> {
   }
   scope(idx: string, cb: () => void) {
     this.enter(idx);
+    // If graph construction fails, the tree is not restartable; keep the stack for debugging.
     cb();
     this.exit();
   }
@@ -890,7 +1302,7 @@ export class TreeDAG<T> {
     // remove usedBy?
     // remove from edges?
   }
-  clone() {
+  clone(): TreeDAG<T> {
     const res = new TreeDAG<T>(deepClone(this.root), this.opts);
     res.usedBy = deepClone(this.usedBy);
     res.usedWeak = deepClone(this.usedWeak);
@@ -926,7 +1338,7 @@ export class TreeDAG<T> {
       walk(start, pathBuf);
     });
   }
-  format(cb?: (node: TreeNode<T>, idx: string) => boolean) {
+  format(cb?: (node: TreeNode<T>, idx: string) => boolean): string {
     if (!this.opts.formatNode) throw new Error('no formatNode');
     let res = '';
     this.iter((node, token) => {
@@ -994,7 +1406,7 @@ export class TreeDAG<T> {
       return merged;
     }
   }
-  getFlags(idx: string, recursive = true) {
+  getFlags(idx: string, recursive = true): Set<string> {
     const res: Set<string> = new Set();
     this.iter(
       (node: TreeNode<T>) => {
@@ -1007,7 +1419,7 @@ export class TreeDAG<T> {
     this.cache.flags.set(idx, res);
     return res;
   }
-  getChildrens(idx: string, recursive = true) {
+  getChildrens(idx: string, recursive = true): Set<string> {
     const res: Set<string> = new Set();
     this.iter(
       (_, nodeIdx) => {
@@ -1098,7 +1510,7 @@ export class TreeDAG<T> {
     }, idx);
     return res;
   }
-  removeUnused() {
+  removeUnused(): boolean {
     const removed: Set<string> = new Set();
     const toFix: Set<string> = new Set();
     // TODO: queue: currently does multiple ops instead one!
@@ -1140,7 +1552,7 @@ export class TreeDAG<T> {
       return changed;
     });
   }
-  applyMappingSingle(elm: string, mapping: TreeMapping, partial = false) {
+  applyMappingSingle(elm: string, mapping: TreeMapping, partial = false): string {
     const m = mapping.get(Path.stripFlags(elm as any));
     if (Array.isArray(m)) throw new Error('Cannot apply multiple mappings to same element');
     if (m === undefined) {
@@ -1181,7 +1593,7 @@ export class TreeDAG<T> {
     }
     return res;
   }
-  mapEdges(mapping: TreeMapping, partial = true, markDirty = true) {
+  mapEdges(mapping: TreeMapping, partial = true, markDirty = true): TreeMapping {
     const affected = new Set<string>();
     const realKeys: string[] = [];
     for (const from of mapping.keys()) {
@@ -1311,7 +1723,7 @@ export class TreeDAG<T> {
     return res;
   }
 
-  tiers(node: TreeNode<T>, idx: string) {
+  tiers(node: TreeNode<T>, idx: string): number[][] | undefined {
     if (!this.isSubgraph(node)) return;
     const left: Set<number> = new Set();
     const processed: Set<number> = new Set();
@@ -1500,7 +1912,12 @@ export class TreeDAG<T> {
   }
   // we take multiple rewrites, then apply one by one, if anything changed we re-do all steps.
   // also we cleanup graph after each rewrite.
-  rewrite(cbs: Record<string, Rewrite<T>>, root?: string, _debug = false, check?: () => void) {
+  rewrite(
+    cbs: Record<string, Rewrite<T>>,
+    root?: string,
+    _debug = false,
+    check?: () => void
+  ): boolean {
     return retryIfChanged(() => {
       let changed = true;
       while (changed) {
@@ -1560,12 +1977,38 @@ export class TreeDAG<T> {
 }
 
 // Misc
-export function splitU64(n: number) {
-  let l = n | 0;
-  let h = (n / 0x100000000) | 0;
+/**
+ * Splits a safe JavaScript integer into low and high unsigned 32-bit words.
+ *
+ * @param n - Non-negative safe integer from the JavaScript-representable u64 subset.
+ * @returns Low and high 32-bit words.
+ * @throws If `n` is negative or not a safe integer. {@link Error}
+ * @example
+ * ```js
+ * splitU64(0x1_0000_0001);
+ * ```
+ */
+export function splitU64(n: number): { l: number; h: number } {
+  // JS numbers only represent an exact u64 subset; reject imprecise
+  // inputs before splitting.
+  if (!Number.isSafeInteger(n) || n < 0)
+    throw new Error(`splitU64: expected non-negative safe integer u64 subset, got ${n}`);
+  const l = n | 0;
+  const h = Math.floor(n / 0x100000000) | 0;
   return { l, h };
 }
 
+/**
+ * Swaps 32-bit or 64-bit words in a `DataView` from big-endian layout to little-endian layout.
+ *
+ * @param v - View whose contents are rewritten in place.
+ * @param is64 - Whether to swap pairs of 32-bit halves as 64-bit words.
+ * @example
+ * ```js
+ * const view = new DataView(new ArrayBuffer(8));
+ * swapEndianness(view, true);
+ * ```
+ */
 export function swapEndianness(v: DataView, is64: boolean) {
   if (is64) {
     for (let i = 0; i < v.byteLength; i += 8) {
@@ -1581,6 +2024,17 @@ export function swapEndianness(v: DataView, is64: boolean) {
   }
 }
 
+/**
+ * Computes the greatest common divisor of two numbers.
+ *
+ * @param a - First integer.
+ * @param b - Second integer.
+ * @returns Greatest common divisor.
+ * @example
+ * ```js
+ * gcd(12, 18);
+ * ```
+ */
 export const gcd = (a: number, b: number): number => {
   a = Math.abs(a);
   b = Math.abs(b);
@@ -1592,15 +2046,55 @@ export const gcd = (a: number, b: number): number => {
   return a;
 };
 
+/**
+ * Computes the least common multiple of two numbers.
+ *
+ * @param a - First integer.
+ * @param b - Second integer.
+ * @returns Least common multiple, or `0` when either input is `0`.
+ * @example
+ * ```js
+ * lcm(12, 18);
+ * ```
+ */
 export const lcm = (a: number, b: number): number =>
   a === 0 || b === 0 ? 0 : Math.abs((a / gcd(a, b)) * b);
 
-// n-ary (empty: gcd=0, lcm=1 by convention)
+/**
+ * Computes the greatest common divisor of a list.
+ *
+ * @param xs - Integer list.
+ * @returns Greatest common divisor, with `0` for an empty list.
+ * @example
+ * ```js
+ * gcdAll([12, 18, 30]);
+ * ```
+ */
 export const gcdAll = (xs: readonly number[]): number => xs.reduce((a, b) => gcd(a, b), 0);
 
+/**
+ * Computes the least common multiple of a list.
+ *
+ * @param xs - Integer list.
+ * @returns Least common multiple, with `1` for an empty list.
+ * @example
+ * ```js
+ * lcmAll([3, 4, 6]);
+ * ```
+ */
 export const lcmAll = (xs: readonly number[]): number => xs.reduce((a, b) => lcm(a, b), 1);
 
-// Generic arrays interleave/deinterleave
+/**
+ * Interleaves equally sized arrays by position.
+ *
+ * @param xs - Arrays to interleave.
+ * @returns Items in `[a0, b0, a1, b1]` order for two inputs.
+ * @throws If input arrays have mismatched lengths. {@link Error}
+ * @example
+ * ```js
+ * interleave([1, 2], [3, 4]);
+ * ```
+ */
 export function interleave<T>(...xs: readonly (readonly T[])[]): T[] {
   const k = xs.length;
   if (!k) return [];
@@ -1610,7 +2104,19 @@ export function interleave<T>(...xs: readonly (readonly T[])[]): T[] {
   for (let i = 0, p = 0; i < n; i++) for (let j = 0; j < k; j++) out[p++] = xs[j][i];
   return out;
 }
-// [a0,b0,c0,a1,b1,c1,...] -> [[a0,a1,...],[b0,b1,...],[c0,c1,...]]
+
+/**
+ * Splits an interleaved array back into `k` streams.
+ *
+ * @param arr - Interleaved input array.
+ * @param k - Positive number of streams.
+ * @returns `k` deinterleaved arrays.
+ * @throws If `k` is invalid or does not divide the array length. {@link Error}
+ * @example
+ * ```js
+ * deinterleave([1, 3, 2, 4], 2);
+ * ```
+ */
 export function deinterleave<T>(arr: readonly T[], k: number): T[][] {
   if (k <= 0 || arr.length % k !== 0) throw new Error('bad stride');
   const n = (arr.length / k) | 0;
@@ -1619,7 +2125,17 @@ export function deinterleave<T>(arr: readonly T[], k: number): T[][] {
   return out;
 }
 
-export function concatBytes(...arrays: Uint8Array[]): Uint8Array {
+/**
+ * Concatenates byte arrays.
+ *
+ * @param arrays - Byte arrays to append in order.
+ * @returns New byte array containing all inputs.
+ * @example
+ * ```js
+ * concatBytes(new Uint8Array([1]), new Uint8Array([2]));
+ * ```
+ */
+export function concatBytes(...arrays: TArg<Uint8Array[]>): TRet<Uint8Array> {
   let sum = 0;
   for (let i = 0; i < arrays.length; i++) {
     const a = arrays[i];
@@ -1631,15 +2147,35 @@ export function concatBytes(...arrays: Uint8Array[]): Uint8Array {
     res.set(a, pad);
     pad += a.length;
   }
-  return res;
+  return res as TRet<Uint8Array>;
 }
 
-/** Checks if something is Uint8Array. Be careful: nodejs Buffer will return true. */
+/**
+ * Checks whether a value is a `Uint8Array`, including Node.js `Buffer`.
+ *
+ * @param a - Value to inspect.
+ * @returns `true` when the value is a byte array view.
+ * @example
+ * ```js
+ * isBytes(new Uint8Array([1]));
+ * ```
+ */
 export function isBytes(a: unknown): a is Uint8Array {
   return a instanceof Uint8Array || (ArrayBuffer.isView(a) && a.constructor.name === 'Uint8Array');
 }
 
-export const poisonProp = (obj: any, key: string) => {
+/**
+ * Installs a throwing accessor used to catch deprecated property reads and writes.
+ *
+ * @param obj - Object to poison.
+ * @param key - Property name to poison.
+ * @example
+ * ```js
+ * const obj = {};
+ * poisonProp(obj, 'oldField');
+ * ```
+ */
+export const poisonProp = (obj: any, key: string): void => {
   Object.defineProperty(obj, key, {
     configurable: true,
     enumerable: false,

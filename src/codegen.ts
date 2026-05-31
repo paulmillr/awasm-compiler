@@ -1,7 +1,7 @@
 import * as P from 'micro-packed';
 import * as js from './js.ts';
 import { allocateMemSpec, memOps, memoryProxy } from './memory.ts';
-import { Module, array, type Flags } from './module.ts';
+import { Module, array, type Flags, type Scope } from './module.ts';
 import * as rewrites from './rewrites.ts';
 import type { TypeName } from './types.ts';
 import * as types from './types.ts';
@@ -9,16 +9,23 @@ import * as utils from './utils.ts';
 import * as wasm from './wasm.ts';
 import * as workers from './workers.ts';
 
+const _0n = /* @__PURE__ */ BigInt(0);
+
 // Main idea: instead of creating AST from parsing strings (what is real compilers do),
 // we just create tree using some DSL-like structure
 
+/** Dotted path token for a node inside a compiler graph. */
 export type NodeIdx = string;
 type Opts = Record<string, any>;
 type Memory = Record<string, ReturnType<typeof allocateMemSpec>>;
 
+/** Concrete payloads stored for every compiler graph node kind. */
 export type NodeMap = {
+  /** Typed operation node. */
   op: { op: string; type: TypeName; args: NodeIdx[]; opts: Opts };
+  /** Root module node. */
   module: { name: string; opts: Opts; memory: Memory; nodes: Node[] };
+  /** Function body node. */
   function: {
     name: string;
     inputs: TypeName[];
@@ -29,6 +36,7 @@ export type NodeMap = {
     embedPos: number;
     embedFns: Record<string, any>;
   };
+  /** Structured block node. */
   block: {
     name?: string;
     args: NodeIdx[];
@@ -37,6 +45,7 @@ export type NodeMap = {
     shape: any;
     nodes: Node[];
   };
+  /** Structured loop node. */
   loop: {
     name?: string;
     args: NodeIdx[];
@@ -47,11 +56,22 @@ export type NodeMap = {
   };
 };
 
+/** Discriminated union of all compiler graph nodes. */
 export type Node = { [K in keyof NodeMap]: { kind: K } & NodeMap[K] }[keyof NodeMap];
+/** Compiler graph node narrowed by node kind. */
 export type NodeOf<K extends keyof NodeMap> = Extract<Node, { kind: K }>;
 type K = keyof NodeMap;
 /**
- * Narrow graph node kind on type level
+ * Narrows a compiler graph node to one of the requested kinds.
+ *
+ * @param n - Node to inspect.
+ * @param ks - Allowed node kinds.
+ * @returns The same node narrowed to the requested kind union.
+ * @throws If the node kind is not allowed. {@link Error}
+ * @example
+ * ```js
+ * as({ kind: 'op', op: 'const', type: 'u32', args: [], opts: {} }, 'op');
+ * ```
  */
 export function as<Ks extends readonly K[]>(n: Node, ...ks: Ks): NodeOf<Ks[number]>;
 export function as(n: Node, ...ks: K[]) {
@@ -59,12 +79,28 @@ export function as(n: Node, ...ks: K[]) {
   return n; // typed via the generic overload
 }
 /**
- * Type guard for node type
+ * Checks whether a compiler graph node has one of the requested kinds.
+ *
+ * @param n - Node to inspect.
+ * @param ks - Allowed node kinds.
+ * @returns `true` when the node kind matches.
+ * @example
+ * ```js
+ * is({ kind: 'module', name: 'm', opts: {}, memory: {}, nodes: [] }, 'module');
+ * ```
  */
 export const is = <Ks extends readonly K[]>(n: Node, ...ks: Ks): n is NodeOf<Ks[number]> =>
   ks.includes(n.kind as K);
 /**
- * Check if graph node is operation
+ * Checks whether a node is an operation, optionally restricted to operation names.
+ *
+ * @param n - Node to inspect.
+ * @param ops - Optional allowed operation names.
+ * @returns `true` when the node is a matching operation node.
+ * @example
+ * ```js
+ * isOp({ kind: 'op', op: 'const', type: 'u32', args: [], opts: {} }, 'const');
+ * ```
  */
 export function isOp<const O extends readonly string[], N extends { kind: Node['kind'] }>(
   n: N,
@@ -75,7 +111,15 @@ export function isOp<const O extends readonly string[], N extends { kind: Node['
   return ops.length === 0 ? true : (ops as readonly string[]).includes((n as any).op);
 }
 /**
- * Symbolic representation of variable. Can be used to index into memory array because of 'toString' method whichs creates JSON
+ * Symbolic compiler value handle.
+ *
+ * `toString()` returns JSON so handles can be used as dynamic property keys in memory proxies.
+ *
+ * @param idx - Compiler graph node path.
+ * @example
+ * ```js
+ * new FnOp('0').toString();
+ * ```
  */
 export class FnOp {
   idx: NodeIdx;
@@ -83,18 +127,15 @@ export class FnOp {
     if (typeof idx !== 'string') throw new Error('FnOp: wrong idx=' + idx);
     this.idx = idx;
   }
-  toString() {
+  toString(): string {
     return JSON.stringify({ idx: this.idx });
   }
 }
-/**
- * Main compiler opts, all rewrites/flavors of code generation defined via this.
- */
+/** Compiler options controlling rewrites and code generation flavors. */
 export type CompilerOpts = Flags & {
   lowerU64?: boolean;
   lowerSIMD?: boolean;
   lowerSmallInt?: boolean;
-  rawWasm?: boolean; // returns raw wasm instead of js boilerplate
   rawWasmInstr?: boolean;
   optimize?: boolean;
   opt_i32xi32?: boolean;
@@ -131,6 +172,15 @@ export type CompilerOpts = Flags & {
   customWorkerCode?: string;
   customWorkerCodeInit?: string;
 };
+/** Lowered backend inputs produced from a high-level module. */
+export type LoweredModule = {
+  /** Wasm module representation ready for binary encoding or JS lowering. */
+  wasmMod: wasm.WasmModule;
+  /** Allocated memory layout keyed by module memory segment name. */
+  memory: Record<string, any>;
+  /** Embedded import values that generated wrappers provide automatically. */
+  importEmbed: js.ImportEmbed;
+};
 
 const DefaultOpts: CompilerOpts = {
   freeze: true,
@@ -157,11 +207,16 @@ const DefaultOptsWASM: CompilerOpts = {
   native64bit: true,
 };
 
+/** Nested state shape carried through graph control-flow helpers. */
 export type StateShape = FnOp | StateShape[] | { [k: string]: StateShape };
-const FnOpShape = utils.Shape<FnOp>((x): x is FnOp => x instanceof FnOp);
+const FnOpShape = /* @__PURE__ */ utils.Shape<FnOp>((x): x is FnOp => x instanceof FnOp);
 type NDOp = utils.ND<FnOp>;
 
-function genScope(mg: ModuleGraph, m: Module<any, any>, opts: CompilerOpts) {
+function genScope(
+  mg: ModuleGraph,
+  m: Module<any, any>,
+  opts: CompilerOpts
+): Scope<any, any> & { rawFn: ModuleGraph } {
   const mgNode = as(mg.ops.root, 'module');
   const memory = mgNode.memory;
   function allMemLinks() {
@@ -478,12 +533,22 @@ function genScope(mg: ModuleGraph, m: Module<any, any>, opts: CompilerOpts) {
         const curFn = m.functions[name];
         if (!curFn) throw new Error('unknown function: ' + name);
         const outTypes = types.normRetType(curFn.outputs);
+        const declaredOutTypes =
+          curFn.outputs === 'void'
+            ? []
+            : Array.isArray(curFn.outputs)
+              ? curFn.outputs
+              : [curFn.outputs];
+        const nodeOutTypes = curFn.import && curFn.outputs !== 'void' ? declaredOutTypes : outTypes;
         if (args.length !== curFn.inputs.length)
           throw new Error(`wrong args: ${args.length} !== ${curFn.inputs.length}`);
         // Call depends on all memory operations (we have no idea what function will do with memory)
         const { weak, strong } = allMemLinks();
         const call = mg.op('i32', 'call', args, {
           name,
+          ...(curFn.import
+            ? { isImport: true, inputTypes: curFn.inputs, outputTypes: declaredOutTypes }
+            : {}),
           weak,
           strong,
           outTypes,
@@ -493,7 +558,7 @@ function genScope(mg: ModuleGraph, m: Module<any, any>, opts: CompilerOpts) {
         injectAllMem(call);
         const res = [];
         for (let i = 0; i < outTypes.length; i++) {
-          res.push(mg.op(outTypes[i] as TypeName, 'nodeOutput', [call], { pos: i }));
+          res.push(mg.op(nodeOutTypes[i] as TypeName, 'nodeOutput', [call], { pos: i }));
         }
         return res;
       },
@@ -506,10 +571,23 @@ function genScope(mg: ModuleGraph, m: Module<any, any>, opts: CompilerOpts) {
       },
     };
   }
-  return scope;
+  // Public `Val` is a virtual branded type; raw `FnOp` is the implementation handle here.
+  return scope as unknown as Scope<any, any> & { rawFn: ModuleGraph };
 }
 /**
- * Per module graph container (compiler specific utils on top of TreeDAG)
+ * Compiler-specific graph container built on top of `TreeDAG`.
+ *
+ * @param name - Module name.
+ * @param memory - Allocated memory segment metadata.
+ * @param mod - Source module definition.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ *
+ * new ModuleGraph('demo', {}, new Module('demo'), {});
+ * ```
  */
 export class ModuleGraph {
   ops: utils.TreeDAG<Node>;
@@ -542,7 +620,14 @@ export class ModuleGraph {
             if (node.opts.weak !== undefined) res.push(...node.opts.weak);
           }
           if (is(node, 'function', 'loop', 'block'))
-            res.push(...node.outputs.filter((i) => !i.startsWith(idx)));
+            res.push(
+              ...node.outputs.filter((i) => {
+                // Path ids are dotted numeric segments; raw startsWith
+                // misclassifies 0.10 as a child of 0.1.
+                const base = utils.Path.stripFlags(i);
+                return base !== idx && !base.startsWith(`${idx}.`);
+              })
+            );
           return res;
         },
         mapEdges: (g, node, mapping, partial) => {
@@ -584,10 +669,10 @@ export class ModuleGraph {
     this.types = types.genTypes(this) as any;
     this.scope = genScope(this, mod, opts);
   }
-  byIdx(idx: string) {
+  byIdx(idx: string): FnOp {
     return new FnOp(idx);
   }
-  getStackBlocks() {
+  getStackBlocks(): { idx: NodeIdx; node: NodeOf<'module' | 'function' | 'block' | 'loop'> }[] {
     const res = [];
     for (let i = 0; i < this.ops.stack.length; i++) {
       const idx = this.ops.stack[this.ops.stack.length - 1 - i];
@@ -598,7 +683,7 @@ export class ModuleGraph {
     }
     return res;
   }
-  getCurFn() {
+  getCurFn(): { idx: NodeIdx; node: NodeOf<'function'> } {
     const stack = this.getStackBlocks();
     const fns = stack.filter((i) => i.node.kind === 'function');
     if (fns.length !== 1) {
@@ -607,7 +692,7 @@ export class ModuleGraph {
     return { idx: fns[0].idx, node: as(fns[0].node, 'function') };
   }
   // Ops
-  op(type: TypeName, op: string, args: FnOp[], opts: Record<string, any> = {}) {
+  op(type: TypeName, op: string, args: FnOp[], opts: Record<string, any> = {}): FnOp {
     for (const a of args) {
       if (!(a instanceof FnOp)) {
         throw new Error('wrong arg: ' + typeof a);
@@ -623,13 +708,13 @@ export class ModuleGraph {
     name: string,
     opts: Omit<NodeMap[K], 'name' | 'kind' | 'nodes'>,
     cb: (t: this, idx: NodeIdx) => void
-  ) {
+  ): NodeIdx {
     const scopeIdx = this.ops.add({ kind, name, ...opts, nodes: [] } as NodeOf<K>);
     this.ops.scope(scopeIdx, () => cb(this, scopeIdx));
     return scopeIdx;
   }
   // dd
-  addFn(name: string, fnDef: any) {
+  addFn(name: string, fnDef: any): NodeIdx {
     return this.subgraph(
       'function',
       name,
@@ -693,7 +778,7 @@ export class ModuleGraph {
     this.ops.rewrite(curRewrites, undefined, DEBUG, DEBUG ? () => checkFn(this) : undefined);
     checkFn(this, true);
   }
-  toInstrs(opts: CompilerOpts) {
+  toInstrs(opts: CompilerOpts): any[] {
     const fns: any[] = [];
     const modNode = as(this.ops.root, 'module');
     const { memory } = modNode;
@@ -887,12 +972,18 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
         maxSizeAlign !== undefined ? maxSizeAlign : 4,
         maxTypeAlign !== undefined ? maxTypeAlign : 4
       );
+      if (types.SIMDType.has(n.type) && n.opts.zeroLoad)
+        maxAlign = utils.wasmAlign(n.opts.zeroLoad / 8);
       if (n.opts.use32x2) maxAlign = 3;
+      const isAtomic = n.op.startsWith('atomic');
       let align = n.opts.align || 0;
       {
         const pos = fn.ops.get(n.args[0]);
-        if (isOp(pos, 'const'))
-          align = utils.wasmAlign((n.opts.offset || 0) + Number(pos.opts.value));
+        if (isOp(pos, 'const')) {
+          const staticAlign = utils.wasmAlign((n.opts.offset || 0) + Number(pos.opts.value));
+          if (isAtomic && staticAlign < align) throw new Error('unaligned atomic access');
+          if (!isAtomic) align = staticAlign;
+        }
         // else align = 0;           // reset align if non-constant node
       }
       align = Math.min(align, maxAlign); // clamp
@@ -903,6 +994,8 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
         align,
         offset,
         swapEndianness: n.opts.swapEndianness,
+        // JS typed-array fast paths may trust align only for compiler-derived memargs.
+        trustedAlign: true,
       };
     };
 
@@ -1023,7 +1116,7 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
       const getLane = () => {
         const vecLaneBytes = types.sizeof(types.ScalarOf(n.type));
         const factor = vecLaneBytes / (n.opts.size / 8);
-        return n.opts.lane * factor;
+        return types.SIMDUtils.checkLane(types.lanesOf(n.type), n.opts.lane) * factor;
       };
       if (isOp(n, 'load')) {
         if (isVec && n.opts.lane !== undefined) {
@@ -1044,6 +1137,8 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
           else if (n.type === 'u64' && n.opts.size === 16) tag = 'i64.load16_u';
           else if (n.type === 'i64' && n.opts.size === 32) tag = 'i64.load32_s';
           else if (n.type === 'u64' && n.opts.size === 32) tag = 'i64.load32_u';
+          else if (isVec && n.opts.zeroLoad === 32) tag = 'v128.load32_zero';
+          else if (isVec && n.opts.zeroLoad === 64) tag = 'v128.load64_zero';
           else if (n.type.startsWith('i') && n.opts.use32x2) tag = 'v128.load32x2_s';
           else if (n.type.startsWith('u') && n.opts.use32x2) tag = 'v128.load32x2_u';
           else if (n.opts.size !== undefined)
@@ -1150,7 +1245,7 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
         ops.push({ TAG: 'block', data: 'void' }); // guard
         pushOps(condInstr);
         ops.push({ TAG: 'i32.eqz' });
-        ops.push({ TAG: 'br_if', data: 0n }); // skip assign+branch if cond==0
+        ops.push({ TAG: 'br_if', data: _0n }); // skip assign+branch if cond==0
         // assign yields -> parent's locals, in order
         for (let i = 0; i < outIdx.length; i++) {
           pushOps(yieldInstrs[i]);
@@ -1246,11 +1341,14 @@ function checkFn(fn: ModuleGraph, final = false) {
   fn.ops.check();
   const memOps: Record<string, Record<string, { write?: NodeIdx; reads: NodeIdx[] }>> = {};
   const fmt = (n: Node) => fn.ops.opts.formatNode!(n);
-  const checkLoad = (node: Node, idx: NodeIdx, name: string) => {
+  const getState = (name: string) => {
     const curFnIdx = fn.getCurFn().idx;
     if (!memOps[curFnIdx]) memOps[curFnIdx] = {};
     if (!memOps[curFnIdx][name]) memOps[curFnIdx][name] = { reads: [] };
-    const ms = memOps[curFnIdx][name];
+    return memOps[curFnIdx][name];
+  };
+  const checkLoad = (node: Node, idx: NodeIdx, name: string) => {
+    const ms = getState(name);
     if (ms.write !== undefined) {
       if (!(node.opts.strong || []).includes(utils.Path.normDepth(idx, ms.write))) {
         throw new Error(`check(${fmt(node)}): read without strong link on write`);
@@ -1263,10 +1361,7 @@ function checkFn(fn: ModuleGraph, final = false) {
     ms.reads.push(idx);
   };
   const checkStore = (node: Node, idx: NodeIdx, name: string) => {
-    const curFnIdx = fn.getCurFn().idx;
-    if (!memOps[curFnIdx]) memOps[curFnIdx] = {};
-    if (!memOps[curFnIdx][name]) memOps[curFnIdx][name] = { reads: [] };
-    const ms = memOps[curFnIdx][name];
+    const ms = getState(name);
     if (ms.write !== undefined) {
       if (ms.reads.length) {
         throw new Error(`check(${fmt(node)}): ms.write with non-empty reads`);
@@ -1303,10 +1398,7 @@ function checkFn(fn: ModuleGraph, final = false) {
     if (node.op === 'load') checkLoad(node, idx, node.opts.name);
     else if (['store', 'fill'].includes(node.op)) checkStore(node, idx, node.opts.name);
     else if (['call', 'br', 'br_if'].includes(node.op)) {
-      const curFnIdx = fn.getCurFn().idx;
-      if (memOps[curFnIdx]) {
-        for (const k in memOps[curFnIdx]) checkStore(node, idx, k);
-      }
+      for (const k in as(fn.ops.root, 'module').memory) checkStore(node, idx, k);
     } else if (node.op === 'copy') {
       checkStore(node, idx, node.opts.name);
       if (node.opts.srcName !== node.opts.name) checkLoad(node, idx, node.opts.srcName);
@@ -1314,9 +1406,23 @@ function checkFn(fn: ModuleGraph, final = false) {
   });
 }
 /**
- * Common module compilation
+ * Compiles a module into the shared lowered module representation.
+ *
+ * @param m - Source module definition.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns Wasm module data, allocated memory metadata, and embedded imports.
+ * @throws If module validation, lowering, or graph construction fails. {@link Error}
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { toMod } from '@awasm/compiler/codegen.js';
+ *
+ * const mod = new Module('demo')
+ *   .fn('zero', [], 'u32', (f) => f.types.u32.const(0));
+ * toMod(mod);
+ * ```
  */
-export function toMod(m: Module<any, any>, opts: CompilerOpts = {}) {
+export function toMod(m: Module<any, any>, opts: CompilerOpts = {}): LoweredModule {
   let mod = m.clone();
 
   let BATCH_SIZE = 1;
@@ -1345,13 +1451,29 @@ export function toMod(m: Module<any, any>, opts: CompilerOpts = {}) {
     }
   }
   const moduleNode = new ModuleGraph(mod.name, memory, mod, opts);
+  const normFnTypes = (lst: TypeName[]) => {
+    const res: ReturnType<typeof types.normType>[] = [];
+    for (const t of lst) {
+      if (opts.lowerU64Arg && (t === 'i64' || t === 'u64')) {
+        // Imported functions are outside ModuleGraph, so their ABI has to be lowered here too.
+        res.push('i32', 'i32');
+      } else {
+        res.push(types.normType(t));
+      }
+    }
+    return res;
+  };
+  const normFnRetTypes = (ret: any) => {
+    if (ret === 'void') return [];
+    return normFnTypes(Array.isArray(ret) ? ret : [ret]);
+  };
   const importFns: Record<string, any> = {};
   const importEmbed: js.ImportEmbed = { env: {} };
   for (const [name, fnDef] of Object.entries(mod.functions) as any) {
     if (fnDef.import) {
       importFns[name] = {
-        inputs: fnDef.inputs.map((i: any) => types.normType(i)),
-        outputs: types.normRetType(fnDef.outputs),
+        inputs: normFnTypes(fnDef.inputs),
+        outputs: normFnRetTypes(fnDef.outputs),
         module: fnDef.module,
       };
       if (fnDef.cb) {
@@ -1392,9 +1514,23 @@ export function toMod(m: Module<any, any>, opts: CompilerOpts = {}) {
 }
 
 /**
- * Compiles `Module` to WASM
+ * Compiles a module into a JavaScript wrapper containing embedded Wasm.
+ *
+ * @param m - Source module definition.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns JavaScript source for the Wasm-backed wrapper.
+ * @throws If module lowering or Wasm generation fails. {@link Error}
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { toWasm } from '@awasm/compiler/codegen.js';
+ *
+ * const mod = new Module('demo')
+ *   .fn('zero', [], 'u32', (f) => f.types.u32.const(0));
+ * toWasm(mod);
+ * ```
  */
-export function toWasm(m: Module, opts: CompilerOpts = {}) {
+export function toWasm(m: Module, opts: CompilerOpts = {}): ReturnType<typeof js.wrapModule> {
   opts = { ...DefaultOpts, ...DefaultOptsWASM, ...opts };
   const { wasmMod, memory, importEmbed } = toMod(m, opts);
   // console.dir(wasmMod.functions, { depth: null, maxArrayLength: null });
@@ -1403,9 +1539,23 @@ export function toWasm(m: Module, opts: CompilerOpts = {}) {
 }
 
 /**
- * Compiles `Module` to JS
+ * Compiles a module into a pure JavaScript fallback wrapper.
+ *
+ * @param m - Source module definition.
+ * @param opts - Compiler options. {@link CompilerOpts}
+ * @returns JavaScript source for the fallback wrapper.
+ * @throws If module lowering or JS generation fails. {@link Error}
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { toJs } from '@awasm/compiler/codegen.js';
+ *
+ * const mod = new Module('demo')
+ *   .fn('zero', [], 'u32', (f) => f.types.u32.const(0));
+ * toJs(mod);
+ * ```
  */
-export function toJs(m: Module, opts: CompilerOpts = {}) {
+export function toJs(m: Module, opts: CompilerOpts = {}): ReturnType<typeof js.wrapModule> {
   opts = { ...DefaultOpts, ...DefaultOptsJS, ...opts };
   const { wasmMod, memory, importEmbed } = toMod(m, opts);
   // console.dir(wasmMod.functions, { depth: null, maxArrayLength: null });

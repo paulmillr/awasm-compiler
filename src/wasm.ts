@@ -1,76 +1,126 @@
+import type { TRet } from '@scure/base';
 import * as P from 'micro-packed';
+import { deepFreeze } from './utils.ts';
+
+const _0n = /* @__PURE__ */ BigInt(0);
+type TypeVal = 'void' | 'i32' | 'i64' | 'f32' | 'f64' | 'v128';
+type WasmType = TypeVal | 'funcref' | 'externref';
+type LocalType = Exclude<TypeVal, 'void'>;
+type WasmKind = 'function' | 'table' | 'memory' | 'global';
+type WasmImportKind = 'function' | 'memory';
+type WasmFunctionType = { inputs: WasmType[]; outputs: WasmType[] };
+type WasmTypeEntry = { TAG: 'function'; data: WasmFunctionType };
+type WasmExport = { name: string; kind: WasmKind; index: bigint };
+type WasmImportType = { TAG: 'function'; data: bigint } | { TAG: 'memory'; data: WasmMemoryLimits };
+type WasmImport = { module: string; name: string; importType: WasmImportType };
+type WasmInstruction = P.UnwrapCoder<typeof instruction>;
+type WasmLocal = { count: bigint; type: P.UnwrapCoder<typeof ValType> };
+type WasmCode = { locals: WasmLocal[]; instructions: WasmInstruction[] };
+type TagEntry<Tag extends number, Coder extends P.CoderType<any>> = [Tag, Coder];
+type MappedTagValue<T> = P.Values<{
+  [K in keyof T]: T[K] extends TagEntry<number, infer Coder>
+    ? { TAG: K; data: P.UnwrapCoder<Coder> }
+    : never;
+}>;
+type WasmSection = MappedTagValue<WasmSections>;
+type WasmBinary = { version: number; sections: WasmSection[] };
 
 // Core encoding for ints inside wasm?
 // TODO: temporary, but kinda works (at leasts tests are ok), cleanup!
-export const LEB128 = P.wrap({
-  encodeStream(w, value: bigint) {
-    let n = BigInt(value);
-    if (n < 0) throw new Error('negative integer');
-    const more = BigInt(0x80); // 0b10000000
-    const mask = BigInt(0x7f); // 0b01111111
-    while (true) {
-      let byte = n & mask;
-      n >>= BigInt(7); // Do the shift BEFORE the check
-      if (n === BigInt(0)) {
-        // Check AFTER shift
+/** Unsigned LEB128 bigint coder used by Wasm immediates. */
+export const LEB128: P.CoderType<bigint> = /* @__PURE__ */ (() =>
+  deepFreeze(
+    P.wrap({
+    encodeStream(w, value: bigint) {
+      let n = BigInt(value);
+      if (n < 0) throw new Error('negative integer');
+      const more = BigInt(0x80); // 0b10000000
+      const mask = BigInt(0x7f); // 0b01111111
+      while (true) {
+        let byte = n & mask;
+        n >>= BigInt(7); // Do the shift BEFORE the check
+        if (n === BigInt(0)) {
+          // Check AFTER shift
+          w.byte(Number(byte));
+          break;
+        }
+        byte |= more;
         w.byte(Number(byte));
-        break;
       }
-      byte |= more;
-      w.byte(Number(byte));
-    }
-  },
-  decodeStream(r) {
-    let result = BigInt(0);
-    let shift = 0;
-    while (true) {
-      const byte = BigInt(r.byte());
-      result |= (byte & BigInt(0x7f)) << BigInt(shift);
-      if ((byte & BigInt(0x80)) === BigInt(0)) break; // Stop when the continuation bit is not set
-      shift += 7;
-    }
-    return result;
-  },
-});
+    },
+    decodeStream(r) {
+      let result = BigInt(0);
+      let shift = 0;
+      while (true) {
+        const byte = BigInt(r.byte());
+        result |= (byte & BigInt(0x7f)) << BigInt(shift);
+        // Stop when the continuation bit is not set.
+        if ((byte & BigInt(0x80)) === BigInt(0)) break;
+        shift += 7;
+      }
+      return result;
+    },
+    })
+  ))();
 
-export const SLEB128 = P.wrap({
-  encodeStream(w, value: bigint) {
-    let n = BigInt(value);
-    const more = BigInt(0x80); // 0b10000000
-    const mask = BigInt(0x7f); // 0b01111111
-    while (true) {
-      let byte = n & mask;
-      n >>= BigInt(7);
-      // Determine if this is the last byte based on sign bit and remaining value
-      const isLast =
-        (n === BigInt(0) && (byte & BigInt(0x40)) === BigInt(0)) ||
-        (n === BigInt(-1) && (byte & BigInt(0x40)) !== BigInt(0));
-      if (!isLast) byte |= more; // Set the continuation bit if more bytes follow
-      w.byte(Number(byte));
-      if (isLast) break;
-    }
-  },
-  decodeStream(r) {
-    let result = BigInt(0);
-    let shift = 0;
-    let byte;
-    while (true) {
-      byte = BigInt(r.byte());
-      result |= (byte & BigInt(0x7f)) << BigInt(shift);
-      shift += 7;
-      if ((byte & BigInt(0x80)) === BigInt(0)) break; // Stop when the continuation bit is not set
-    }
-    // Perform sign extension if needed
-    const msb = BigInt(0x40); // Most significant bit in the last byte
-    if ((byte & msb) !== BigInt(0)) result |= BigInt(-1) << BigInt(shift);
-    return result;
-  },
-});
+/** Signed LEB128 bigint coder used by Wasm immediates. */
+export const SLEB128: P.CoderType<bigint> = /* @__PURE__ */ (() =>
+  deepFreeze(
+    P.wrap({
+    encodeStream(w, value: bigint) {
+      let n = BigInt(value);
+      const more = BigInt(0x80); // 0b10000000
+      const mask = BigInt(0x7f); // 0b01111111
+      while (true) {
+        let byte = n & mask;
+        n >>= BigInt(7);
+        // Determine if this is the last byte based on sign bit and remaining value
+        const isLast =
+          (n === BigInt(0) && (byte & BigInt(0x40)) === BigInt(0)) ||
+          (n === BigInt(-1) && (byte & BigInt(0x40)) !== BigInt(0));
+        if (!isLast) byte |= more; // Set the continuation bit if more bytes follow
+        w.byte(Number(byte));
+        if (isLast) break;
+      }
+    },
+    decodeStream(r) {
+      let result = BigInt(0);
+      let shift = 0;
+      let byte;
+      while (true) {
+        byte = BigInt(r.byte());
+        result |= (byte & BigInt(0x7f)) << BigInt(shift);
+        shift += 7;
+        // Stop when the continuation bit is not set.
+        if ((byte & BigInt(0x80)) === BigInt(0)) break;
+      }
+      // Perform sign extension if needed
+      const msb = BigInt(0x40); // Most significant bit in the last byte
+      if ((byte & msb) !== BigInt(0)) result |= BigInt(-1) << BigInt(shift);
+      return result;
+    },
+    })
+  ))();
 
 // Instructions
-const memarg = P.struct({ align: LEB128, offset: LEB128 });
+// This is a low-level binary encoder: it writes requested immediates even when
+// instruction-level validation will reject the module.
+const memarg: P.CoderType<{ align: bigint; offset: bigint }> = /* @__PURE__ */ P.struct({
+  align: LEB128,
+  offset: LEB128,
+});
+const laneIdx = (lanes: number): P.CoderType<number> =>
+  P.validate(P.U8, (lane) => {
+    if (!Number.isSafeInteger(lane) || lane < 0 || lane >= lanes)
+      throw new Error(`invalid SIMD lane: ${lane} not in [0, ${lanes})`);
+    return lane;
+  });
+type LaneArg = { mem: P.UnwrapCoder<typeof memarg>; lane: number };
+const laneArg = (lanes: number): P.CoderType<LaneArg> =>
+  P.struct({ mem: memarg, lane: laneIdx(lanes) });
 const idx = LEB128;
-const EMPTY = /* @__PURE__ */ P.magic(P.bytes(0), new Uint8Array(0));
+const EMPTY: P.CoderType<undefined> = /* @__PURE__ */ (() =>
+  P.magic(P.bytes(0), new Uint8Array(0)))();
 
 // prettier-ignore
 const memory = {
@@ -160,10 +210,8 @@ const basic = {
   extend32_s:      {            i64: 0xc4                                       },
 };
 
-const simdarg = P.struct({ mem: memarg, lane: P.U8 });
-
 // prettier-ignore
-const simd = {
+const simd = /* @__PURE__ */ (() => ({
   // basic
   load:                          { v128: 0x00, args: memarg                                                                 },
   load8x8_s:                     { v128: 0x01, args: memarg                                                                 },
@@ -185,23 +233,23 @@ const simd = {
   xor:                           { v128: 0x51                                                                               },
   bitselect:                     { v128: 0x52                                                                               },
   any_true:                      { v128: 0x53                                                                               },
-  load8_lane:                    { v128: 0x54, args: simdarg                                                                },
-  load16_lane:                   { v128: 0x55, args: simdarg                                                                },
-  load32_lane:                   { v128: 0x56, args: simdarg                                                                },
-  load64_lane:                   { v128: 0x57, args: simdarg                                                                },
-  store8_lane:                   { v128: 0x58, args: simdarg                                                                },
-  store16_lane:                  { v128: 0x59, args: simdarg                                                                },
-  store32_lane:                  { v128: 0x5a, args: simdarg                                                                },
-  store64_lane:                  { v128: 0x5b, args: simdarg                                                                },
+  load8_lane:                    { v128: 0x54, args: laneArg(16)                                                            },
+  load16_lane:                   { v128: 0x55, args: laneArg(8)                                                             },
+  load32_lane:                   { v128: 0x56, args: laneArg(4)                                                             },
+  load64_lane:                   { v128: 0x57, args: laneArg(2)                                                             },
+  store8_lane:                   { v128: 0x58, args: laneArg(16)                                                            },
+  store16_lane:                  { v128: 0x59, args: laneArg(8)                                                             },
+  store32_lane:                  { v128: 0x5a, args: laneArg(4)                                                             },
+  store64_lane:                  { v128: 0x5b, args: laneArg(2)                                                             },
   load32_zero:                   { v128: 0x5c, args: memarg                                                                 },
   load64_zero:                   { v128: 0x5d, args: memarg                                                                 },
-  shuffle:                       { i8x16: 0x0d, args: P.array(16, P.U8)                                          },
+  shuffle:                       { i8x16: 0x0d, args: P.array(16, laneIdx(32))                                              },
   swizzle:                       { i8x16: 0x0e                                                                              },
   splat:                         { i8x16: 0x0f, i16x8: 0x10, i32x4: 0x11, i64x2: 0x12, f32x4: 0x13, f64x2: 0x14             },
-  extract_lane_s:                { i8x16: 0x15, i16x8: 0x18                                                    , args: P.U8 },
-  extract_lane_u:                { i8x16: 0x16, i16x8: 0x19                                                    , args: P.U8 },
-  replace_lane:                  { i8x16: 0x17, i16x8: 0x1a, i32x4: 0x1c, i64x2: 0x1e, f32x4: 0x20, f64x2: 0x22, args: P.U8 },
-  extract_lane:                  {                           i32x4: 0x1b, i64x2: 0x1d, f32x4: 0x1f, f64x2: 0x21, args: P.U8 },
+  extract_lane_s:                { i8x16: 0x15, i16x8: 0x18                                                    , args: { i8x16: laneIdx(16), i16x8: laneIdx(8) } },
+  extract_lane_u:                { i8x16: 0x16, i16x8: 0x19                                                    , args: { i8x16: laneIdx(16), i16x8: laneIdx(8) } },
+  replace_lane:                  { i8x16: 0x17, i16x8: 0x1a, i32x4: 0x1c, i64x2: 0x1e, f32x4: 0x20, f64x2: 0x22, args: { i8x16: laneIdx(16), i16x8: laneIdx(8), i32x4: laneIdx(4), i64x2: laneIdx(2), f32x4: laneIdx(4), f64x2: laneIdx(2) } },
+  extract_lane:                  {                           i32x4: 0x1b, i64x2: 0x1d, f32x4: 0x1f, f64x2: 0x21, args: { i32x4: laneIdx(4), i64x2: laneIdx(2), f32x4: laneIdx(4), f64x2: laneIdx(2) } },
   eq:                            { i8x16: 0x23, i16x8: 0x2d, i32x4: 0x37, i64x2: 0xd6, f32x4: 0x41, f64x2: 0x47             },
   ne:                            { i8x16: 0x24, i16x8: 0x2e, i32x4: 0x38, i64x2: 0xd7, f32x4: 0x42, f64x2: 0x48             },
   lt_s:                          { i8x16: 0x25, i16x8: 0x2f, i32x4: 0x39, i64x2: 0xd8                                       },
@@ -304,7 +352,7 @@ const simd = {
   relaxed_q15mulr_s:             {               i16x8: 0x111                                                               },
   relaxed_dot_i8x16_i7x16_s:     {               i16x8: 0x112                                                               },
   relaxed_dot_i8x16_i7x16_add_s: {                             i32x4: 0x113                                                 },
-};
+}))();
 
 // prettier-ignore
 const atomics = {
@@ -380,58 +428,119 @@ function getInstructions<
   return res as any;
 }
 
-export const Type = P.map(P.U8, {
-  void: 0x40,
-  i32: 0x7f,
-  i64: 0x7e,
-  f32: 0x7d,
-  f64: 0x7c,
-  v128: 0x7b,
-  // reftype
-  funcref: 0x70,
-  externref: 0x6f,
-});
+/** Wasm value and reference type byte coder. */
+export const Type: P.CoderType<WasmType> = /* @__PURE__ */ (() =>
+  deepFreeze(
+    P.map(P.U8, {
+      void: 0x40,
+      i32: 0x7f,
+      i64: 0x7e,
+      f32: 0x7d,
+      f64: 0x7c,
+      v128: 0x7b,
+      // reftype
+      funcref: 0x70,
+      externref: 0x6f,
+    })
+  ) as P.CoderType<WasmType>)();
+const RefNullType: P.CoderType<'funcref' | 'externref'> = /* @__PURE__ */ P.validate(
+  Type,
+  (type) => {
+    if (type !== 'funcref' && type !== 'externref')
+      throw new Error('ref.null immediate must be a reference type');
+    return type;
+  }
+) as P.CoderType<'funcref' | 'externref'>;
+const ValType: P.CoderType<Exclude<WasmType, 'void'>> = /* @__PURE__ */ P.validate(Type, (type) => {
+  if (type === 'void') throw new Error('void is not a valid local valtype');
+  return type;
+}) as P.CoderType<Exclude<WasmType, 'void'>>;
 
-const stubSection = P.bytes(LEB128);
-export const section = <T>(inner: P.CoderType<T>) => P.prefix(LEB128, P.array(LEB128, inner));
+const stubSection: P.CoderType<Uint8Array> = /* @__PURE__ */ (() => P.bytes(LEB128))();
+/**
+ * Creates a standard Wasm section vector coder.
+ *
+ * @param inner - Coder for one section item.
+ * @returns Length-prefixed vector coder for the section.
+ * @example
+ * ```js
+ * import * as P from 'micro-packed';
+ * import { section } from '@awasm/compiler/wasm.js';
+ *
+ * section(P.U8);
+ * ```
+ */
+export const section = <T>(inner: P.CoderType<T>): P.CoderType<T[]> =>
+  P.prefix(LEB128, P.array(LEB128, inner));
+const tagEntry = <const Tag extends number, Coder extends P.CoderType<any>>(
+  tag: Tag,
+  coder: Coder
+): TagEntry<Tag, Coder> => [tag, coder];
 
-const varstring = P.string(LEB128);
+const varstring: P.CoderType<string> = /* @__PURE__ */ (() => P.string(LEB128))();
 
-const Kind = P.map(P.U8, {
-  function: 0,
-  table: 1,
-  memory: 2,
-  global: 3,
-});
-const functionType = P.struct({ inputs: P.array(LEB128, Type), outputs: P.array(LEB128, Type) });
-const typesSection = section(P.mappedTag(P.U8, { function: [0x60, functionType] }));
+const Kind: P.CoderType<WasmKind> = /* @__PURE__ */ (() =>
+  P.map(P.U8, {
+    function: 0,
+    table: 1,
+    memory: 2,
+    global: 3,
+  }) as P.CoderType<WasmKind>)();
+const ImportKind: P.CoderType<WasmImportKind> = /* @__PURE__ */ (() =>
+  P.map(P.U8, {
+    function: 0,
+    memory: 2,
+  }) as P.CoderType<WasmImportKind>)();
+const functionType: P.CoderType<WasmFunctionType> = /* @__PURE__ */ (() =>
+  P.validate(
+    P.struct({ inputs: P.array(LEB128, Type), outputs: P.array(LEB128, Type) }),
+    (type) => {
+      // 0x40 is the empty blocktype marker; function signatures use empty vectors.
+      if (type.inputs.includes('void') || type.outputs.includes('void'))
+        throw new Error('void is not a valid function signature valtype');
+      return type;
+    }
+  ))();
+const typesSection: P.CoderType<WasmTypeEntry[]> = /* @__PURE__ */ (() =>
+  section(P.mappedTag(P.U8, { function: [0x60, functionType] })))();
 
-const exportSection = P.prefix(
-  LEB128,
-  P.array(LEB128, P.struct({ name: varstring, kind: Kind, index: LEB128 }))
-);
+const exportSection: P.CoderType<WasmExport[]> = /* @__PURE__ */ (() =>
+  P.prefix(LEB128, P.array(LEB128, P.struct({ name: varstring, kind: Kind, index: LEB128 }))))();
 
-const MemLimits = P.struct({
-  flags: P.bitset(['r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'shared', 'maximum'], true),
-  initial: LEB128,
-  maximum: P.flagged('flags/maximum', LEB128),
-});
-
-const importSection = section(
+const MemLimits: P.CoderType<WasmMemoryLimits> = /* @__PURE__ */ (() =>
   P.struct({
-    module: varstring,
-    name: varstring,
-    importType: P.tag(Kind, { function: idx, memory: MemLimits }),
-  })
-);
-const memorySection = section(MemLimits);
+    flags: P.bitset(['r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'shared', 'maximum'], true),
+    initial: LEB128,
+    maximum: P.flagged('flags/maximum', LEB128),
+  }))();
 
-const LEB128_32 = P.apply(LEB128, P.coders.numberBigint);
+const importSection: P.CoderType<WasmImport[]> = /* @__PURE__ */ (() =>
+  section(
+    P.struct({
+      module: varstring,
+      name: varstring,
+      importType: P.tag(ImportKind, { function: idx, memory: MemLimits }),
+    })
+  ))();
+const memorySection: P.CoderType<WasmMemoryLimits[]> = /* @__PURE__ */ (() =>
+  section(MemLimits))();
 
-const BlockType: P.CoderType<number | P.UnwrapCoder<typeof Type>> = P.wrap({
+const LEB128_32: P.CoderType<number> = /* @__PURE__ */ (() =>
+  P.apply(LEB128, P.coders.numberBigint))();
+const SLEB128_32: P.CoderType<number> = /* @__PURE__ */ (() =>
+  P.apply(SLEB128, P.coders.numberBigint))();
+const MAX_U32 = 0xffffffff;
+const BlockTypeIdx: P.CoderType<number> = /* @__PURE__ */ P.validate(SLEB128_32, (value) => {
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_U32)
+    throw new Error(`invalid block type index: ${value}`);
+  return value;
+});
+
+const BlockType: P.CoderType<number | P.UnwrapCoder<typeof Type>> = /* @__PURE__ */ P.wrap({
   encodeStream(w, value) {
-    if (typeof value === 'number') LEB128_32.encodeStream(w, value);
-    else Type.encodeStream(w, value);
+    if (typeof value !== 'number') return Type.encodeStream(w, value);
+    // Block typeidx uses signed LEB33, so 64 must not alias empty blocktype byte 0x40.
+    BlockTypeIdx.encodeStream(w, value);
   },
   decodeStream(r) {
     const b = r.bytes(1, true);
@@ -440,12 +549,16 @@ const BlockType: P.CoderType<number | P.UnwrapCoder<typeof Type>> = P.wrap({
       r.bytes(1);
       return res;
     } catch (e) {
-      return LEB128_32.decodeStream(r);
+      return BlockTypeIdx.decodeStream(r);
     }
   },
 });
-const BrTableArg = P.struct({ targets: P.array(LEB128, idx), default: idx });
-const instruction = P.mappedTag(P.U8, {
+const BrTableArg: P.CoderType<{ targets: bigint[]; default: bigint }> = /* @__PURE__ */ (() =>
+  P.struct({
+    targets: P.array(LEB128, idx),
+    default: idx,
+  }))();
+const instruction = /* @__PURE__ */ (() => P.mappedTag(P.U8, {
   /*
   TODO: fix:
 
@@ -470,7 +583,8 @@ call_indirect order is typeidx then tableidx (old toolchains used a reserved 0x0
   call_indirect: [0x11, P.struct({ type: idx, table: idx })],
   // paramentric?
   drop: [0x1a, EMPTY], // pops value from stack
-  select: [0x1b, EMPTY], // [value1] [value2] [condition] from stack, select value based on condition?
+  // [value1] [value2] [condition] from stack, select value based on condition?
+  select: [0x1b, EMPTY],
   // memory
   ...getInstructions(memory, EMPTY, 'local', 'global', 'table'),
   'memory.size': [0x3f, P.magic(P.U8, 0x00)],
@@ -478,7 +592,7 @@ call_indirect order is typeidx then tableidx (old toolchains used a reserved 0x0
   // basic
   ...getInstructions(basic, EMPTY, 'i32', 'i64', 'f32', 'f64'),
   // references
-  null: [0xd0, Type],
+  null: [0xd0, RefNullType],
   is_null: [0xd1, EMPTY],
   func: [0xd2, idx],
   // fb: gc + Reference-Typed Strings Proposal
@@ -519,66 +633,137 @@ call_indirect order is typeidx then tableidx (old toolchains used a reserved 0x0
     0xfe,
     P.mappedTag(LEB128_32, {
       'atomic.notify': [0x00, memarg],
-      'atomic.fence': [0x03, EMPTY],
+      'atomic.fence': [0x03, P.magic(P.U8, 0x00)],
       ...getInstructions(atomics, memarg, 'i32', 'i64'),
     }),
   ],
-});
-const locals = P.array(LEB128, P.struct({ count: LEB128, type: Type }));
-const codeSection = section(
-  P.prefix(LEB128, P.struct({ locals, instructions: P.array(null, instruction) }))
-);
-const functionsSection = section(idx);
+}))();
+const locals: P.CoderType<WasmLocal[]> = /* @__PURE__ */ (() =>
+  P.array(LEB128, P.struct({ count: LEB128, type: ValType })))();
+const codeSection: P.CoderType<WasmCode[]> = /* @__PURE__ */ (() =>
+  section(P.prefix(LEB128, P.struct({ locals, instructions: P.array(null, instruction) }))))();
+const functionsSection: P.CoderType<bigint[]> = /* @__PURE__ */ (() => section(idx))();
+type WasmSections = {
+  custom: TagEntry<0, P.CoderType<{ name: string; data: Uint8Array }>>;
+  types: TagEntry<1, typeof typesSection>;
+  imports: TagEntry<2, typeof importSection>;
+  functions: TagEntry<3, typeof functionsSection>;
+  tables: TagEntry<4, typeof stubSection>;
+  memory: TagEntry<5, typeof memorySection>;
+  global: TagEntry<6, typeof stubSection>;
+  exports: TagEntry<7, typeof exportSection>;
+  start: TagEntry<8, typeof idx>;
+  element: TagEntry<9, typeof stubSection>;
+  code: TagEntry<10, typeof codeSection>;
+  data: TagEntry<11, typeof stubSection>;
+};
+const wasmSections: WasmSections = /* @__PURE__ */ (() => ({
+  custom: tagEntry(0, P.prefix(LEB128, P.struct({ name: P.string(LEB128), data: P.bytes(null) }))),
+  types: tagEntry(1, typesSection),
+  imports: tagEntry(2, importSection),
+  functions: tagEntry(3, functionsSection), // ??
+  tables: tagEntry(4, stubSection),
+  memory: tagEntry(5, memorySection),
+  global: tagEntry(6, stubSection),
+  exports: tagEntry(7, exportSection),
+  start: tagEntry(8, idx), // [Function Index (varuint32)]
+  element: tagEntry(9, stubSection), // [Count (varuint32)] [Element Entries (sequence)]
+  code: tagEntry(10, codeSection),
+  data: tagEntry(11, stubSection),
+}))();
 
-export const wasmSection = P.mappedTag(P.U8, {
-  custom: [0, P.prefix(LEB128, P.struct({ name: P.string(LEB128), data: P.bytes(null) }))],
-  types: [1, typesSection],
-  imports: [2, importSection],
-  functions: [3, functionsSection], // ??
-  tables: [4, stubSection],
-  memory: [5, memorySection],
-  global: [6, stubSection],
-  exports: [7, exportSection],
-  start: [8, idx], // [Function Index (varuint32)]
-  element: [9, stubSection], // [Count (varuint32)] [Element Entries (sequence)]
-  code: [10, codeSection],
-  data: [11, stubSection],
-});
-/**
- * Generic WASM coder/decoder
- */
-export const wasmBinary = P.struct({
-  magic: P.magic(P.string(4), '\0asm'),
-  version: P.U32LE,
-  sections: P.array(null, wasmSection),
-});
+/** Coder for top-level Wasm sections. */
+export const wasmSection: TRet<P.CoderType<WasmSection>> = /* @__PURE__ */ (() =>
+  deepFreeze(P.mappedTag(P.U8, wasmSections)) as TRet<P.CoderType<WasmSection>>)();
 
-// unwrap Type gives string
-type TypeVal = 'void' | 'i32' | 'i64' | 'f32' | 'f64' | 'v128';
+/** Generic Wasm binary coder and decoder. */
+export const wasmBinary: TRet<P.CoderType<WasmBinary>> = /* @__PURE__ */ (() =>
+  deepFreeze(
+    P.struct({
+      magic: P.magic(P.string(4), '\0asm'),
+      version: P.U32LE,
+      sections: P.array(null, wasmSection),
+    })
+  ) as TRet<P.CoderType<WasmBinary>>)();
+
+/** Lowered module shape consumed by the raw Wasm and JavaScript backends. */
 export type WasmModule = {
+  /** Module and generated wrapper function name. */
   name: string;
+  /** Optional linear-memory configuration. */
   memory?: {
+    /** Memory size in bytes before page rounding. */
     size: number;
+    /** Whether memory is imported from `env._memory`. */
     import?: boolean;
+    /** Whether memory is shared for threads. */
     shared?: boolean;
+    /** Whether memory is exported by the module wrapper. */
     export?: boolean;
+    /** Optional maximum size in bytes before page rounding. */
     maximum?: number;
   };
+  /** Lowered function declarations and bodies. */
   functions: {
     name: string;
     inputs: TypeVal[];
     outputs: TypeVal[];
     export?: boolean;
     import?: boolean;
-    locals?: { count: bigint; type: TypeVal }[]; ////P.UnwrapCoder<typeof locals>[];
-    instructions?: P.UnwrapCoder<typeof instruction>[];
+    module?: string;
+    locals?: { count: bigint; type: LocalType }[]; ////P.UnwrapCoder<typeof locals>[];
+    instructions?: WasmInstruction[];
   }[];
 };
+/** Encoded memory limits for Wasm memory sections. */
+export type WasmMemoryLimits = {
+  /** Encoded limit flags used by the Wasm memory type. */
+  flags: {
+    /** Reserved flag bit 0. */
+    r0?: boolean;
+    /** Reserved flag bit 1. */
+    r1?: boolean;
+    /** Reserved flag bit 2. */
+    r2?: boolean;
+    /** Reserved flag bit 3. */
+    r3?: boolean;
+    /** Reserved flag bit 4. */
+    r4?: boolean;
+    /** Reserved flag bit 5. */
+    r5?: boolean;
+    /** Marks memory as shared. */
+    shared?: boolean;
+    /** Marks the limit as carrying a maximum page count. */
+    maximum?: boolean;
+  };
+  /** Initial memory size in Wasm pages. */
+  initial: bigint;
+  /** Optional maximum memory size in Wasm pages. */
+  maximum?: bigint;
+};
+/** Memory settings returned by `wasmMemoryOpts`. */
+export type WasmMemoryOpts = {
+  /** Source module memory settings in bytes. */
+  modMemory: NonNullable<WasmModule['memory']>;
+  /** Encoded Wasm page limits. */
+  opts: WasmMemoryLimits;
+};
 
-export function wasmMemoryOpts(mod: WasmModule) {
+/**
+ * Converts byte-sized memory settings into Wasm page limits.
+ *
+ * @param mod - Lowered module containing optional memory settings.
+ * @returns Original memory settings and encoded Wasm memory limits.
+ * @throws If shared memory lacks a maximum or initial exceeds maximum. {@link Error}
+ * @example
+ * ```js
+ * wasmMemoryOpts({ name: 'demo', memory: { size: 65536 }, functions: [] });
+ * ```
+ */
+export function wasmMemoryOpts(mod: WasmModule): WasmMemoryOpts {
   const toPages = (bytes: number) => BigInt(Math.ceil(bytes / 2 ** 16)); // wasm can only consume 64kb pages
   const modMemory = mod.memory || { size: 0 };
-  const opts: P.UnwrapCoder<typeof MemLimits> = {
+  const opts: WasmMemoryLimits = {
     flags: { shared: !!modMemory.shared },
     initial: toPages(modMemory.size),
   };
@@ -587,12 +772,24 @@ export function wasmMemoryOpts(mod: WasmModule) {
     opts.maximum = toPages(modMemory.maximum);
   }
   if (opts.flags.shared && !opts.maximum) throw new Error('shared memory without maximum limit');
+  if (opts.maximum !== undefined && opts.initial > opts.maximum)
+    throw new Error(
+      `memory initial pages ${opts.initial} greater than maximum pages ${opts.maximum}`
+    );
   return { modMemory, opts };
 }
 /**
- * Convert stack based ops from 'codegen.ts/toInstr' into actual wasm with checks.
+ * Converts compiler-lowered stack instructions into a Wasm binary.
+ *
+ * @param mod - Lowered module description.
+ * @returns Encoded Wasm binary bytes.
+ * @throws If memory limits, signatures, or immediates are invalid. {@link Error}
+ * @example
+ * ```js
+ * createWasm({ name: 'demo', memory: { size: 0 }, functions: [] });
+ * ```
  */
-export function createWasm(mod: WasmModule) {
+export function createWasm(mod: WasmModule): TRet<Uint8Array> {
   const { modMemory, opts: mem } = wasmMemoryOpts(mod);
   const envModule = 'env'; // always env for simplicity
   // Re-use same types (useful for blocks/loops with fallthrough)
@@ -614,7 +811,10 @@ export function createWasm(mod: WasmModule) {
   } else {
     if (modMemory.size !== 0 || modMemory.export) memory.push(mem);
   }
-  if (modMemory.export) exports.push({ name: 'memory', kind: 'memory', index: 0n }); // always single memory
+  if (modMemory.export) {
+    // Always single memory.
+    exports.push({ name: 'memory', kind: 'memory', index: _0n });
+  }
   // Functions
   const functionIdx: Record<string, number> = {};
   let functionPos = 0;
@@ -624,7 +824,8 @@ export function createWasm(mod: WasmModule) {
     if (fn.locals || fn.instructions)
       throw new Error('imported function with locals or instructions');
     imports.push({
-      module: envModule,
+      // `env` is only the default module; importFn(..., module) must survive to linking.
+      module: fn.module || envModule,
       name: fn.name,
       importType: { TAG: 'function', data: addType(fn) },
     });
@@ -692,5 +893,5 @@ export function createWasm(mod: WasmModule) {
   if (memory.length) sections.push({ TAG: 'memory', data: memory });
   if (exports.length) sections.push({ TAG: 'exports', data: exports });
   if (code.length) sections.push({ TAG: 'code', data: code });
-  return wasmBinary.encode({ version: 1, sections });
+  return wasmBinary.encode({ version: 1, sections }) as TRet<Uint8Array>;
 }

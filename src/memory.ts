@@ -11,33 +11,51 @@ import {
   minSimdType,
   opsAtomics,
   opsForType,
+  nodeRetType,
   sizeof,
 } from './types.ts';
-import { lcm, omit, align as utilsAlign, last as utilsLast, wasmAlign } from './utils.ts';
+import {
+  deepFreeze,
+  lcm,
+  omit,
+  align as utilsAlign,
+  last as utilsLast,
+  wasmAlign,
+} from './utils.ts';
 
-/**
- * Per memory region options
- */
+/** Per-region memory layout options. */
 export type MemoryOpts = {
+  /** Store scalar values with byte order swapped relative to the default target order. */
   swapEndianness?: boolean;
+  /** Disable SIMD-friendly stream interleaving for this region. */
   noInterleave?: boolean;
-  align?: number; // starting pos % align = 0
-  alignEnd?: number; // end % pad = 0
+  /** Required byte alignment for the region start. */
+  align?: number;
+  /** Required byte alignment for the padded region end. */
+  alignEnd?: number;
+  /** Mark this region as batch-expanded by worker or SIMD compilation. */
   batch?: boolean;
 };
 
-/**
- * Memory region representation
- */
+/** Allocated memory region representation. */
 export type MemOpts = {
+  /** Start position in the linear memory buffer. */
   pos: number;
+  /** Logical byte size of the region. */
   size: number;
-  paddedSize: number; // full size of region with alignment block
-  align?: number; // power of two (as in wasm)
-  count?: number; // for arrays
-  lanes?: number; // for vectorized arrays
-  type?: TypeName; // for arrays
+  /** Physical byte size including alignment padding. */
+  paddedSize: number;
+  /** Region alignment as a byte count. */
+  align?: number;
+  /** Array element count when the region is an array. */
+  count?: number;
+  /** Vector lane count when the region is viewed as lanes. */
+  lanes?: number;
+  /** Scalar element type when the region is array-backed. */
+  type?: TypeName;
+  /** Internal precomputed region tree used by memory proxies. */
   pre?: any;
+  /** Named subregion metadata as `[pos, len, chunks, chunkSize]`. */
   subRegions?: Record<string, [number, number, number, number]>;
 };
 
@@ -47,12 +65,17 @@ function getAlignOpts(spec: ArraySpec | StructSpec | ScalarSpec<any>) {
   let align = spec.opts.align;
   if (align === undefined) {
     if (spec.kind === 'scalar') {
-      align = spec.size ? spec.size : sizeof(spec.type); // align scalars to size
-    } else if (spec.kind === 'array') align = 16; // arrays always aligned to 16 by default (simd related loading)
+      // Align scalars to size.
+      align = spec.size ? spec.size : sizeof(spec.type);
+    } else if (spec.kind === 'array') {
+      // Arrays default to SIMD-friendly alignment.
+      align = 16;
+    }
   }
   let alignEnd = spec.opts.alignEnd;
   if (alignEnd === undefined) {
-    if (spec.kind === 'array') alignEnd = 16; // at the end too, we don't want vector op for leftovers touch anything outside
+    // Keep vector leftovers from touching outside the region.
+    if (spec.kind === 'array') alignEnd = 16;
   }
   align = align === undefined ? 1 : align;
   alignEnd = alignEnd === undefined ? 1 : alignEnd;
@@ -155,7 +178,19 @@ type RegionExpr = Aligned & {
   subRegions?: Record<string, [number, number, number, number]>;
 };
 /**
- * Generates size/position of memory element inside global buffer based on alignment/padding
+ * Allocates a structured or array memory specification at a byte position.
+ *
+ * @param pos - Starting byte position.
+ * @param t - Memory specification to allocate.
+ * @returns Next free position, public memory options, and internal region tree.
+ * @throws If layout validation or alignment checks fail. {@link Error}
+ * @example
+ * ```js
+ * import { array } from '@awasm/compiler/module.js';
+ * import { allocateMemSpec } from '@awasm/compiler/memory.js';
+ *
+ * allocateMemSpec(0, array('u32', {}, 4));
+ * ```
  */
 export function allocateMemSpec(
   pos: number,
@@ -222,6 +257,23 @@ function getSymbolicArray(spec: ArraySpec, inner: Aligned): Aligned {
   } as any;
 }
 
+/**
+ * Resolves one child region from an allocated region tree.
+ *
+ * @param opts - Current allocated region. {@link RegionExpr}
+ * @param key - Array index, symbolic index, or struct field name.
+ * @param skipChecks - Whether static bounds and shape checks are skipped.
+ * @returns Child region metadata with an adjusted byte position.
+ * @throws If the key does not match the region shape. {@link Error}
+ * @example
+ * ```js
+ * import { array } from '@awasm/compiler/module.js';
+ * import { allocateMemSpec, getRegionInfo } from '@awasm/compiler/memory.js';
+ *
+ * const { pre } = allocateMemSpec(0, array('u32', {}, 4));
+ * getRegionInfo(pre, 0);
+ * ```
+ */
 export function getRegionInfo(
   opts: RegionExpr,
   key: string | number | FnOp,
@@ -272,7 +324,26 @@ export function getRegionInfo(
   } else throw new Error(`getRegionInfo: wrong region ${spec.kind} key=${key}`);
 }
 
-export function getRegionInfoPath(cur: RegionExpr, ...keys: (string | number | FnOp)[]) {
+/**
+ * Resolves several child keys through an allocated region tree.
+ *
+ * @param cur - Starting allocated region.
+ * @param keys - Child keys to resolve in order.
+ * @returns Final child region metadata.
+ * @throws If any path segment does not match the current region shape. {@link Error}
+ * @example
+ * ```js
+ * import { array } from '@awasm/compiler/module.js';
+ * import { allocateMemSpec, getRegionInfoPath } from '@awasm/compiler/memory.js';
+ *
+ * const { pre } = allocateMemSpec(0, array('u32', {}, 4));
+ * getRegionInfoPath(pre, 0);
+ * ```
+ */
+export function getRegionInfoPath(
+  cur: RegionExpr,
+  ...keys: (string | number | FnOp)[]
+): RegionExpr {
   for (const k of keys) cur = getRegionInfo(cur, k) as any;
   return cur;
 }
@@ -280,13 +351,33 @@ export function getRegionInfoPath(cur: RegionExpr, ...keys: (string | number | F
 const prod = (xs: readonly number[]) => {
   //if (!xs.length) throw new Error('empty length');
   let p = 1;
-  for (let i = 0; i < xs.length; i++) p *= xs[i];
+  let numeric = true;
+  for (let i = 0; i < xs.length; i++) {
+    const x = xs[i];
+    p *= x;
+    if (typeof x !== 'number') numeric = false;
+    if (numeric && !Number.isSafeInteger(p)) throw new Error('wrong array size');
+  }
   return p;
 };
 
-type MulExpr = number | (number | FnOp)[]; // flat product of integers and size symbols
+type MulExpr = number | FnOp | (number | FnOp)[]; // flat product of integers and size symbols
 type PosExpr = { base: number; baseMul: MulExpr[]; syms: FnOp[]; coeffs: MulExpr[] };
-export const PosExpr = {
+type PosExprAPI = {
+  isNum(p: number | PosExpr): p is number;
+  isExpr(p: number | PosExpr): p is PosExpr;
+  canon(e: PosExpr): number | PosExpr;
+  toExpr(p: number | PosExpr): PosExpr;
+  term(sym: number | FnOp, coeff: number | MulExpr): number | PosExpr;
+  add(a: number | PosExpr, b: number | PosExpr): number | PosExpr;
+  madd(a: number | PosExpr, b: number | PosExpr, k: number): number | PosExpr;
+  eval(e: PosExpr, values: number[]): number;
+  evalSymSize(f: ModuleGraph, pos: MulExpr | number): FnOp;
+  evalSym(f: ModuleGraph, pos: PosExpr | number): { pos: number | FnOp; align: number };
+  mul(...xs: MulExpr[]): MulExpr;
+};
+/** Symbolic byte-position arithmetic for memory indexing. */
+export const PosExpr: PosExprAPI = /* @__PURE__ */ deepFreeze({
   // PosExpr
   isNum: (p: number | PosExpr): p is number => typeof p === 'number',
   isExpr: (p: number | PosExpr): p is PosExpr => !PosExpr.isNum(p),
@@ -333,9 +424,21 @@ export const PosExpr = {
     return PosExpr.add(a, scaled);
   },
   eval(e: PosExpr, values: number[]) {
+    const evalMul = (m: MulExpr) => {
+      if (typeof m === 'number') return m;
+      if (!Array.isArray(m)) throw new Error('cannot evaluate symbolic product');
+      let res = 1;
+      for (const x of m) {
+        // Numeric eval only has positional values; symbolic products need evalSym().
+        if (typeof x !== 'number') throw new Error('cannot evaluate symbolic product');
+        res *= x;
+      }
+      return res;
+    };
     let sum = e.base;
-    let n = Math.min(e.syms.length, e.coeffs.length, values.length);
-    for (let i = 0; i < n; i++) sum += (e.coeffs[i] as number) * values[i];
+    for (const m of e.baseMul) sum += evalMul(m);
+    const n = Math.min(e.syms.length, e.coeffs.length, values.length);
+    for (let i = 0; i < n; i++) sum += evalMul(e.coeffs[i]) * values[i];
     return sum;
   },
   evalSymSize(f: ModuleGraph, pos: MulExpr | number) {
@@ -352,6 +455,7 @@ export const PosExpr = {
     const ctzPow2 = (n: number): number => (n === 0 ? 32 : wasmAlign(n)); // treat 0 as +∞ (i.e., no restriction); 32 is safe sentinel for min()
     const ctzMul = (m: MulExpr) => {
       if (typeof m === 'number') return ctzPow2(m);
+      if (!Array.isArray(m)) return 32;
       let min = 32;
       for (const fct of m) if (typeof fct === 'number') min = Math.min(min, ctzPow2(fct));
       return min;
@@ -399,7 +503,7 @@ export const PosExpr = {
     rest.sort((a, b) => (a.idx < b.idx ? -1 : a.idx > b.idx ? 1 : 0));
     return rest.length ? (k !== 1 ? [k, ...rest] : rest) : k;
   },
-} as const;
+} as const);
 
 type View = RegionExpr & {
   idx(path: number | string | FnOp): View;
@@ -574,6 +678,18 @@ function reshapeView(
 ) {
   const spec = region.spec;
   if (spec.kind !== 'array') throw new Error('reshapeView: not array');
+  if (!skipChecks) {
+    // Runtime evaluates symbolic reshape dimensions as plain numbers; batch offsets
+    // can be 0 there, so keep this as a static/codegen shape-domain check only.
+    for (const s of sizes) {
+      if (typeof s === 'number' && (!Number.isSafeInteger(s) || s < 1))
+        throw new Error('reshapeView: wrong reshape dimension');
+      if (typeof s !== 'number') {
+        if (!(s instanceof FnOp) || !IntType.has(nodeRetType(f, s)))
+          throw new Error('reshapeView: wrong reshape dimension');
+      }
+    }
+  }
   // Simple case, everything is number
   if (!skipChecks && sizes.every((i) => typeof i === 'number')) {
     const newCount = prod(sizes);
@@ -591,7 +707,15 @@ type ProxyContext = {
   };
 };
 /**
- * Creates main user interface over memory region using memOps function for actual implementation
+ * Creates the main proxy interface over a memory region.
+ *
+ * @param f - Function graph that receives memory operations.
+ * @param name - Memory segment name.
+ * @param region - Allocated region to expose.
+ * @param memOpsFn - Backend memory operation factory.
+ * @param skipChecks - Whether static shape checks are skipped.
+ * @returns Proxy-backed memory access surface.
+ * @throws If proxy access uses an unsupported key or invalid view operation. {@link Error}
  */
 export function memoryProxy(
   f: ModuleGraph,
@@ -599,7 +723,7 @@ export function memoryProxy(
   region: RegionExpr,
   memOpsFn: typeof memOps,
   skipChecks = false
-) {
+): any {
   const mk = (view: View, path: (string | number | FnOp)[], ctx: ProxyContext): any => {
     if (!path) throw new Error('empty path');
     const region = omit(view, 'idx', 'align', 'alignEnd', 'inner', 'fields');
@@ -777,6 +901,27 @@ export function memoryProxy(
 
 type RegionFull = RegionExpr & ProxyContext;
 
+/**
+ * Creates load/store helpers for one memory region path.
+ *
+ * @param f - Function graph that receives memory operations.
+ * @param name - Memory segment name.
+ * @param region - Fully resolved region metadata.
+ * @param path - Region path used for debug metadata.
+ * @returns Memory operation handle for the region.
+ * @throws If the region cannot be mapped to a concrete load/store type. {@link Error}
+ * @example
+ * ```js
+ * import { Module } from '@awasm/compiler/module.js';
+ * import { ModuleGraph } from '@awasm/compiler/codegen.js';
+ * import { array } from '@awasm/compiler/module.js';
+ * import { allocateMemSpec, memOps } from '@awasm/compiler/memory.js';
+ *
+ * const graph = new ModuleGraph('demo', {}, new Module('demo'), {});
+ * const { pre } = allocateMemSpec(0, array('u32', {}, 4));
+ * memOps(graph, 'buf', pre, []);
+ * ```
+ */
 export function memOps(
   f: ModuleGraph,
   name: string,
@@ -800,6 +945,8 @@ export function memOps(
   const addPos = (curPos: number | FnOp, size: number) =>
     typeof curPos === 'number' ? curPos + size : u32.add(curPos, u32.const(size));
   const posSym = (pos: FnOp | number) => (typeof pos === 'number' ? u32.const(pos) : pos);
+  const posExpr = (pos: FnOp | number): number | PosExpr =>
+    pos instanceof FnOp ? PosExpr.term(pos, 1) : pos;
 
   function memOpts(name: string, pos: FnOp | number, opts: any = {}) {
     const fRoot = f.getCurFn().node;
@@ -1061,10 +1208,7 @@ export function memOps(
       Object.assign(res, {
         get(): FnOp[] {
           const res = [];
-          let curPos = pos;
-          if (curPos instanceof FnOp) {
-            curPos = PosExpr.term(curPos, 1);
-          }
+          const curPos = posExpr(pos);
           for (let i = 0; i < count; i++) {
             res.push(
               tmp(
@@ -1080,7 +1224,7 @@ export function memOps(
           if (values.length !== count)
             throw new Error(`set/array: wrong length=${values.length}, expected: ${count}`);
           const res = [];
-          let curPos = pos;
+          const curPos = posExpr(pos);
           for (let i = 0; i < count; i++) {
             res.push(
               tmp(

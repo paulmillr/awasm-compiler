@@ -1,5 +1,5 @@
 import { describe, should } from '@paulmillr/jsbt/test.js';
-import { deepStrictEqual } from 'node:assert';
+import { deepStrictEqual, throws } from 'node:assert';
 import * as types from '../src/types.ts';
 import * as utils from '../src/utils.ts';
 
@@ -8,6 +8,17 @@ describe('Utils', () => {
     should('basic', () => {
       deepStrictEqual(utils.Dimensions(2, 4, 8).cardinality, 64);
       deepStrictEqual(utils.Dimensions(3, 5, 7).cardinality, 105);
+    });
+    should('integer domain', () => {
+      throws(() => utils.Dimensions(1.5), /wrong dimension size/);
+      throws(() => utils.Dimensions(Number.MAX_SAFE_INTEGER, 2), /wrong dimension cardinality/);
+      const d = utils.Dimensions(3);
+      throws(() => d.key.encode([1.5]), /wrong dimension position/);
+      throws(() => d.key.decode(1.5), /idx key bounds/);
+      throws(() => d.get([0, 1, 2], [1.5]), /wrong dimension position/);
+      const target = [0, 1, 2];
+      throws(() => d.set(target, [1.5], 9), /wrong dimension position/);
+      deepStrictEqual(target, [0, 1, 2]);
     });
     should('flatKey', () => {
       const x = utils.Dimensions(5, 3, 2);
@@ -108,6 +119,16 @@ describe('Utils', () => {
       deepStrictEqual(S2.validate(shape, roundtrip), true);
     });
   });
+  describe('splitU64', () => {
+    should('validates precise number domain', () => {
+      deepStrictEqual(utils.splitU64(0), { l: 0, h: 0 });
+      deepStrictEqual(utils.splitU64(0x1_0000_0000), { l: 0, h: 1 });
+      deepStrictEqual(utils.splitU64(Number.MAX_SAFE_INTEGER), { l: -1, h: 0x1fffff });
+      throws(() => utils.splitU64(-1), /safe integer|u64/i);
+      throws(() => utils.splitU64(1.5), /safe integer|u64/i);
+      throws(() => utils.splitU64(2 ** 64 - 1), /safe integer|u64/i);
+    });
+  });
   describe('Graph', () => {
     describe('Path', () => {
       should('basic', () => {
@@ -157,6 +178,11 @@ describe('Utils', () => {
         deepStrictEqual(utils.Path.isParent('1.2.3', '1.2.3.4'), true);
         deepStrictEqual(utils.Path.isParent('1.2.4', '1.2.3.4'), false);
         deepStrictEqual(utils.Path.isParent('1.2.3.4', '1.2.3.4'), false);
+        // mapParent
+        deepStrictEqual(utils.Path.mapParent('1.2', '9', '1.2'), '9');
+        deepStrictEqual(utils.Path.mapParent('1.2', '9', '1.2.3'), '9.3');
+        deepStrictEqual(utils.Path.mapParent('1.2', '9', '1.2.3w'), '9.3w');
+        throws(() => utils.Path.mapParent('1.2', '9', '1.20.3'), /wrong child/);
       });
     });
     type NodeIdx = string;
@@ -359,6 +385,8 @@ describe('Utils', () => {
       const d = g.add({ type: 'u32', op: 'const', opts: { real: true, id: 'd', src: b } });
 
       const x = g.clone();
+      deepStrictEqual(x.usedBy instanceof Map, true);
+      deepStrictEqual(x.usedBy.get(a), new Set([c]));
       x.toposort();
       // console.log('TOPO ORIG:');
       // console.log('X', x.format());
