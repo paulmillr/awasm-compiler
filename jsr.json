@@ -1,0 +1,23 @@
+{
+  "name": "@awasm/compiler",
+  "version": "0.1.3",
+  "exports": {
+    "./codegen.js": "./src/codegen.ts",
+    "./js.js": "./src/js.ts",
+    "./memory.js": "./src/memory.ts",
+    "./module.js": "./src/module.ts",
+    "./rewrites.js": "./src/rewrites.ts",
+    "./runtime.js": "./src/runtime.ts",
+    "./types.js": "./src/types.ts",
+    "./wasm.js": "./src/wasm.ts",
+    "./workers.js": "./src/workers.ts",
+    "./utils.js": "./src/utils.ts"
+  },
+  "imports": {
+    "@scure/base": "jsr:@scure/base@2.2.0",
+    "micro-packed": "jsr:@paulmillr/micro-packed@0.9.0"
+  },
+  "publish": {
+    "include": ["src", "jsr.json", "LICENSE", "README.md"]
+  }
+}
