@@ -1,3 +1,4 @@
+import * as P from 'micro-packed';
 import { type ModuleGraph, FnOp } from './codegen.ts';
 import type { ArraySpec, ScalarSpec, StructSpec } from './module.ts';
 import {
@@ -15,6 +16,7 @@ import {
   sizeof,
 } from './types.ts';
 import {
+  aarray,
   deepFreeze,
   lcm,
   omit,
@@ -196,6 +198,16 @@ export function allocateMemSpec(
   pos: number,
   t: StructSpec | ArraySpec
 ): { pos: number; opts: MemOpts; pre: RegionExpr } {
+  if (typeof pos !== 'number')
+    throw new TypeError(`"pos" expected number, got type=${typeof pos}`);
+  if (!Number.isSafeInteger(pos) || pos < 0)
+    throw new RangeError(`"pos" expected non-negative safe integer, got ${pos}`);
+  if (!P.utils.isPlainObject(t))
+    throw new TypeError(`"t" expected memory spec object, got type=${typeof t}`);
+  if (typeof (t as any).kind !== 'string')
+    throw new TypeError(`"t.kind" expected string, got type=${typeof (t as any).kind}`);
+  if (!P.utils.isPlainObject((t as any).opts))
+    throw new TypeError(`"t.opts" expected object, got type=${typeof (t as any).opts}`);
   const item = getSize(t) as RegionExpr;
   const subRegions: Record<string, [number, number, number, number]> = {};
   // Walk over substructures and scalar, save
@@ -279,8 +291,21 @@ export function getRegionInfo(
   key: string | number | FnOp,
   skipChecks = false
 ): RegionExpr {
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
+  if (typeof skipChecks !== 'boolean')
+    throw new TypeError(`"skipChecks" expected boolean, got type=${typeof skipChecks}`);
+  if (!P.utils.isPlainObject((opts as any).spec))
+    throw new TypeError(`"opts.spec" expected object, got type=${typeof (opts as any).spec}`);
+  if (typeof (opts as any).spec.kind !== 'string')
+    throw new TypeError(
+      `"opts.spec.kind" expected string, got type=${typeof (opts as any).spec.kind}`
+    );
   const spec = opts.spec;
   if (spec.kind === 'array') {
+    aarray(spec.sizes, 'opts.spec.sizes');
+    if (!P.utils.isPlainObject(opts.inner))
+      throw new TypeError(`"opts.inner" expected object, got type=${typeof opts.inner}`);
     if (typeof key !== 'number' && typeof key !== 'object')
       throw new Error(`getRegionInfo: wrong key for array=${key}`);
     if (!skipChecks && typeof key === 'number' && (key < 0 || key >= spec.sizes[0]))
@@ -312,6 +337,8 @@ export function getRegionInfo(
       return res as any;
     }
   } else if (spec.kind === 'struct') {
+    if (!P.utils.isPlainObject(opts.fields))
+      throw new TypeError(`"opts.fields" expected object, got type=${typeof opts.fields}`);
     if (typeof key !== 'string') throw new Error(`getRegionInfo: struct key is not string=${key}`);
     const item = opts.fields![key];
     if (!item) throw new Error(`getRegionInfo: struct unknown key: ${key}`);
@@ -928,6 +955,13 @@ export function memOps(
   region: RegionFull,
   path: (number | string | FnOp)[]
 ): any {
+  if (!P.utils.isPlainObject(f) || !('types' in f))
+    throw new TypeError(`"f" expected ModuleGraph, got type=${typeof f}`);
+  if (typeof name !== 'string')
+    throw new TypeError(`"name" expected string, got type=${typeof name}`);
+  if (!P.utils.isPlainObject(region))
+    throw new TypeError(`"region" expected object, got type=${typeof region}`);
+  aarray(path, 'path');
   const res: Record<string, any> = { name, path, region };
   const { u32, i64 } = f.types;
   const getPos = (region: RegionExpr) => PosExpr.evalSym(f, region.pos);
@@ -1221,6 +1255,7 @@ export function memOps(
           return res;
         },
         set(values: FnOp[]): void {
+          aarray(values, 'values');
           if (values.length !== count)
             throw new Error(`set/array: wrong length=${values.length}, expected: ${count}`);
           const res = [];
@@ -1294,6 +1329,7 @@ export function memOps(
           return vecRes;
         },
         set(values: FnOp[]): void {
+          aarray(values, 'values');
           if (values.length !== region.count!)
             throw new Error(`set/array: wrong length=${values.length}, expected: ${region.count}`);
           if (region.opts.swapEndianness) values = values.map((i: any) => vT.swapEndianness(i));
@@ -1340,6 +1376,7 @@ export function memOps(
           return res;
         },
         set(values: FnOp[]): void {
+          aarray(values, 'values');
           if (values.length !== region.count!)
             throw new Error(`set/array: wrong length=${values.length}, expected: ${region.count}`);
           const res = [];
@@ -1391,6 +1428,7 @@ export function memOps(
           return res;
         },
         set(values: FnOp[]): void {
+          aarray(values, 'values');
           if (values.length !== region.count!)
             throw new Error(`set/array: wrong length=${values.length}, expected: ${region.count}`);
           const res = [];

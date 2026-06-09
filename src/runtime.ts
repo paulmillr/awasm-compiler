@@ -2,6 +2,7 @@
 // Runs stull in runtime instead of compilation. Useful for debug and if
 // you want to run module in very slow mode without compilation
 import type { TArg } from '@scure/base';
+import * as P from 'micro-packed';
 import type { CompilerOpts, ModuleGraph } from './codegen.ts';
 import { allocateMemSpec, memoryProxy } from './memory.ts';
 import { Module, array } from './module.ts';
@@ -1078,6 +1079,14 @@ export function toRuntime(
   _opts: CompilerOpts = {},
   debug = false
 ): () => any {
+  if (typeof typeModFn !== 'function')
+    throw new TypeError(`"typeModFn" expected function, got type=${typeof typeModFn}`);
+  if (!(mod instanceof Module))
+    throw new TypeError(`"mod" expected Module, got type=${typeof mod}`);
+  if (!P.utils.isPlainObject(_opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof _opts}`);
+  if (typeof debug !== 'boolean')
+    throw new TypeError(`"debug" expected boolean, got type=${typeof debug}`);
   const typeMod = typeModFn();
   // Memory
   const memory: Record<any, any> = {};

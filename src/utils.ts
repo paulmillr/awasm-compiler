@@ -6,6 +6,17 @@ export type ElementOf<T> = T extends readonly (infer U)[] ? U : never;
 /** Recursive nested-data helper used by APIs that accept trees of values. */
 export type ND<T> = T | readonly ND<T>[];
 
+export function aarray<T>(
+  item: unknown,
+  title: string,
+  inner: (elm: T, title: string) => void = () => {}
+): T[] {
+  if (!Array.isArray(item))
+    throw new TypeError(`"${title}" expected array, got type=${typeof item}`);
+  for (let i = 0; i < item.length; i++) inner(item[i], `${title}[${i}]`);
+  return item;
+}
+
 /** Generic type encompassing 8/16/32-byte arrays - but not 64-byte. */
 // prettier-ignore
 export type TypedArray = Int8Array | Uint8ClampedArray | Uint8Array |
@@ -216,6 +227,8 @@ export function mapCoder<T extends Record<string, string>>(obj: T): MapCoder<T> 
     direct: obj,
     reverse: r,
     encode(from: keyof T) {
+      if (typeof (from as unknown) !== 'string')
+        throw new TypeError('"from" expected string, got type=' + typeof from);
       if (obj[from] === undefined)
         throw new Error(
           `mapCoder: unknown element=${from.toString()} expected ${Object.keys(obj)}`
@@ -223,6 +236,8 @@ export function mapCoder<T extends Record<string, string>>(obj: T): MapCoder<T> 
       return obj[from];
     },
     decode(to: T[keyof T]) {
+      if (typeof to !== 'string')
+        throw new TypeError('"to" expected string, got type=' + typeof to);
       if (r[to] === undefined)
         throw new Error(`mapCoder: unknown element=${to} expected ${Object.keys(r)}`);
       return r[to];
@@ -270,6 +285,7 @@ export const chunks = <T>(a: readonly T[], size: number): T[][] => {
  * ```
  */
 export function chunkBytes(a: TArg<Uint8Array>, size: number): TRet<Uint8Array[]> {
+  if (!isBytes(a)) throw new TypeError('"a" expected Uint8Array, got type=' + typeof a);
   if (size <= 0) throw new RangeError('size must be > 0');
   const full = Math.floor(a.length / size); // number of full chunks (floor)
   const paddedChunkSize = Math.floor(a.length / full);
@@ -308,6 +324,8 @@ export function omit<T extends object, K extends keyof T>(
   obj: T,
   ...keys: readonly K[]
 ): Omit<T, K> {
+  if (!P.utils.isPlainObject(obj))
+    throw new TypeError('"obj" expected object, got type=' + typeof obj);
   return Object.fromEntries(Object.entries(obj).filter(([k]) => !keys.includes(k as K))) as Omit<
     T,
     K
@@ -359,15 +377,19 @@ export type Named<N extends readonly string[]> = {
  * ```
  */
 export const named = <const N extends string[]>(names: N): Named<N> => {
+  aarray(names, 'names');
   type K = N[number];
   return {
     encode<T>(lst: T[]): Record<K, T> {
+      aarray(lst, 'lst');
       if (lst.length !== names.length) throw new Error('arr size mismatch');
       const r = {} as Record<K, T>;
       for (let i = 0; i < names.length; i++) (r as any)[names[i]] = lst[i];
       return r;
     },
     decode<T>(obj: Record<K, T>): T[] {
+      if (!P.utils.isPlainObject(obj))
+        throw new TypeError(`"obj" expected object, got type=${typeof obj}`);
       const out = [];
       for (const n of names) out.push((obj as any)[n]);
       return out;
@@ -456,6 +478,7 @@ export function Dimensions<const D extends number[]>(...dims: D): DimensionsRes<
     }
   }
   const checkIdx = (idx: number[]): void => {
+    aarray(idx, 'idx');
     if (idx.length !== L) throw new Error('wrong number of dimensions');
     for (let i = 0; i < L; i++) {
       const v = idx[i] as number;
@@ -481,15 +504,19 @@ export function Dimensions<const D extends number[]>(...dims: D): DimensionsRes<
   } as const; // satisfies P.Coder<Index<D>, number>
   // Iterates all points (flat,index). This version uses decode; see fastIter below.
   const iter = (cb: (flat: number, idx: number[]) => void): void => {
+    if (typeof cb !== 'function')
+      throw new TypeError(`"cb" expected function, got type=${typeof cb}`);
     for (let i = 0; i < cardinality; i++) cb(i, flatKey.decode(i));
   };
   const getAt = <T>(obj: Nest<T, D>, keys: number[]): T => {
+    aarray(obj, 'obj');
     checkIdx(keys);
     let o: any = obj;
     for (let k = 0; k < L; k++) o = o[keys[k] as number];
     return o as T;
   };
   const setAt = <T>(obj: Nest<T, D>, keys: number[], value: T): void => {
+    aarray(obj, 'obj');
     checkIdx(keys);
     let o: any = obj;
     for (let k = 0; k < L - 1; k++) {
@@ -502,6 +529,7 @@ export function Dimensions<const D extends number[]>(...dims: D): DimensionsRes<
   };
   const flat = {
     encode<T>(x: Nest<T, D>): T[] {
+      aarray(x, 'x');
       const out: T[] = new Array(cardinality);
       iter((i, k) => {
         out[i] = getAt(x, k);
@@ -509,6 +537,7 @@ export function Dimensions<const D extends number[]>(...dims: D): DimensionsRes<
       return out;
     },
     decode<T>(lst: T[]): Nest<T, D> {
+      aarray(lst, 'lst');
       if (lst.length !== cardinality) throw new Error('lst.length');
       const out: any = [];
       iter((i, k) => {
@@ -554,6 +583,7 @@ export type NamedDimensionsRes<O extends Record<string, number>> = Omit<
 export function NamedDimensions<const O extends Record<string, number>>(
   o: O
 ): NamedDimensionsRes<O> {
+  if (!P.utils.isPlainObject(o)) throw new TypeError(`"o" expected object, got type=${typeof o}`);
   type K = keyof O & string;
 
   const names = Object.keys(o) as K[];
@@ -569,9 +599,14 @@ export function NamedDimensions<const O extends Record<string, number>>(
     ...d,
     key: keyNamed,
     iter: (cb: (flat: number, idx: NamedIndex<O>) => void) => {
+      if (typeof cb !== 'function')
+        throw new TypeError(`"cb" expected function, got type=${typeof cb}`);
       d.iter((flat, tIdx) => cb(flat, nd.encode<number>(tIdx as any) as NamedIndex<O>));
     },
     chunks<T>(name: K, lst: T[]) {
+      if (typeof name !== 'string')
+        throw new TypeError(`"name" expected string, got type=${typeof name}`);
+      aarray(lst, 'lst');
       const dim = names.indexOf(name);
       if (dim < 0) throw new Error('unknown dimension:' + name);
       return chunks(lst, dims[dim]);
@@ -640,6 +675,8 @@ export type ShapeCoder<T> = {
  * ```
  */
 export const Shape = <T>(isVal: (val: unknown) => val is T): ShapeCoder<T> => {
+  if (typeof isVal !== 'function')
+    throw new TypeError(`"isVal" expected function, got type=${typeof isVal}`);
   const isPlain = (o: unknown): o is Record<string, unknown> =>
     !!o && Object.getPrototypeOf(o) === Object.prototype;
   type Flat = T[];
@@ -670,6 +707,7 @@ export const Shape = <T>(isVal: (val: unknown) => val is T): ShapeCoder<T> => {
       return { shape: walkShape(input), flat };
     },
     encode<S>(shape: unknown, flat: readonly T[]): S {
+      aarray(flat, 'flat');
       const walkShape = (s: unknown): unknown => {
         if (typeof s === 'number' && Number.isInteger(s)) {
           if (s < 0 || s >= flat.length) throw new Error(`Index out of range: ${s}`);
@@ -864,7 +902,8 @@ export const Path: PathAPI = /* @__PURE__ */ deepFreeze({
     return token.slice(0, split);
   },
   decode(token: string): { path: number[]; mask: number } {
-    if (typeof token !== 'string') throw new Error(`Path.decode: wrong token ${token}`);
+    if (typeof token !== 'string')
+      throw new TypeError(`"token" expected string, got type=${typeof token}`);
     const hit = this.cache.decode.get(token);
     if (hit) return hit;
     const { split, mask } = this._scanSuffix(token);
@@ -2010,6 +2049,9 @@ export function splitU64(n: number): { l: number; h: number } {
  * ```
  */
 export function swapEndianness(v: DataView, is64: boolean) {
+  if (!(v instanceof DataView)) throw new TypeError(`"v" expected DataView, got type=${typeof v}`);
+  if (typeof is64 !== 'boolean')
+    throw new TypeError(`"is64" expected boolean, got type=${typeof is64}`);
   if (is64) {
     for (let i = 0; i < v.byteLength; i += 8) {
       const h = v.getUint32(i, false);
@@ -2070,7 +2112,10 @@ export const lcm = (a: number, b: number): number =>
  * gcdAll([12, 18, 30]);
  * ```
  */
-export const gcdAll = (xs: readonly number[]): number => xs.reduce((a, b) => gcd(a, b), 0);
+export const gcdAll = (xs: readonly number[]): number => {
+  aarray(xs, 'xs');
+  return xs.reduce((a, b) => gcd(a, b), 0);
+};
 
 /**
  * Computes the least common multiple of a list.
@@ -2082,7 +2127,10 @@ export const gcdAll = (xs: readonly number[]): number => xs.reduce((a, b) => gcd
  * lcmAll([3, 4, 6]);
  * ```
  */
-export const lcmAll = (xs: readonly number[]): number => xs.reduce((a, b) => lcm(a, b), 1);
+export const lcmAll = (xs: readonly number[]): number => {
+  aarray(xs, 'xs');
+  return xs.reduce((a, b) => lcm(a, b), 1);
+};
 
 /**
  * Interleaves equally sized arrays by position.

@@ -375,7 +375,10 @@ export type ScalarOf<N extends TypeName> = N extends `${infer P}x${number}`
  * ScalarOf('u32x4');
  * ```
  */
-export const ScalarOf = <T extends TypeName>(t: T): ScalarOf<T> => t.split('x')[0] as ScalarOf<T>;
+export const ScalarOf = <T extends TypeName>(t: T): ScalarOf<T> => {
+  if (typeof t !== 'string') throw new TypeError(`"t" expected string, got type=${typeof t}`);
+  return t.split('x')[0] as ScalarOf<T>;
+};
 
 /** SIMD lane count extracted from a type name. */
 export type LanesOf<N extends TypeName> = N extends `${string}x${infer L extends number}`
@@ -395,6 +398,8 @@ export type LanesOf<N extends TypeName> = N extends `${string}x${infer L extends
  * ```
  */
 export function lanesOf(type: TypeName): 1 | 2 | 4 | 8 | 16 {
+  if (typeof type !== 'string')
+    throw new TypeError(`"type" expected string, got type=${typeof type}`);
   if (type.endsWith('x16')) return 16;
   if (type.endsWith('x8')) return 8;
   if (type.endsWith('x4')) return 4;
@@ -413,6 +418,8 @@ export function lanesOf(type: TypeName): 1 | 2 | 4 | 8 | 16 {
  * ```
  */
 export const sizeof = (type: TypeName): number => {
+  if (typeof type !== 'string')
+    throw new TypeError(`"type" expected string, got type=${typeof type}`);
   // Required in runtime, otherwise would be: return TypeCoders[type].size!;
   return (TYPES[type].width / 8) * lanesOf(type);
 };
@@ -441,11 +448,14 @@ export const addLanes = (type: TypeName, lanes: number): SIMDType =>
  * minSimdType('u32');
  * ```
  */
-export const minSimdType = (type: TypeName): SIMDType =>
-  addLanes(
+export const minSimdType = (type: TypeName): SIMDType => {
+  if (typeof type !== 'string')
+    throw new TypeError(`"type" expected string, got type=${typeof type}`);
+  return addLanes(
     type,
     TYPES[type].width === 64 ? 2 : TYPES[type].width === 32 ? 4 : TYPES[type].width === 16 ? 8 : 16
   ) as SIMDType;
+};
 
 /**
  * Normalizes unsigned integer type names to their signed-width equivalent.
@@ -457,7 +467,10 @@ export const minSimdType = (type: TypeName): SIMDType =>
  * normSignedness('u32x4');
  * ```
  */
-export const normSignedness = (t: TypeName): TypeName => t.replace('u', 'i') as TypeName;
+export const normSignedness = (t: TypeName): TypeName => {
+  if (typeof t !== 'string') throw new TypeError(`"t" expected string, got type=${typeof t}`);
+  return t.replace('u', 'i') as TypeName;
+};
 
 /** Mask result type for comparisons over a source type. */
 export type MaskType<T extends TypeName> = T extends SIMDType
@@ -606,6 +619,7 @@ export const SIMDUtils: SIMDUtilsAPI = /* @__PURE__ */ utils.deepFreeze({
     return lane;
   },
   checkShufflePattern: (bytes: number, pattern: number[]) => {
+    utils.aarray(pattern, 'pattern');
     if (pattern.length !== bytes)
       throw new Error(`invalid SIMD shuffle pattern length: ${pattern.length}, expected ${bytes}`);
     for (const i of pattern) SIMDUtils.checkLane(bytes * 2, i);
@@ -613,6 +627,7 @@ export const SIMDUtils: SIMDUtilsAPI = /* @__PURE__ */ utils.deepFreeze({
   },
   // Convert lane pattern to byte pattern
   shuffleLanes: (laneSize: number, pattern: number[], bytes = 32) => {
+    utils.aarray(pattern, 'pattern');
     // Default is two v128 inputs: 2 * v128.size = 2 * 16 = 32 bytes.
     const x = utils.chunks(utils.seq(bytes), laneSize);
     return pattern.flatMap((i) => {
@@ -773,7 +788,11 @@ export const SIMDUtils: SIMDUtilsAPI = /* @__PURE__ */ utils.deepFreeze({
  * i32ToU32(-1);
  * ```
  */
-export const i32ToU32 = (x: number | bigint): bigint => BigInt.asUintN(32, BigInt(x));
+export const i32ToU32 = (x: number | bigint): bigint => {
+  if (typeof x !== 'number' && typeof x !== 'bigint')
+    throw new TypeError(`"x" expected number or bigint, got type=${typeof x}`);
+  return BigInt.asUintN(32, BigInt(x));
+};
 /**
  * Reinterprets a signed 64-bit value as unsigned.
  *
@@ -795,7 +814,11 @@ export const i64ToU64 = (x: number | bigint): bigint => BigInt.asUintN(64, BigIn
  * u32ToI32(0xffff_ffff);
  * ```
  */
-export const u32ToI32 = (x: number | bigint): bigint => BigInt.asIntN(32, BigInt(x));
+export const u32ToI32 = (x: number | bigint): bigint => {
+  if (typeof x !== 'number' && typeof x !== 'bigint')
+    throw new TypeError(`"x" expected number or bigint, got type=${typeof x}`);
+  return BigInt.asIntN(32, BigInt(x));
+};
 /**
  * Reinterprets an unsigned 64-bit value as signed.
  *
@@ -1396,6 +1419,7 @@ function genSIMDMask<T extends TypeName>(f: ModuleGraph, typeName: T): GetOpsFnO
   Object.assign(res, {
     maskCount: count,
     shuffleLanes: (lhs: FnOp, rhs: FnOp, pattern: number[]) => {
+      utils.aarray(pattern, 'pattern');
       for (const i of pattern)
         if (i < 0 || i >= 2 * count) throw new Error(`pattern OOB: ${i} not in [0, ${2 * count})`);
       const res = pattern.map((i) => Math.floor(i / count) * innerLanes + (i % count));
@@ -1522,6 +1546,9 @@ export function normRetType(type: RetType): WasmValueType[] {
  * ```
  */
 export function nodeRetType(f: ModuleGraph, op: FnOp): TypeName {
+  if (!P.utils.isPlainObject(f) || !('ops' in f))
+    throw new TypeError(`"f" expected ModuleGraph, got type=${typeof f}`);
+  if (!(op instanceof FnOp)) throw new TypeError(`"op" expected FnOp, got type=${typeof op}`);
   const node = as(f.ops.get(op.idx), 'op');
   let res = node.type;
   if (opsCompare.has(node.op)) return maskType(node.type);
@@ -1545,6 +1572,8 @@ export function nodeRetType(f: ModuleGraph, op: FnOp): TypeName {
  * ```
  */
 export function genRuntimeTypeMod(opts: { conversions?: boolean; casts?: boolean } = {}): Module {
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   const conversions = opts.conversions !== false;
   const casts = opts.casts !== false;
   const mod = new Module('runtimeTypes');

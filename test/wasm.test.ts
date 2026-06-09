@@ -12,7 +12,7 @@ function log(value) {
 function getWasm(code) {
   const mod = { functions: [] };
   const jsCode = js.wrapWASM(mod, code);
-  return js.exec(js.wrapModule(mod, jsCode, []).raw);
+  return js.exec(js.wrapModule(mod, jsCode, {}).raw);
 }
 function oneFn(...instructions) {
   return {

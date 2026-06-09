@@ -1,3 +1,4 @@
+import * as P from 'micro-packed';
 import { toJs, toWasm, type CompilerOpts } from './codegen.ts';
 import { genObject, type ImportEmbed } from './js.ts';
 import type { ArraySpec, FnDef, Scope, StructSpec, Val } from './module.ts';
@@ -87,6 +88,10 @@ for (let wid=0, curMask=mask, processed = 0, processedMask = 0; wid++, curMask>>
  * ```
  */
 export function addBatch(mod: Module, opts: CompilerOpts): Module<{}, {}> {
+  if (!(mod instanceof Module))
+    throw new TypeError(`"mod" expected Module, got type=${typeof mod}`);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   let res = mod.clone();
   for (const [name, fn] of Object.entries(mod.functions) as any) {
     if (!fn.batch) continue;
@@ -152,6 +157,10 @@ export function addBatch(mod: Module, opts: CompilerOpts): Module<{}, {}> {
  * ```
  */
 export function addThreads(mod: Module, opts: CompilerOpts): Module<WorkerMemory, WorkerFunctions> {
+  if (!(mod instanceof Module))
+    throw new TypeError(`"mod" expected Module, got type=${typeof mod}`);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   const prevFunctions = mod.functions as Record<string, any>;
   // Get stack size
   let STACK_SIZE = 1; // empty memory array not allowed
@@ -583,6 +592,14 @@ export function initWorkers(
   importEmbed: ImportEmbed,
   opts: CompilerOpts
 ): string {
+  if (typeof platform !== 'string')
+    throw new TypeError(`"platform" expected string, got type=${typeof platform}`);
+  if (platform !== 'js' && platform !== 'wasm')
+    throw new RangeError(`"platform" expected js or wasm, got ${platform}`);
+  if (importEmbed !== undefined && !P.utils.isPlainObject(importEmbed))
+    throw new TypeError(`"importEmbed" expected object, got type=${typeof importEmbed}`);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   if (!opts.useThreads) return '';
   let modInit = `const getInstance = (code, _imports)=>`;
   if (platform === 'wasm')

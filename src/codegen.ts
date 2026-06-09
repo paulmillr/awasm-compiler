@@ -75,6 +75,9 @@ type K = keyof NodeMap;
  */
 export function as<Ks extends readonly K[]>(n: Node, ...ks: Ks): NodeOf<Ks[number]>;
 export function as(n: Node, ...ks: K[]) {
+  if (!P.utils.isPlainObject(n)) throw new TypeError(`"n" expected node, got type=${typeof n}`);
+  for (const k of ks)
+    if (typeof k !== 'string') throw new TypeError(`"ks" expected string, got type=${typeof k}`);
   if (!ks.includes(n.kind as K)) throw new Error(`expected ${ks.join('|')}, got ${n.kind}`);
   return n; // typed via the generic overload
 }
@@ -89,8 +92,10 @@ export function as(n: Node, ...ks: K[]) {
  * is({ kind: 'module', name: 'm', opts: {}, memory: {}, nodes: [] }, 'module');
  * ```
  */
-export const is = <Ks extends readonly K[]>(n: Node, ...ks: Ks): n is NodeOf<Ks[number]> =>
-  ks.includes(n.kind as K);
+export const is = <Ks extends readonly K[]>(n: Node, ...ks: Ks): n is NodeOf<Ks[number]> => {
+  if (!P.utils.isPlainObject(n)) throw new TypeError(`"n" expected node, got type=${typeof n}`);
+  return ks.includes(n.kind as K);
+};
 /**
  * Checks whether a node is an operation, optionally restricted to operation names.
  *
@@ -107,6 +112,7 @@ export function isOp<const O extends readonly string[], N extends { kind: Node['
   ...ops: O
 ): n is N & NodeOf<'op'> & { op: O[number] } {
   // runtime check
+  if (!P.utils.isPlainObject(n)) throw new TypeError(`"n" expected node, got type=${typeof n}`);
   if ((n as any).kind !== 'op') return false;
   return ops.length === 0 ? true : (ops as readonly string[]).includes((n as any).op);
 }
@@ -124,7 +130,8 @@ export function isOp<const O extends readonly string[], N extends { kind: Node['
 export class FnOp {
   idx: NodeIdx;
   constructor(idx: NodeIdx) {
-    if (typeof idx !== 'string') throw new Error('FnOp: wrong idx=' + idx);
+    if (typeof idx !== 'string')
+      throw new TypeError(`"idx" expected string, got type=${typeof idx}`);
     this.idx = idx;
   }
   toString(): string {
@@ -594,6 +601,14 @@ export class ModuleGraph {
   types: ReturnType<typeof types.genTypes>;
   scope: ReturnType<typeof genScope>;
   constructor(name: string, memory: Memory, mod: Module, opts: CompilerOpts) {
+    if (typeof name !== 'string')
+      throw new TypeError(`"name" expected string, got type=${typeof name}`);
+    if (!P.utils.isPlainObject(memory))
+      throw new TypeError(`"memory" expected object, got type=${typeof memory}`);
+    if (!(mod instanceof Module))
+      throw new TypeError(`"mod" expected Module, got type=${typeof mod}`);
+    if (!P.utils.isPlainObject(opts))
+      throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
     this.ops = new utils.TreeDAG<Node>(
       { kind: 'module', name, nodes: [], memory, opts: {} },
       {
@@ -693,6 +708,12 @@ export class ModuleGraph {
   }
   // Ops
   op(type: TypeName, op: string, args: FnOp[], opts: Record<string, any> = {}): FnOp {
+    if (typeof type !== 'string')
+      throw new TypeError(`"type" expected string, got type=${typeof type}`);
+    if (typeof op !== 'string') throw new TypeError(`"op" expected string, got type=${typeof op}`);
+    utils.aarray(args, 'args');
+    if (!P.utils.isPlainObject(opts))
+      throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
     for (const a of args) {
       if (!(a instanceof FnOp)) {
         throw new Error('wrong arg: ' + typeof a);
@@ -709,12 +730,27 @@ export class ModuleGraph {
     opts: Omit<NodeMap[K], 'name' | 'kind' | 'nodes'>,
     cb: (t: this, idx: NodeIdx) => void
   ): NodeIdx {
+    if (typeof kind !== 'string')
+      throw new TypeError(`"kind" expected string, got type=${typeof kind}`);
+    if (typeof name !== 'string')
+      throw new TypeError(`"name" expected string, got type=${typeof name}`);
+    if (!P.utils.isPlainObject(opts))
+      throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
+    if (typeof cb !== 'function')
+      throw new TypeError(`"cb" expected function, got type=${typeof cb}`);
     const scopeIdx = this.ops.add({ kind, name, ...opts, nodes: [] } as NodeOf<K>);
     this.ops.scope(scopeIdx, () => cb(this, scopeIdx));
     return scopeIdx;
   }
   // dd
   addFn(name: string, fnDef: any): NodeIdx {
+    if (typeof name !== 'string')
+      throw new TypeError(`"name" expected string, got type=${typeof name}`);
+    if (!P.utils.isPlainObject(fnDef))
+      throw new TypeError(`"fnDef" expected object, got type=${typeof fnDef}`);
+    utils.aarray(fnDef.inputs, 'fnDef.inputs');
+    if (typeof fnDef.cb !== 'function')
+      throw new TypeError(`"fnDef.cb" expected function, got type=${typeof fnDef.cb}`);
     return this.subgraph(
       'function',
       name,
@@ -736,6 +772,8 @@ export class ModuleGraph {
     );
   }
   rewrite(opts: CompilerOpts) {
+    if (!P.utils.isPlainObject(opts))
+      throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
     const curRewrites: Record<string, utils.Rewrite<Node>> = {};
     const getRewrite = (x: rewrites.RewriteFn): utils.Rewrite<Node> => {
       const inner = x(this, opts);
@@ -1423,6 +1461,9 @@ function checkFn(fn: ModuleGraph, final = false) {
  * ```
  */
 export function toMod(m: Module<any, any>, opts: CompilerOpts = {}): LoweredModule {
+  if (!(m instanceof Module)) throw new TypeError(`"m" expected Module, got type=${typeof m}`);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   let mod = m.clone();
 
   let BATCH_SIZE = 1;
@@ -1531,6 +1572,9 @@ export function toMod(m: Module<any, any>, opts: CompilerOpts = {}): LoweredModu
  * ```
  */
 export function toWasm(m: Module, opts: CompilerOpts = {}): ReturnType<typeof js.wrapModule> {
+  if (!(m instanceof Module)) throw new TypeError(`"m" expected Module, got type=${typeof m}`);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   opts = { ...DefaultOpts, ...DefaultOptsWASM, ...opts };
   const { wasmMod, memory, importEmbed } = toMod(m, opts);
   // console.dir(wasmMod.functions, { depth: null, maxArrayLength: null });
@@ -1556,6 +1600,9 @@ export function toWasm(m: Module, opts: CompilerOpts = {}): ReturnType<typeof js
  * ```
  */
 export function toJs(m: Module, opts: CompilerOpts = {}): ReturnType<typeof js.wrapModule> {
+  if (!(m instanceof Module)) throw new TypeError(`"m" expected Module, got type=${typeof m}`);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   opts = { ...DefaultOpts, ...DefaultOptsJS, ...opts };
   const { wasmMod, memory, importEmbed } = toMod(m, opts);
   // console.dir(wasmMod.functions, { depth: null, maxArrayLength: null });

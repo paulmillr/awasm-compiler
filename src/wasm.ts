@@ -1,6 +1,6 @@
 import type { TRet } from '@scure/base';
 import * as P from 'micro-packed';
-import { deepFreeze } from './utils.ts';
+import { aarray, deepFreeze } from './utils.ts';
 
 const _0n = /* @__PURE__ */ BigInt(0);
 type TypeVal = 'void' | 'i32' | 'i64' | 'f32' | 'f64' | 'v128';
@@ -761,6 +761,8 @@ export type WasmMemoryOpts = {
  * ```
  */
 export function wasmMemoryOpts(mod: WasmModule): WasmMemoryOpts {
+  if (!P.utils.isPlainObject(mod))
+    throw new TypeError(`"mod" expected object, got type=${typeof mod}`);
   const toPages = (bytes: number) => BigInt(Math.ceil(bytes / 2 ** 16)); // wasm can only consume 64kb pages
   const modMemory = mod.memory || { size: 0 };
   const opts: WasmMemoryLimits = {
@@ -790,6 +792,9 @@ export function wasmMemoryOpts(mod: WasmModule): WasmMemoryOpts {
  * ```
  */
 export function createWasm(mod: WasmModule): TRet<Uint8Array> {
+  if (!P.utils.isPlainObject(mod))
+    throw new TypeError(`"mod" expected object, got type=${typeof mod}`);
+  aarray(mod.functions, 'mod.functions');
   const { modMemory, opts: mem } = wasmMemoryOpts(mod);
   const envModule = 'env'; // always env for simplicity
   // Re-use same types (useful for blocks/loops with fallthrough)

@@ -1,7 +1,8 @@
 import { base64, hex, type TArg } from '@scure/base';
+import * as P from 'micro-packed';
 import type { CompilerOpts } from './codegen.ts';
 import type { MemOpts } from './memory.ts';
-import { chunks, type ElementOf } from './utils.ts';
+import { aarray, chunks, type ElementOf } from './utils.ts';
 import { wasmMemoryOpts, type WasmModule } from './wasm.ts';
 import { initWorkers } from './workers.ts';
 
@@ -40,6 +41,8 @@ class Stack extends Array<string> {
  * ```
  */
 export function genObject(obj: Record<string, any>, deep = true): string {
+  if (!P.utils.isPlainObject(obj))
+    throw new TypeError('"obj" expected object, got type=' + typeof obj);
   const res = Object.entries(obj)
     .map(([k, v]) => {
       // `__proto__:` is a prototype setter in object literals, even when the key is quoted.
@@ -100,6 +103,10 @@ function memSegment(name: string, s: MemOpts, opts: CompilerOpts = {}) {
  * ```
  */
 export function memViews(segments: Segments, opts: CompilerOpts = {}): Record<string, string> {
+  if (!P.utils.isPlainObject(segments))
+    throw new TypeError('"segments" expected object, got type=' + typeof segments);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError('"opts" expected object, got type=' + typeof opts);
   const res: Record<string, string> = {};
   for (const [name, s] of Object.entries(segments)) Object.assign(res, memSegment(name, s, opts));
   return res;
@@ -1341,6 +1348,13 @@ export function createJS(
   importEmbed: ImportEmbed,
   opts: CompilerOpts = {}
 ): string {
+  if (!P.utils.isPlainObject(mod))
+    throw new TypeError(`"mod" expected object, got type=${typeof mod}`);
+  aarray(mod.functions, 'mod.functions');
+  if (importEmbed !== undefined && !P.utils.isPlainObject(importEmbed))
+    throw new TypeError(`"importEmbed" expected object, got type=${typeof importEmbed}`);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   const modMemory = mod.memory || { size: 0 };
   const bufType = `${modMemory.shared ? 'Shared' : ''}ArrayBuffer`;
   // JS output consumes compiler-normalized instructions, not arbitrary
@@ -1433,6 +1447,12 @@ export function wrapWASM(
   importEmbed: ImportEmbed,
   opts: CompilerOpts = {}
 ): string {
+  if (!P.utils.isPlainObject(mod))
+    throw new TypeError(`"mod" expected object, got type=${typeof mod}`);
+  if (importEmbed !== undefined && !P.utils.isPlainObject(importEmbed))
+    throw new TypeError(`"importEmbed" expected object, got type=${typeof importEmbed}`);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   const wasmMem = (mod: WasmModule) => {
     const { opts } = wasmMemoryOpts(mod);
     return `new WebAssembly.Memory(${genObject({ initial: opts.initial, maximum: opts.maximum, shared: opts.flags.shared })})`;
@@ -1493,6 +1513,17 @@ export function wrapModule(
   importEmbed: ImportEmbed,
   opts: CompilerOpts = {}
 ): WrappedModule {
+  if (!P.utils.isPlainObject(mod))
+    throw new TypeError(`"mod" expected object, got type=${typeof mod}`);
+  aarray(mod.functions, 'mod.functions');
+  if (typeof code !== 'string')
+    throw new TypeError(`"code" expected string, got type=${typeof code}`);
+  if (!P.utils.isPlainObject(segments))
+    throw new TypeError(`"segments" expected object, got type=${typeof segments}`);
+  if (importEmbed !== undefined && !P.utils.isPlainObject(importEmbed))
+    throw new TypeError(`"importEmbed" expected object, got type=${typeof importEmbed}`);
+  if (!P.utils.isPlainObject(opts))
+    throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
   const embed = importEmbed || {};
   const hasCustomEmbeddedImport = Object.keys(embed).some((k) => k !== 'env');
   // Custom embedded import modules must merge like env; otherwise caller-provided

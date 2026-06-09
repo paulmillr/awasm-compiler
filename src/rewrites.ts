@@ -220,6 +220,9 @@ function loweringUtils(
  * ```
  */
 export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 64): Rewrite {
+  if (typeof bits !== 'number')
+    throw new TypeError(`"bits" expected number, got type=${typeof bits}`);
+  if (!Number.isSafeInteger(bits)) throw new RangeError(`"bits" expected integer, got ${bits}`);
   if (![64, 128, 256].includes(bits)) throw new Error(`lowerWideInt: unsupported width ${bits}`);
   const wordBits = bits / 2;
   const wordBytes = wordBits / 8;

@@ -14,7 +14,7 @@ import type {
   ScalarType,
   TypeName,
 } from './types.ts'; // Can import only types here!
-import type { ND } from './utils.ts';
+import { aarray, type ND } from './utils.ts';
 
 /** Shift mask value used by integer shift operations. */
 export type ShiftMask = Val<'u32'>;
@@ -648,7 +648,12 @@ type BatchOpts = { lanes: number; perThread?: number };
 
 /** Public function return type specifier. */
 export type RetType = TypeName | readonly TypeName[] | 'void';
+const checkName = (name: string) => {
+  if (typeof name !== 'string')
+    throw new TypeError(`"name" expected string, got type=${typeof name}`);
+};
 const checkFnName = (name: string) => {
+  checkName(name);
   // Wrappers always expose memory and segments, so functions cannot safely use those public names.
   if (name === 'memory' || name === 'segments') throw new Error('reserved function name: ' + name);
 };
@@ -669,6 +674,8 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
   readonly memory: M;
   readonly functions: F;
   constructor(name: string) {
+    if (typeof name !== 'string')
+      throw new TypeError(`"name" expected string, got type=${typeof name}`);
     this.name = name;
     this.memory = {} as any;
     this.functions = {} as any;
@@ -676,12 +683,15 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
   use<NM extends Segs, NF extends FnRegistry>(
     f: (m: Module<M, F>) => Module<NM, NF>
   ): Module<NM, NF> {
+    if (typeof f !== 'function')
+      throw new TypeError(`"f" expected function, got type=${typeof f}`);
     return f(this);
   }
   mem<Name extends string, Spec extends ArraySpec | StructSpec>(
     name: Name,
     spec: Spec
   ): Module<M & { [K in Name]: Spec }, F> {
+    checkName(name);
     if ((this as any).memory[name]) throw new Error('array already exists:' + name);
     (this as any).memory[name] = spec as any;
     return this as any;
@@ -690,6 +700,7 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
     name: Name,
     spec: Spec
   ): Module<M & { [K in Name]: CollapseArray<Spec, [number]> & { batch: true } }, F> {
+    checkName(name);
     if ((this as any).memory[name]) throw new Error('array already exists:' + name);
     (this as any).memory[name] = { ...spec, opts: { ...spec.opts, batch: true } } as any;
     return this as any;
@@ -714,6 +725,9 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
     module?: string
   ): Module<M, F & { [P in Name]: FnDef<In, ReturnType<CB>> & { out: Out } }> {
     checkFnName(name);
+    aarray(inputs, 'inputs');
+    if (module !== undefined && typeof module !== 'string')
+      throw new TypeError(`"module" expected string, got type=${typeof module}`);
     if (this.functions[name]) throw new Error('function already exists:' + name);
     this.functions[name] = { inputs, outputs, cb, module, import: true } as any;
     return this as any;
@@ -730,6 +744,9 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
     cb: CB
   ): Module<M, F & { [P in Name]: FnDef<In, ReturnType<CB>> }> {
     checkFnName(name);
+    aarray(inputs, 'inputs');
+    if (typeof cb !== 'function')
+      throw new TypeError(`"cb" expected function, got type=${typeof cb}`);
     if (this.functions[name]) throw new Error('function already exists:' + name);
     this.functions[name] = { inputs, outputs, cb } as any;
     return this as any;
@@ -758,6 +775,9 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
     cb: CB
   ): Module<M, F & { [P in Name]: FnDef<In, ReturnType<CB>> }> {
     checkFnName(name);
+    aarray(inputs, 'inputs');
+    if (typeof cb !== 'function')
+      throw new TypeError(`"cb" expected function, got type=${typeof cb}`);
     if (this.functions[name]) throw new Error('function already exists:' + name);
     if (!Number.isSafeInteger(opts.lanes) || opts.lanes < 1)
       throw new Error(`batch function opts: wrong lanes: ${opts.lanes}`);
