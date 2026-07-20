@@ -779,10 +779,13 @@ type PathAPI = {
     noFlags: Map<string, string>;
   };
   encode(path: number[], mask?: number): string;
+  _encode(path: number[], mask?: number): string;
   _scanSuffix(token: string): PathScan;
   _flagsSuffix(mask: number): string;
   _setFlagsOnBase(base: string, mask: number): string;
   _base(token: string): string;
+  _depth(token: string): number;
+  _hasFlag(token: string, flag: string): boolean;
   decode(token: string): PathDecoded;
   getFlags(flags: string[]): number;
   addFlags(token: string, toAdd?: number): string;
@@ -856,10 +859,7 @@ export const Path: PathAPI = /* @__PURE__ */ deepFreeze({
     parent: /* @__PURE__ */ new Map() as Map<string, PathParent>,
     noFlags: /* @__PURE__ */ new Map() as Map<string, string>,
   },
-  encode(path: number[], mask: number = 0): string {
-    if (!Array.isArray(path)) throw new Error('Path.encode: path must be non-empty number[]');
-    for (const n of path)
-      if (!Number.isSafeInteger(n) || n < 0) throw new Error('Path.encode: bad segment');
+  _encode(path: number[], mask: number = 0): string {
     const base = path.join('.');
     if (!mask) return base;
     // canonical order = insertion order of short->long mapping
@@ -868,7 +868,15 @@ export const Path: PathAPI = /* @__PURE__ */ deepFreeze({
       if (this.bs.has(mask, (this.flags.direct as any)[k])) fstr += k;
     return base + fstr;
   },
+  encode(path: number[], mask: number = 0): string {
+    if (!Array.isArray(path)) throw new Error('Path.encode: path must be non-empty number[]');
+    for (const n of path)
+      if (!Number.isSafeInteger(n) || n < 0) throw new Error('Path.encode: bad segment');
+    return this._encode(path, mask);
+  },
   _scanSuffix(token: string): { split: number; mask: number } {
+    const last = token[token.length - 1];
+    if (last !== 'w' && last !== 's') return { split: token.length, mask: this.bs.ZERO };
     let i = token.length;
     let mask = this.bs.ZERO;
     const direct = this.flags.direct as Record<string, string>; // short -> long
@@ -900,6 +908,16 @@ export const Path: PathAPI = /* @__PURE__ */ deepFreeze({
   _base(token: string): string {
     const { split } = this._scanSuffix(token);
     return token.slice(0, split);
+  },
+  _depth(token: string): number {
+    const { split } = this._scanSuffix(token);
+    if (!split) return 0;
+    let res = 1;
+    for (let i = 0; i < split; i++) if (token[i] === '.') res++;
+    return res;
+  },
+  _hasFlag(token: string, flag: string) {
+    return this.bs.has(this._scanSuffix(token).mask, flag as any);
   },
   decode(token: string): { path: number[]; mask: number } {
     if (typeof token !== 'string')
@@ -953,14 +971,7 @@ export const Path: PathAPI = /* @__PURE__ */ deepFreeze({
     if (hit) return hit;
     const { split, mask } = this._scanSuffix(token);
     if (split === 0) throw new Error('Path.parent: root has no parent'); // only '' case
-    // find last '.' inside base
-    let dot = -1;
-    for (let i = split - 1; i >= 0; i--) {
-      if (token[i] === '.') {
-        dot = i;
-        break;
-      }
-    }
+    const dot = token.lastIndexOf('.', split - 1);
     let parent: string, current: number;
     if (dot < 0) {
       // top-level like '3[w|s]*'
@@ -1016,11 +1027,10 @@ export const Path: PathAPI = /* @__PURE__ */ deepFreeze({
   // Self is not parent of itself.
   // TODO: pretty much child.startsWith(parent), but '45.1 vs 45.19'
   isParent(parent: string, child: string): boolean {
-    const pa = this.decode(parent).path;
-    const pb = this.decode(child).path;
-    if (pa.length >= pb.length) return false; // strict
-    for (let i = 0; i < pa.length; i++) if (pa[i] !== pb[i]) return false;
-    return true;
+    const p = this._base(parent);
+    const c = this._base(child);
+    if (p === '') return c !== '';
+    return c.length > p.length && c.startsWith(p) && c[p.length] === '.';
   },
   // Returns true if all paths has same "base":
   // - '1, 2, 3.1.2.3', but not '1.2, 2.3, 3.4'
@@ -1034,13 +1044,17 @@ export const Path: PathAPI = /* @__PURE__ */ deepFreeze({
     return true;
   },
   mapParent(oldParent: string, newParent: string, child: string): string {
-    const oldPath = this.decode(oldParent).path;
-    const newPath = this.decode(newParent).path;
-    const { path: childPath, mask } = this.decode(child);
-    let ok = oldPath.length <= childPath.length;
-    for (let i = 0; ok && i < oldPath.length; i++) ok = oldPath[i] === childPath[i];
-    if (!ok) throw new Error(`wrong child=${child} (old=${oldParent} new=${newParent})`);
-    return this.encode([...newPath, ...childPath.slice(oldPath.length)], mask);
+    const oldBase = this._base(oldParent);
+    const newBase = this._base(newParent);
+    const { split, mask } = this._scanSuffix(child);
+    const childBase = child.slice(0, split);
+    if (oldBase && childBase !== oldBase && !childBase.startsWith(oldBase + '.'))
+      throw new Error(`wrong child=${child} (old=${oldParent} new=${newParent})`);
+    let suffix = childBase;
+    if (oldBase) suffix = childBase === oldBase ? '' : childBase.slice(oldBase.length + 1);
+    // Mapping into root must not retain the separator that followed the old parent.
+    const base = newBase && suffix ? `${newBase}.${suffix}` : newBase || suffix;
+    return this._setFlagsOnBase(base, mask);
   },
   normDepth(cur: string, n: string): string {
     const c = Path.decode(cur);
@@ -1052,10 +1066,10 @@ export const Path: PathAPI = /* @__PURE__ */ deepFreeze({
     if (i === olen) return n; // n is ancestor or same
     if (i === clen && clen < olen)
       // cur is ancestor of n
-      return Path.encode(o.path.slice(0, clen), o.mask);
+      return Path._encode(o.path.slice(0, clen), o.mask);
     // diverged somewhere before the end of either path:
     // normalize n to its node just under the divergence (e.g., 55.32 from 55.32.163)
-    return Path.encode(o.path.slice(0, i + 1), o.mask);
+    return Path._encode(o.path.slice(0, i + 1), o.mask);
   },
   hasFlag(idx: string, flag: string) {
     const res = Path.decode(idx);
@@ -1089,6 +1103,7 @@ export type TreeMapping = Map<string, string>;
 const EMPTY_MAP: TreeMapping = /* @__PURE__ */ new Map();
 /** Callback used by graph rewrite passes to replace one node path with another. */
 export type Rewrite<T> = (node: TreeNode<T>, idx: string) => string | undefined;
+type AddCacheMatch<T> = (node: TreeNode<T>, idx: string) => boolean;
 /** Callback bag that tells `TreeDAG` how to inspect and rewrite user node payloads. */
 export type TreeDAGOpts<T> = {
   /**
@@ -1132,6 +1147,14 @@ export type TreeDAGOpts<T> = {
    * @returns Flag names or empty slots.
    */
   getFlags: (node: TreeNode<T>) => (string | undefined)[];
+  /**
+   * Returns a construction-cache key for nodes that should be unique within one subgraph scope.
+   *
+   * @param node - Node whose construction identity is inspected.
+   * @param idx - Current or predicted path of the node.
+   * @returns Scope-local construction key or `undefined` when the node is not cacheable.
+   */
+  getAddKey?: (node: TreeNode<T>, idx: string) => string | undefined;
 };
 /**
  * Core compiler graph structure for nested directed acyclic graphs.
@@ -1156,9 +1179,13 @@ export class TreeDAG<T> {
   opts: TreeDAGOpts<T>;
   root: TreeNode<T>;
   stack: string[]; // we are cursor at same time to simplify '.add'
+  private stackNodes: TreeNode<T>[];
   stableId = 0;
+  version = 0;
+  toposortType: 'tiers' | 'alap' | 'default' = 'default';
   usedBy: Map<string, Set<string>>;
   usedWeak: Map<string, Set<string>>;
+  addCache: Map<string, Map<string, string>>;
   cache: {
     edges: Map<string, Set<string>>;
     edgesRec: Map<string, Set<string>>;
@@ -1166,19 +1193,53 @@ export class TreeDAG<T> {
   };
   debug: boolean;
   private dirtyScopes: Set<string>;
+  private dirtyAddScopes: Set<string>;
   constructor(root: TreeNode<T>, opts: TreeDAGOpts<T>) {
     this.root = root;
     this.opts = opts;
     this.stack = [''];
+    this.stackNodes = [this.root];
     this.usedBy = new Map();
     this.usedWeak = new Map();
+    this.addCache = new Map();
     this.debug = false;
     this.dirtyScopes = new Set();
+    this.dirtyAddScopes = new Set();
     this.cache = {
       edges: new Map(),
       edgesRec: new Map(),
       flags: new Map(),
     };
+  }
+  private removeCachedAdd(idx: string) {
+    for (const scope of this.addCache.values()) {
+      for (const [key, val] of scope) if (val === idx) scope.delete(key);
+    }
+  }
+  private dirtyAddScope(idx: string) {
+    this.addCache.delete(idx);
+    this.dirtyAddScopes.add(idx);
+  }
+  private dirtyAddParent(idx: string) {
+    if (idx === '') return;
+    this.dirtyAddScope(Path.parent(idx).parent);
+  }
+  private rebuildAddCache(parentIdx: string, current?: TreeNode<T>) {
+    const sg = current || this.get(parentIdx);
+    if (!this.isSubgraph(sg)) throw new Error('add: current path is not a subgraph');
+    const scoped = new Map<string, string>();
+    if (this.opts.getAddKey) {
+      for (let i = 0; i < sg.nodes.length; i++) {
+        const child = sg.nodes[i];
+        if (child === undefined) continue;
+        const idx = parentIdx ? `${parentIdx}.${i}` : `${i}`;
+        const key = this.opts.getAddKey(child, idx);
+        if (key === undefined || scoped.has(key)) continue;
+        scoped.set(key, idx);
+      }
+    }
+    this.addCache.set(parentIdx, scoped);
+    return { scoped };
   }
   private isSubgraph(node: TreeNode<T>): node is Subgraph<T> {
     return node.nodes && Array.isArray(node.nodes) ? true : false;
@@ -1204,7 +1265,7 @@ export class TreeDAG<T> {
       cur = cur.nodes![i]!;
       if (cur === undefined && !allowEmpty)
         throw new Error(`get: removed node at ${path.slice(0, depth + 1).join('/')}`);
-      stack.push({ idx: Path.encode(path.slice(0, depth + 1)), node: cur });
+      stack.push({ idx: Path._encode(path.slice(0, depth + 1)), node: cur });
     }
     return stack;
   }
@@ -1234,6 +1295,9 @@ export class TreeDAG<T> {
     const res = this.getPath(path, false, true);
     return res !== undefined;
   }
+  private getMaybe(idx: string): TreeNode<T> | undefined {
+    return this.getPath(Path.decode(idx).path, false, true);
+  }
   get(idx: string): TreeNode<T> {
     const { path } = Path.decode(idx);
     return this.getPath(path);
@@ -1243,16 +1307,27 @@ export class TreeDAG<T> {
     return this.getPathStack(path);
   }
   enter(idx: string) {
-    if (!this.isSubgraph(this.get(idx))) throw new Error('enter: target is not a subgraph: ' + idx);
+    const node = this.get(idx);
+    if (!this.isSubgraph(node)) throw new Error('enter: target is not a subgraph: ' + idx);
     this.stack.push(idx);
+    this.stackNodes.push(node);
   }
   exit() {
     this.stack.pop();
-    if (!this.stack.length) throw new Error('empty stack (already at root)');
+    this.stackNodes.pop();
+    if (!this.stack.length || !this.stackNodes.length)
+      throw new Error('empty stack (already at root)');
   }
   scope(idx: string, cb: () => void) {
     this.enter(idx);
     // If graph construction fails, the tree is not restartable; keep the stack for debugging.
+    cb();
+    this.exit();
+  }
+  private scopeKnown(idx: string, node: TreeNode<T>, cb: () => void) {
+    if (!this.isSubgraph(node)) throw new Error('enter: target is not a subgraph: ' + idx);
+    this.stack.push(idx);
+    this.stackNodes.push(node);
     cb();
     this.exit();
   }
@@ -1264,11 +1339,12 @@ export class TreeDAG<T> {
   }
   private onAdd(idx: string, node?: TreeNode<T>, edges?: (string | undefined)[], markDirty = true) {
     if (!node && !edges) throw new Error('onRemove: need node or edges');
+    this.version++;
     const raw = edges ? edges : this.opts.getEdges(node!, idx);
     //console.log('onAdd', idx, node);
     for (const e of raw) {
       if (typeof e !== 'string') continue;
-      const isWeak = Path.hasFlag(e, 'weak');
+      const isWeak = Path._hasFlag(e, 'weak');
       const edge = Path.stripFlags(e);
       const cache = isWeak ? this.usedWeak : this.usedBy;
       let s = cache.get(edge);
@@ -1289,15 +1365,16 @@ export class TreeDAG<T> {
       let i = 0;
       const n = Math.min(src.length, dst.length);
       while (i < n && src[i] === dst[i]) i++;
-      this.dirtyScopes.add(Path.encode(src.slice(0, i)));
+      this.dirtyScopes.add(Path._encode(src.slice(0, i)));
     }
   }
   private onRemove(idx: string, node?: TreeNode<T>, edges?: (string | undefined)[]) {
     if (!node && !edges) throw new Error('onRemove: need node or edges');
+    this.version++;
     const raw = edges ? edges : this.opts.getEdges(node!, idx);
     for (const e of raw) {
       if (typeof e !== 'string') continue;
-      const isWeak = Path.hasFlag(e, 'weak');
+      const isWeak = Path._hasFlag(e, 'weak');
       const edge = Path.stripFlags(e);
       const cache = isWeak ? this.usedWeak : this.usedBy;
       const s = cache.get(edge);
@@ -1306,19 +1383,43 @@ export class TreeDAG<T> {
     this.invalidateEdgeCaches(idx);
   }
   // /Cache hooks
-  add(node: TreeNode<T>, parent?: string): string {
-    const path = Path.decode(parent ? parent : this.stack[this.stack.length - 1]).path;
-    const sg = this.getPath(path, true);
+  add(node: TreeNode<T>, parent?: string, key?: string, isMatch?: AddCacheMatch<T>): string {
+    const parentIdx = parent ? parent : this.stack[this.stack.length - 1];
+    // Hot construction calls add to the current scope; keep the node on the stack to avoid
+    // decoding and walking the same parent path for every op in large generated modules.
+    const sg = parent
+      ? this.getPath(Path.decode(parentIdx).path, true)
+      : this.stackNodes[this.stackNodes.length - 1];
     if (!this.isSubgraph(sg)) throw new Error('add: current path is not a subgraph');
+    const idx = parentIdx ? `${parentIdx}.${sg.nodes.length}` : `${sg.nodes.length}`;
+    // Direct add sites participate in construction CSE too; otherwise rewrite helpers can bypass it.
+    const addKey = key === undefined ? this.opts.getAddKey?.(node, idx) : key;
+    if (addKey !== undefined) {
+      const rebuilt = this.dirtyAddScopes.has(parentIdx)
+        ? this.rebuildAddCache(parentIdx, sg)
+        : undefined;
+      if (rebuilt) this.dirtyAddScopes.delete(parentIdx);
+      const scoped = rebuilt?.scoped || this.addCache.get(parentIdx);
+      const cached = scoped?.get(addKey);
+      const cachedNode = cached === undefined ? undefined : this.getMaybe(cached);
+      if (cachedNode !== undefined && (!isMatch || isMatch(cachedNode, cached!))) return cached!;
+      if (cached !== undefined) scoped!.delete(addKey);
+    }
     //if (node.opts) node.opts.stableId = this.stableId++;
     //    const idx = Path.encode([...path, sg.nodes.push(Object.freeze(node)) - 1]);
-    const idx = Path.encode([...path, sg.nodes.push(node) - 1]);
+    sg.nodes.push(node);
     this.onAdd(idx, node);
+    if (addKey !== undefined) {
+      let scoped = this.addCache.get(parentIdx);
+      if (!scoped) this.addCache.set(parentIdx, (scoped = new Map()));
+      scoped.set(addKey, idx);
+    }
     return idx;
   }
   set(idx: string, node: TreeNode<T>): void {
     const oldNode = this.get(idx);
     this.onRemove(idx, oldNode);
+    this.removeCachedAdd(idx);
     this.onAdd(idx, node);
     if (!idx) {
       Object.assign(this.root, node);
@@ -1335,6 +1436,7 @@ export class TreeDAG<T> {
     if (!this.isSubgraph(parent)) throw new Error('set: parent is not a subgraph');
     const node = this.get(idx);
     this.onRemove(idx, node);
+    this.removeCachedAdd(idx);
     this.usedBy.delete(idx);
     this.usedWeak.delete(idx);
     parent.nodes[current] = undefined;
@@ -1345,6 +1447,9 @@ export class TreeDAG<T> {
     const res = new TreeDAG<T>(deepClone(this.root), this.opts);
     res.usedBy = deepClone(this.usedBy);
     res.usedWeak = deepClone(this.usedWeak);
+    res.addCache = deepClone(this.addCache);
+    res.dirtyAddScopes = deepClone(this.dirtyAddScopes);
+    res.toposortType = this.toposortType;
     return res;
   }
   // Iterate from optional start token (absolute). Default = root.
@@ -1352,19 +1457,16 @@ export class TreeDAG<T> {
   //  - if node is subgraph: stack == node's path (add -> inside it)
   //  - else (leaf):         stack == parent path (add -> siblings)
   iter(cb: (node: TreeNode<T>, idx: string) => true | void, idx?: string, recursive = true): void {
-    const walk = (node: TreeNode<T>, path: number[]) => {
-      const curPath = Path.encode(path);
+    const walk = (node: TreeNode<T>, curPath: string) => {
       const ret = cb(node, curPath);
       if (!ret && recursive && this.isSubgraph(node)) {
         const arr = node.nodes;
         const L = arr.length; // snapshot
-        this.scope(curPath, () => {
+        this.scopeKnown(curPath, node, () => {
           for (let i = 0; i < L; i++) {
             const child = arr[i];
             if (!child) continue;
-            path.push(i); // mutate
-            walk(child, path); // reuse
-            path.pop(); // undo
+            walk(child, curPath ? `${curPath}.${i}` : `${i}`);
           }
         });
       }
@@ -1372,9 +1474,7 @@ export class TreeDAG<T> {
     this.scope(idx ? Path.parent(idx).parent : '', () => {
       const startPath = idx ? Path.decode(idx).path : [];
       const start = this.getPath(startPath, /*allowRoot=*/ true);
-      // NOTE: walk mutates 'path', so pass the same instance
-      const pathBuf = startPath.slice(0);
-      walk(start, pathBuf);
+      walk(start, idx ? Path.stripFlags(idx) : '');
     });
   }
   format(cb?: (node: TreeNode<T>, idx: string) => boolean): string {
@@ -1399,7 +1499,7 @@ export class TreeDAG<T> {
           const e = raw[i];
           if (typeof e !== 'string') continue;
           const base = Path.stripFlags(e);
-          const isWeak = Path.hasFlag(e, 'weak') ? 1 : 2;
+          const isWeak = Path._hasFlag(e, 'weak') ? 1 : 2;
           const prev = byBase.get(base) || 0;
           if (isWeak > prev) byBase.set(base, isWeak); // keep strongest
         }
@@ -1413,7 +1513,7 @@ export class TreeDAG<T> {
       }
       if (!includeWeak) {
         const strongOnly = new Set<string>();
-        for (const tok of merged) if (!Path.hasFlag(tok, 'weak')) strongOnly.add(tok);
+        for (const tok of merged) if (!Path._hasFlag(tok, 'weak')) strongOnly.add(tok);
         return strongOnly;
       }
       return merged;
@@ -1439,7 +1539,7 @@ export class TreeDAG<T> {
       }
       if (!includeWeak) {
         const strongOnly = new Set<string>();
-        for (const tok of merged) if (!Path.hasFlag(tok, 'weak')) strongOnly.add(tok);
+        for (const tok of merged) if (!Path._hasFlag(tok, 'weak')) strongOnly.add(tok);
         return strongOnly;
       }
       return merged;
@@ -1477,7 +1577,7 @@ export class TreeDAG<T> {
       const edges = this.opts.getEdges(node, idx);
       for (const e of edges) {
         if (e === undefined) continue;
-        const used = Path.hasFlag(e, 'weak') ? usedWeak : usedBy;
+        const used = Path._hasFlag(e, 'weak') ? usedWeak : usedBy;
         const edge = Path.stripFlags(e);
         let cur = used.get(edge);
         if (cur === undefined) {
@@ -1608,7 +1708,7 @@ export class TreeDAG<T> {
       const d = Path.decode(i);
       const base = Path.stripFlags(i);
       const mask = d.mask;
-      const isWeak = Path.hasFlag(i, 'weak');
+      const isWeak = Path._hasFlag(i, 'weak');
 
       let m = mapping.get(base);
       if (m === undefined) {
@@ -1655,6 +1755,8 @@ export class TreeDAG<T> {
       const cur = mapping.get(k) as string;
       affected.add(cur);
       affected.add(Path.parent(cur).parent);
+      this.dirtyAddParent(k);
+      this.dirtyAddParent(cur);
     }
     type Op = {
       oldUser: string;
@@ -1664,6 +1766,7 @@ export class TreeDAG<T> {
     };
     const ops: Op[] = [];
     for (const idx of affected) {
+      this.dirtyAddParent(idx);
       const node = this.get(idx);
       // detect renumber – we must move memberships even if edges are same
       const oldUser = inv.get(idx) || idx;
@@ -1706,7 +1809,7 @@ export class TreeDAG<T> {
     // collect raw edges per top child (no merge/sort yet)
     const rawByTop: Map<number, Set<string>> = new Map();
     const walk = (n: TreeNode<T>, path: number[], top: number) => {
-      const curPath = Path.encode(path);
+      const curPath = Path._encode(path);
       // collect this node's own edges (non-recursive)
       const raw = this.opts.getEdges(n, curPath);
       for (let k = 0; k < raw.length; k++) {
@@ -1716,7 +1819,7 @@ export class TreeDAG<T> {
         if (p.parent !== idx) continue;
         const edgeIdx = p.current;
         if (node.nodes[edgeIdx] === undefined) {
-          if (Path.hasFlag(e, 'weak')) continue;
+          if (Path._hasFlag(e, 'weak')) continue;
           throw new Error('removed child idx=' + idx + ' child=' + e + ' flags=' + p.mask);
         }
         let cur = rawByTop.get(top);
@@ -1827,9 +1930,9 @@ export class TreeDAG<T> {
         //   tiers.map((i) => i.length)
         // );
         for (const cur of tiers.flat()) {
-          const curPath = Path.encode([...parentPath, cur]);
+          const curPath = Path._encode([...parentPath, cur]);
           const curNode = node.nodes[cur];
-          mapping.set(curPath, Path.encode([...parentPath, newNodes.push(curNode) - 1]));
+          mapping.set(curPath, Path._encode([...parentPath, newNodes.push(curNode) - 1]));
         }
       } else if (type === 'alap') {
         const { adj, rev } = this.revEdgeCache(node, idx)!;
@@ -1868,8 +1971,8 @@ export class TreeDAG<T> {
             continue;
           }
           placed[cur] = 1;
-          const oldPath = Path.encode([...parentPath, cur]);
-          const newPath = Path.encode([...parentPath, newNodes.push(curNode) - 1]);
+          const oldPath = Path._encode([...parentPath, cur]);
+          const newPath = Path._encode([...parentPath, newNodes.push(curNode) - 1]);
           mapping.set(oldPath, newPath);
         }
       } else {
@@ -1878,7 +1981,7 @@ export class TreeDAG<T> {
           const cur = q.pop()!;
           const curNode = node.nodes[cur];
           if (curNode === undefined) continue; // skip deleted nodes
-          const curPath = Path.encode([...parentPath, cur]);
+          const curPath = Path._encode([...parentPath, cur]);
           if (mapping.has(curPath)) continue;
           for (const edge of adj.get(cur)!) {
             if (mapping.has(Path.stripFlags(edge))) continue; // already processed
@@ -1896,7 +1999,7 @@ export class TreeDAG<T> {
             q.push(cur, edgeIdx);
             continue main;
           }
-          mapping.set(curPath, Path.encode([...parentPath, newNodes.push(curNode) - 1]));
+          mapping.set(curPath, Path._encode([...parentPath, newNodes.push(curNode) - 1]));
         }
         if (newNodes.length > node.nodes.length) {
           throw new Error(
@@ -1926,8 +2029,14 @@ export class TreeDAG<T> {
     this.removeUnused();
     while (this.dirtyScopes.size) {
       let cur = '';
-      for (const s of this.dirtyScopes)
-        if (!cur || Path.decode(s).path.length < Path.decode(cur).path.length) cur = s;
+      let depth = Infinity;
+      for (const s of this.dirtyScopes) {
+        const sDepth = Path._depth(s);
+        if (sDepth < depth) {
+          cur = s;
+          depth = sDepth;
+        }
+      }
       this.dirtyScopes.delete(cur);
       const path = Path.decode(cur).path as number[];
       let n: TreeNode<T> | undefined = this.root;
@@ -1945,7 +2054,7 @@ export class TreeDAG<T> {
       }
       if (!ok || !n) continue;
       if (!this.isSubgraph(n)) continue;
-      this.toposort(cur, 'default', false);
+      this.toposort(cur, this.toposortType, false);
     }
     this.check();
   }

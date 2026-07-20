@@ -198,8 +198,7 @@ export function allocateMemSpec(
   pos: number,
   t: StructSpec | ArraySpec
 ): { pos: number; opts: MemOpts; pre: RegionExpr } {
-  if (typeof pos !== 'number')
-    throw new TypeError(`"pos" expected number, got type=${typeof pos}`);
+  if (typeof pos !== 'number') throw new TypeError(`"pos" expected number, got type=${typeof pos}`);
   if (!Number.isSafeInteger(pos) || pos < 0)
     throw new RangeError(`"pos" expected non-negative safe integer, got ${pos}`);
   if (!P.utils.isPlainObject(t))
@@ -1005,16 +1004,36 @@ export function memOps(
   function load(type: TypeName, pos: FnOp | number, opts: any = {}) {
     const o = memOpts(name, pos, opts);
     const res = f.op(type, 'load', [o.pos], o.opts);
-    o.ms.reads.push(res.idx);
+    if (!o.ms.reads.includes(res.idx)) o.ms.reads.push(res.idx);
     return res;
   }
+  const sameStoreOpts = (a: any, b: any) => {
+    for (const key of new Set([...Object.keys(a), ...Object.keys(b)]))
+      if (key !== 'strong' && key !== 'weak' && a[key] !== b[key]) return false;
+    return true;
+  };
   function store(type: TypeName, pos: FnOp | number, value: FnOp, opts: any = {}) {
     const o = memOpts(name, pos, opts);
-    const res = f.op(type, 'store', [o.pos, value], {
+    const writeOpts = {
       ...o.opts,
       weak: o.ms.reads.map((i) => f.ops.weak(i)),
       isMut: true,
-    });
+    };
+    if (o.ms.write !== undefined && writeOpts.weak.length === 0) {
+      const prev = f.ops.get(o.ms.write);
+      if (
+        prev.kind === 'op' &&
+        prev.op === 'store' &&
+        prev.type === type &&
+        prev.args[0] === o.pos.idx &&
+        prev.args[1] === value.idx &&
+        writeOpts.strong.length === 1 &&
+        writeOpts.strong[0] === o.ms.write &&
+        sameStoreOpts(prev.opts, writeOpts)
+      )
+        return f.byIdx(o.ms.write);
+    }
+    const res = f.op(type, 'store', [o.pos, value], writeOpts);
     o.ms.write = res.idx;
     o.ms.reads = [];
     return res;

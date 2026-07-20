@@ -6,6 +6,7 @@ import * as rewrites from './rewrites.ts';
 import type { TypeName } from './types.ts';
 import * as types from './types.ts';
 import * as utils from './utils.ts';
+import * as values from './values.ts';
 import * as wasm from './wasm.ts';
 import * as workers from './workers.ts';
 
@@ -22,7 +23,15 @@ type Memory = Record<string, ReturnType<typeof allocateMemSpec>>;
 /** Concrete payloads stored for every compiler graph node kind. */
 export type NodeMap = {
   /** Typed operation node. */
-  op: { op: string; type: TypeName; args: NodeIdx[]; opts: Opts };
+  op: {
+    op: string;
+    type: TypeName;
+    args: NodeIdx[];
+    opts: Opts;
+    fact?: values.Fact;
+    /** Logical integer width before this operation was split into smaller words. */
+    wide?: number;
+  };
   /** Root module node. */
   module: { name: string; opts: Opts; memory: Memory; nodes: Node[] };
   /** Function body node. */
@@ -138,6 +147,52 @@ export class FnOp {
     return JSON.stringify({ idx: this.idx });
   }
 }
+
+const optKeyValue = (value: any): string | undefined => {
+  if (value === undefined) return 'undefined';
+  if (typeof value === 'string') return `string:${value}`;
+  if (typeof value === 'number') return `number:${value}`;
+  if (typeof value === 'boolean') return `boolean:${value}`;
+  if (typeof value === 'bigint') return `bigint:${value.toString()}`;
+  if (Array.isArray(value)) {
+    const vals = [];
+    for (const item of value) {
+      const key = optKeyValue(item);
+      if (key === undefined) return;
+      vals.push(key);
+    }
+    return `array:${vals.join(',')}`;
+  }
+  return;
+};
+const optsKey = (opts: Opts): string | undefined => {
+  const parts = [];
+  for (const key of Object.keys(opts).sort()) {
+    const value = optKeyValue(opts[key]);
+    if (value === undefined) return;
+    parts.push(`${key}=${value}`);
+  }
+  return parts.join('|');
+};
+const constructionOpKey = (
+  type: TypeName,
+  op: string,
+  args: NodeIdx[],
+  opts: Opts
+): string | undefined => {
+  const pure = rewrites.pureOpKey(type, op, args, opts);
+  if (pure !== undefined) return `pure|${pure}`;
+  if (op !== 'load') return;
+  const optsRaw = optsKey(opts);
+  if (optsRaw === undefined) return;
+  return `memory|${type}|${op}|${args.join('|')}|${optsRaw}`;
+};
+const emptyObject = (opts: Opts) => {
+  for (const _ in opts) return false;
+  return true;
+};
+const cacheableConstructionKey = (op: string, opts: Opts) =>
+  op !== 'load' && (op === 'const' || emptyObject(opts));
 /** Compiler options controlling rewrites and code generation flavors. */
 export type CompilerOpts = Flags & {
   lowerU64?: boolean;
@@ -152,11 +207,14 @@ export type CompilerOpts = Flags & {
   lowerPattern?: boolean;
   lowerPatternJS?: boolean;
   lowerWasm?: boolean;
+  cseOps?: boolean; // Rewrite CSE; set false for graph-shape reducers/bench baselines.
+  icseOps?: boolean; // Pressure-gated inverse CSE for tee-less generated code.
+  motionOps?: boolean; // Pure-op code motion across block/loop scopes; set false for baselines.
+  optBlockState?: boolean; // Block-state passthrough; backend defaults may retain saved state.
 
   // wasm low level (both js and wasm)
   wasmBlockType?: boolean;
   wasmTee?: boolean;
-  wasmTeeSimd?: boolean;
 
   freeze?: boolean; // Object.freeze on module stuff
   reuseModule?: boolean; // Cache module at instantiation for re-use
@@ -178,6 +236,24 @@ export type CompilerOpts = Flags & {
   threadLimit?: number;
   customWorkerCode?: string;
   customWorkerCodeInit?: string;
+  // Analysis hook for finding repeated final-op sequences across generated modules.
+  opNgrams?: OpNgramReport;
+  opNgramLabel?: string;
+  opNgramExamples?: number;
+};
+export type OpNgramHit = {
+  id: string;
+  module: string;
+  label: string;
+  name: string;
+  at: number;
+  context: string[];
+};
+export type OpNgramReport = {
+  ops: Record<string, number>;
+  ngrams: Record<string, number>;
+  functions: { module: string; label: string; name: string; ops: number }[];
+  examples?: Record<string, OpNgramHit[]>;
 };
 /** Lowered backend inputs produced from a high-level module. */
 export type LoweredModule = {
@@ -194,6 +270,9 @@ const DefaultOpts: CompilerOpts = {
   optimize: true,
   lowerSmallInt: true,
   lowerPattern: true,
+  cseOps: true,
+  motionOps: true,
+  optBlockState: true,
   wasmBlockType: true,
   wasmTee: true,
   optExtMul: true,
@@ -203,12 +282,16 @@ const DefaultOptsJS: CompilerOpts = {
   lowerSIMD: true,
   patternMemoryEndianess: true,
   wasmTee: false, // useless for js
+  icseOps: true,
   opt_i32xi32: true,
 };
 
 const DefaultOptsWASM: CompilerOpts = {
   lowerWasm: true,
   useSIMD: true,
+  // Saved block state combines with scalar64 reducer trees into the faster Wasm shape; JS keeps
+  // passthrough through DefaultOpts, and callers can still explicitly select either lowering.
+  optBlockState: false,
   // Flags
   nativeSIMD: true,
   native64bit: true,
@@ -340,6 +423,7 @@ function genScope(
           const argType = types.nodeRetType(mg, i);
           return mg.op(argType, 'arg', [], { pos: j, scope: blockIdx });
         });
+        blockNode.opts.argIds = args.map((i) => i.idx);
         const out = cb(...(FnOpShape.encode(shape, args || []) as any)) || [];
         if (!FnOpShape.validate(shape, out)) throw new Error('wrong output shape');
         blockNode.outputs = FnOpShape.decode(out).flat.map((i) => i.idx);
@@ -598,6 +682,7 @@ function genScope(
  */
 export class ModuleGraph {
   ops: utils.TreeDAG<Node>;
+  opts: CompilerOpts;
   types: ReturnType<typeof types.genTypes>;
   scope: ReturnType<typeof genScope>;
   constructor(name: string, memory: Memory, mod: Module, opts: CompilerOpts) {
@@ -609,6 +694,18 @@ export class ModuleGraph {
       throw new TypeError(`"mod" expected Module, got type=${typeof mod}`);
     if (!P.utils.isPlainObject(opts))
       throw new TypeError(`"opts" expected object, got type=${typeof opts}`);
+    this.opts = opts;
+    const addKeyCache = new WeakMap<NodeOf<'op'>, { args: NodeIdx[]; key: string | undefined }>();
+    const getAddKey = (node: Node) => {
+      if (node.kind !== 'op') return;
+      if (!cacheableConstructionKey(node.op, node.opts))
+        return constructionOpKey(node.type, node.op, node.args, node.opts);
+      const hit = addKeyCache.get(node);
+      if (hit && hit.args === node.args) return hit.key;
+      const key = constructionOpKey(node.type, node.op, node.args, node.opts);
+      addKeyCache.set(node, { args: node.args, key });
+      return key;
+    };
     this.ops = new utils.TreeDAG<Node>(
       { kind: 'module', name, nodes: [], memory, opts: {} },
       {
@@ -646,6 +743,7 @@ export class ModuleGraph {
           return res;
         },
         mapEdges: (g, node, mapping, partial) => {
+          if (node.kind === 'op') addKeyCache.delete(node);
           if (is(node, 'op', 'block', 'loop'))
             node.args = g.applyMapping(node.args, mapping, partial);
           if (node.opts) {
@@ -679,6 +777,7 @@ export class ModuleGraph {
         getFlags: (node) => {
           return [node.opts?.isMut ? 'isMut' : undefined];
         },
+        getAddKey,
       }
     );
     this.types = types.genTypes(this) as any;
@@ -720,9 +819,20 @@ export class ModuleGraph {
       }
     }
     const node = { kind: 'op' as const, type, op, args: args.map((i) => i.idx), opts };
+    const fact = values.infer(this, node);
+    if (fact) (node as NodeOf<'op'>).fact = fact;
     //node.opts.stack = new Error().stack;
-    const res = new FnOp(this.ops.add(node));
-    return res;
+    const key = constructionOpKey(type, op, node.args, opts);
+    return new FnOp(
+      this.ops.add(
+        node,
+        undefined,
+        key,
+        (cached) =>
+          cached.kind === 'op' &&
+          constructionOpKey(cached.type, cached.op, cached.args, cached.opts) === key
+      )
+    );
   }
   subgraph<K extends 'function' | 'module' | 'block' | 'loop'>(
     kind: K,
@@ -785,6 +895,18 @@ export class ModuleGraph {
         if (!res.idx || !(res instanceof FnOp)) {
           throw new Error('wrong rewrite res');
         }
+        // Rewrites rebuild equivalent operations through new graph nodes. Preserve lowering
+        // provenance only when the operation itself survives; identity folds can return an
+        // unrelated shared input that must keep its own provenance.
+        const resNode = this.ops.get(res.idx);
+        if (
+          isOp(node) &&
+          node.wide &&
+          isOp(resNode) &&
+          resNode.type === node.type &&
+          resNode.op === node.op
+        )
+          resNode.wide = Math.max(resNode.wide || 0, node.wide);
         return res.idx;
       };
     };
@@ -807,13 +929,33 @@ export class ModuleGraph {
     }
     if (opts.optimize) curRewrites.optimizeU64 = getRewrite(rewrites.optimize);
 
-    if (opts.lowerWasm) curRewrites.lowerWasm = getRewrite(rewrites.lowerWasm);
     curRewrites.lowerSmallIntWasm = getRewrite(rewrites.lowerSmallInt);
     if (opts.optimize) curRewrites.optimizeWASM = getRewrite(rewrites.optimize);
     //if (opts.lowerU64Arg)
     if (opts.lowerPatternJS) curRewrites.lowerPatternJS = getRewrite(rewrites.lowerPatternJS);
+    if (opts.motionOps) curRewrites.motionOps = getRewrite(rewrites.motion);
+    if (opts.cseOps) curRewrites.cseOps = getRewrite(rewrites.cse);
     const DEBUG = false;
-    this.ops.rewrite(curRewrites, undefined, DEBUG, DEBUG ? () => checkFn(this) : undefined);
+    const run = (cbs: Record<string, utils.Rewrite<Node>>) => {
+      if (!Object.keys(cbs).length) return;
+      this.ops.rewrite(cbs, undefined, DEBUG, DEBUG ? () => checkFn(this) : undefined);
+    };
+    run(curRewrites);
+    if (opts.lowerWasm) {
+      // Run Wasm lowering outside the optimizer fixpoint so generic IR canonicalization
+      // cannot ping-pong with Wasm-only opcode expansion.
+      const lowerWasm = { lowerWasm: getRewrite(rewrites.lowerWasm) };
+      const lowerSmallIntWasm = { lowerSmallIntWasm: getRewrite(rewrites.lowerSmallInt) };
+      run(lowerWasm);
+      // Wasm-only SIMD expansion can create scalar u8/u16 lane ops after the generic pass.
+      run(lowerSmallIntWasm);
+      if (opts.optimize) run({ optimizeLoweredWASM: getRewrite(rewrites.optimize) });
+      run(lowerWasm);
+      run(lowerSmallIntWasm);
+    }
+    // Inverse CSE runs last: earlier CSE/motion passes would re-merge or hoist its clones.
+    // Tee-backed Wasm already re-reads shared values cheaply and benchmarked worse with cloning.
+    if (opts.icseOps && !opts.wasmTee) run({ icseOps: getRewrite(rewrites.icse) });
     checkFn(this, true);
   }
   toInstrs(opts: CompilerOpts): any[] {
@@ -893,6 +1035,11 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
   const singleUsed: Record<NodeIdx, Instr[]> = {};
   const singleUserArgs: Record<NodeIdx, number> = {};
   const teeCache: Record<NodeIdx, { varIdx: number; ops: Instr[] }> = {};
+  // Tee refs already emitted through a variadic site, in emission order. A tee_cache leaf
+  // whose refs are all seen expands to a plain local.get (expandRec first-use rule), so it is
+  // availability-free for scheduling; unseen refs still carry their producer's cost.
+  const teeSeen = new Set<NodeIdx>();
+  const teeType: Record<NodeIdx, string> = {};
   const isUsedByLoop: Record<NodeIdx, number> = {};
   const isUsedByBlock: Record<NodeIdx, number> = {};
 
@@ -924,6 +1071,151 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
   // TODO: cleanup, very ugly!
   const getRetTypes = (lst: NodeIdx[]) =>
     lst.map((i) => types.normType(types.nodeRetType(fn, fn.byIdx(i))));
+  const passthroughOut: Record<NodeIdx, NodeIdx[]> = {};
+  const branchValues = (node: NodeOf<'op'>) =>
+    node.op === 'br_if' ? node.args.slice(0, -1) : node.args;
+  const blockStateArg = (idx: NodeIdx, node: NodeOf<'block'>, arg: NodeIdx) => {
+    const state = fn.ops.get(arg);
+    if (isOp(state, 'arg') && state.opts.scope === idx) return node.args[state.opts.pos];
+    return arg;
+  };
+  const branchTarget = (idx: NodeIdx, node: NodeOf<'op'> | number) => {
+    const depth = typeof node === 'number' ? node : node.opts.depth;
+    const parents = fn.ops.getStack(idx).filter((i) => is(i.node, 'loop', 'block'));
+    return parents[parents.length - depth - 1];
+  };
+  const isBlockArg = (idx: NodeIdx | undefined, targetIdx: NodeIdx, pos: number) => {
+    if (!idx) return false;
+    const base = utils.Path.stripFlags(idx);
+    let node: Node;
+    try {
+      node = fn.ops.get(base);
+    } catch {
+      return false;
+    }
+    return isOp(node, 'arg') && node.opts.scope === targetIdx && node.opts.pos === pos;
+  };
+  const blockArgIds = (targetIdx: NodeIdx, target: Node) => {
+    const targetNode = as(target, 'block', 'loop');
+    const targetPath = utils.Path.decode(targetIdx).path;
+    return targetNode.args.map((_, pos) => {
+      // Graph cleanup can remove and renumber scoped arg nodes, so cached paths are not stable.
+      for (let i = 0; i < targetNode.nodes!.length; i++) {
+        const child = targetNode.nodes![i];
+        const idx = utils.Path._encode([...targetPath, i]);
+        if (child && isBlockArg(idx, targetIdx, pos)) return idx;
+      }
+      const cached = targetNode.opts.argIds?.[pos];
+      return isBlockArg(cached, targetIdx, pos) ? utils.Path.stripFlags(cached) : undefined;
+    });
+  };
+  const branchChanges = (targetIdx: NodeIdx, target: Node) => {
+    const res = as(target, 'block', 'loop').args.map(() => false);
+    fn.ops.iter((child, childIdx) => {
+      if (
+        isOp(child, 'br_if', 'br') &&
+        branchTarget(childIdx, child.opts.depth)?.idx === targetIdx
+      ) {
+        const values = branchValues(child);
+        for (let i = 0; i < values.length; i++)
+          if (!isBlockArg(values[i], targetIdx, i)) res[i] = true;
+      }
+    }, targetIdx);
+    return res;
+  };
+  const dependsOn = (idx: NodeIdx, targets: Set<NodeIdx>, seen = new Set<NodeIdx>()): boolean => {
+    const base = utils.Path.stripFlags(idx);
+    if (targets.has(base)) return true;
+    if (seen.has(base)) return false;
+    seen.add(base);
+    if (!fn.ops.exists(base)) return false;
+    const node = fn.ops.get(base);
+    if (!node || node.kind !== 'op') return false;
+    return node.args.some((arg) => dependsOn(arg, targets, seen));
+  };
+  const parallelHazard = (
+    args: NodeIdx[],
+    targetArgIds: (NodeIdx | undefined)[],
+    changed: boolean[]
+  ) => {
+    const overwritten = new Set<NodeIdx>();
+    for (let i = args.length - 1; i >= 0; i--) {
+      if (changed[i] && overwritten.size && dependsOn(args[i], overwritten)) return true;
+      const target = targetArgIds[i];
+      if (changed[i] && target) overwritten.add(target);
+    }
+    return false;
+  };
+  const controlScopes = (idx: NodeIdx) => {
+    const res = new Set<NodeIdx>();
+    for (const cur of fn.ops.getStack(idx)) if (is(cur.node, 'block', 'loop')) res.add(cur.idx);
+    return res;
+  };
+  const branchSkipsBefore = (scope: NodeIdx, to: NodeIdx) => {
+    let skips = false;
+    fn.ops.iter((cur, curIdx) => {
+      if (skips || utils.Path.cmp(curIdx, to) >= 0 || !isOp(cur, 'br', 'br_if')) return;
+      const target = branchTarget(curIdx, cur);
+      if (target && (target.idx === scope || utils.Path.isParent(target.idx, scope))) skips = true;
+    }, scope);
+    return skips;
+  };
+  const canMoveTeeIntoControl = (from: NodeIdx, to: NodeIdx) => {
+    const fromScopes = controlScopes(from);
+    for (const cur of controlScopes(to)) {
+      if (fromScopes.has(cur)) continue;
+      // Moving a tee write into a skipped block or loop can leave later reads at local defaults.
+      if (fn.ops.get(cur).kind !== 'block' || branchSkipsBefore(cur, to)) return false;
+    }
+    return true;
+  };
+  const canMoveLoadToConsumer = (from: NodeIdx, to: NodeIdx | undefined) => {
+    if (to === undefined) return false;
+    const load = as(fn.ops.get(from), 'op');
+    // Vector loads often feed lane/shuffle assembly. Inlining them into a reducer shortens
+    // source text but creates tee-heavy schedules for generated hash/stream kernels.
+    if (types.SIMDType.has(load.type)) return false;
+    const owner = fn.ops.exists(to) ? fn.ops.get(to) : undefined;
+    const variadic =
+      owner &&
+      isOp(owner) &&
+      types.IntType.has(owner.type) &&
+      types.opsVariadic.has(owner.op) &&
+      owner.args.length > 2;
+    if (!variadic) return false;
+    const weakUsers = fn.ops.usedWeak.get(from);
+    if (!weakUsers) return true;
+    for (const user of weakUsers) {
+      if (!fn.ops.exists(user)) continue;
+      // Weak memory users are writes that must stay after this read. Inlining moves the read to
+      // its consumer, so every dependent write still has to be later than that consumer.
+      if (utils.Path.cmp(to, user) >= 0) return false;
+    }
+    return true;
+  };
+  const collectTeeCache = (instrs: Instr | Instr[], refs = new Set<NodeIdx>()) => {
+    if (Array.isArray(instrs)) for (const instr of instrs) collectTeeCache(instr, refs);
+    else if (instrs?.TAG === 'local.tee_cache') refs.add(instrs.idx);
+    return refs;
+  };
+  const sameBlockState = (idx: NodeIdx, node: NodeOf<'block'>, state: NodeIdx[]) => {
+    if (state.length !== node.args.length) return false;
+    for (let i = 0; i < state.length; i++)
+      if (blockStateArg(idx, node, state[i]) !== node.args[i]) return false;
+    return true;
+  };
+  const canPassthroughBlock = (idx: NodeIdx, node: NodeOf<'block'>) => {
+    if (!opts.optBlockState || !node.args.length || !sameBlockState(idx, node, node.outputs))
+      return false;
+    let ok = true;
+    fn.ops.iter((cur, curIdx) => {
+      if (!ok || !isOp(cur, 'br', 'br_if')) return;
+      const target = branchTarget(curIdx, cur);
+      if (target?.idx === idx) ok = sameBlockState(idx, node, branchValues(cur));
+    }, idx);
+    return ok;
+  };
+  const graphWeight = values.weight(fn);
   const processNode = (idx: string) => {
     const getArg = (arg: string, consume: boolean = true) => {
       if (opts.wasmTee && teeCache[arg]) {
@@ -931,11 +1223,15 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
       }
       const n = fn.ops.get(arg) as Node; // const n: utils.TreeNode<Node>
       if (isOp(n, 'nodeOutput')) {
+        const passthrough = passthroughOut[n.args[0]];
+        if (passthrough) return getArg(passthrough[n.opts.pos], consume);
         const outs = callIdx[n.args[0]];
         if (!outs) throw new Error('nodeOutput: callIdx missing');
         return { TAG: 'local.get', data: BigInt(outs[n.opts.pos]) };
       }
       if (isOp(n, 'arg') && n.opts.scope) {
+        const passthrough = passthroughOut[n.opts.scope];
+        if (passthrough) return getArg(passthrough[n.opts.pos], consume);
         const outs = callIdx[n.opts.scope];
         if (!outs) throw new Error('arg/scope: callIdx missing');
         return { TAG: 'local.get', data: BigInt(outs[n.opts.pos]) };
@@ -972,7 +1268,7 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
     if (n.kind === 'function') {
       for (let i = 0; i < n.nodes!.length; i++) {
         if (!n.nodes![i]) continue;
-        pushOps(processNode(utils.Path.encode([...nPath, i])));
+        pushOps(processNode(utils.Path._encode([...nPath, i])));
       }
       pushOps(n.outputs.flatMap((i) => getArg(i)));
       ops.push({ TAG: 'end' });
@@ -989,18 +1285,48 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
     if (isOp(n, 'cast')) return [];
 
     const argIdxs: string[] = n.kind === 'module' ? [] : n.args;
-    const argInstrs = argIdxs.map((i) => getArg(i)); // array of objs OR arrays
-    pushOps(argInstrs.flat());
+    // Non-typed branches may discard this eager arg list and re-emit only guarded state saves.
+    const consumeArgs = !(isOp(n, 'br_if', 'br') && !opts.wasmBlockType);
+    const argInstrs = argIdxs.map((i) => getArg(i, consumeArgs)); // array of objs OR arrays
+    const scoreInstrs = (instrs: any) => {
+      const list = Array.isArray(instrs) ? instrs : [instrs];
+      let cost = 0;
+      let simple = true;
+      for (const op of list) {
+        if (op.TAG.endsWith('.const')) continue;
+        if (op.TAG === 'local.get') {
+          cost += 1;
+          continue;
+        }
+        simple = false;
+        cost += op.TAG.includes('.load') ? 8 : 4;
+      }
+      return { constOnly: cost === 0, cost, len: list.length, simple };
+    };
+    const scheduleVariadic =
+      isOp(n) && types.IntType.has(n.type) && types.opsVariadic.has(n.op) && argIdxs.length > 2;
+    if (!scheduleVariadic) pushOps(argInstrs.flat());
     let isVoid = false;
 
     const parentNode = as(fn.ops.get(utils.Path.parent(idx).parent), 'function', 'loop', 'block');
+    const owners = usedBy.get(idx);
+    const ownerCnt = owners?.size || 0;
+    const singleOwner = ownerCnt === 1 ? owners!.values().next().value : undefined;
+    const loadMoveOk = isOp(n, 'load') ? canMoveLoadToConsumer(idx, singleOwner) : true;
     const canInline =
       !n.opts.isMut &&
       !parentNode.outputs.includes(idx) &&
-      !isOp(n, 'load', 'addCarry', 'carry', 'store') &&
+      !isOp(n, 'addCarry', 'carry', 'store') &&
+      loadMoveOk &&
       !isUsedByLoop[idx];
-    const ownerCnt = usedBy.get(idx)?.size || 0;
-    const singleUser = ownerCnt === 1 && canInline && singleUserArgs[idx] <= 1;
+    // A pending local.tee is a write. Same-scope single-use inlining is fine, but moving it
+    // into a nested control scope can hide the write on skipped paths while later reads survive.
+    const unsafeTeeControlMove =
+      singleOwner !== undefined && collectTeeCache(argInstrs).size > 0
+        ? !canMoveTeeIntoControl(idx, singleOwner)
+        : false;
+    const singleUser =
+      ownerCnt === 1 && canInline && singleUserArgs[idx] <= 1 && !unsafeTeeControlMove;
 
     const getMemArg = (n: Node) => {
       n = as(n, 'op');
@@ -1038,6 +1364,89 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
     };
 
     const TAG = getNodeTag(n);
+    const emitVariadicSchedule = () => {
+      const items = argIdxs.map((arg, order) => {
+        const score = scoreInstrs(argInstrs[order]);
+        return {
+          instrs: argInstrs[order],
+          score,
+          order,
+          weight: graphWeight(arg),
+        };
+      });
+      const emitLeaf = (item: (typeof items)[number]) => pushOps(item.instrs);
+      const emitBalanced = (ordered: typeof items) => {
+        const emit = (start: number, end: number) => {
+          if (end - start === 1) return emitLeaf(ordered[start]);
+          const middle = start + Math.ceil((end - start) / 2);
+          emit(start, middle);
+          emit(middle, end);
+          ops.push({ TAG });
+        };
+        emit(0, ordered.length);
+      };
+      const emitChunked = (ordered: typeof items, width: number) => {
+        for (let start = 0; start < ordered.length; start += width) {
+          const end = Math.min(start + width, ordered.length);
+          // Keep each chunk wide: the measured schedule emits all leaves before folding them.
+          // Streaming reductions inside a chunk produce a different Wasm tree and lose the
+          // cross-platform result even though the source-order partition is the same.
+          for (let pos = start; pos < end; pos++) emitLeaf(ordered[pos]);
+          for (let pos = start + 1; pos < end; pos++) ops.push({ TAG });
+          if (start) ops.push({ TAG });
+        }
+      };
+      // Availability: simple leaves (consts/locals) and tee re-reads cost nothing to consume —
+      // expandRec turns every non-first tee_cache read into a plain local.get. Only leaves with
+      // unseen tee refs (or computed/load bodies) still carry their producer's work here.
+      const avail = items.map((i) => {
+        const refs = collectTeeCache(i.instrs);
+        let unseen = false;
+        for (const r of refs) if (!teeSeen.has(r)) unseen = true;
+        return i.score.simple || (refs.size && !unseen) ? 0 : i.weight;
+      });
+      for (const i of items) for (const r of collectTeeCache(i.instrs)) teeSeen.add(r);
+      const sorted = items.slice().sort((a, b) => {
+        if (a.score.constOnly !== b.score.constOnly) return a.score.constOnly ? 1 : -1;
+        if (a.score.simple !== b.score.simple) return a.score.simple ? 1 : -1;
+        if (a.weight !== b.weight) return b.weight - a.weight;
+        if (a.score.cost !== b.score.cost) return b.score.cost - a.score.cost;
+        if (a.score.len !== b.score.len) return b.score.len - a.score.len;
+        return a.order - b.order;
+      });
+      // JS lowering erases logical integer width before scheduling. Provenance restores the
+      // pressure-bounded stream for reducers split from wide values; native-width reducers keep
+      // the adaptive policy.
+      if (!opts.wasmTee && isOp(n) && n.wide) return emitChunked(sorted, 1);
+      // Wide emission (whole leaf block, folds at the end) restores the fast reduction shape
+      // for 32-bit rounds: streaming reductions between producer computations was the measured
+      // md5/ripemd/sha1 regression (set->tee collapse, +30-40% runtime). Two structural
+      // exceptions keep the sorted stream (each leaf folds into the accumulator as produced):
+      // - 64-bit elements (u64, u64x2): use a balanced heavy-first expression tree in Wasm.
+      //   It shortens simultaneous live ranges without changing leaf selection and is flat on
+      //   x86 while materially faster on Apple Silicon. Element width is a type property, not a
+      //   kernel gate; JS retains its existing linear schedule.
+      // - scalar all-producer sites (CSE-flattened limb sums, table-load reductions): no
+      //   available leaf to anchor a block; streaming keeps at most accumulator+leaf live
+      //   (this is the shape that fixed AES table loads).
+      // Wide SIMD blocks keep SOURCE order: construction order already groups lanes/rounds and
+      // resorting scrambles it (keccak/blake3). Wide scalar blocks emit heavy-first, so cheap
+      // leaves land on the early reduce edge (fold-at-end reduces the last-pushed first).
+      const nType = as(n, 'op').type as string;
+      if (nType.includes('64')) {
+        if (!opts.lowerWasm) return emitChunked(sorted, 1);
+        // Five scalar operands cross the measured register-pressure boundary. Source-order
+        // groups of three keep partial reductions short on both tested Wasm backends; smaller
+        // scalar trees and 64-bit SIMD retain the balanced heavy-first schedule.
+        if (!types.SIMDType.has(nType) && items.length >= 5) return emitChunked(items, 3);
+        return emitBalanced(sorted);
+      }
+      if (!types.SIMDType.has(nType)) {
+        if (avail.every((w) => w > 0)) return emitChunked(sorted, 1);
+        return emitChunked(sorted, sorted.length);
+      }
+      emitChunked(items, items.length);
+    };
     if (
       isOp(
         n,
@@ -1143,7 +1552,8 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
         'extmul_high_i32x4_s'
       )
     ) {
-      for (let i = 1; i < argIdxs.length; i++) ops.push({ TAG });
+      if (scheduleVariadic) emitVariadicSchedule();
+      else for (let i = 1; i < argIdxs.length; i++) ops.push({ TAG });
     }
     // TMP
     else if (isOp(n, 'addCarry', 'carry')) ops.push({ TAG });
@@ -1235,70 +1645,140 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
       callIdx[idx] = outIdx;
       isVoid = true;
     } else if (is(n, 'block', 'loop')) {
-      const argTypes = getRetTypes(n.args);
-      const outTypes = getRetTypes(n.outputs); // same as args
-      const blockType = !opts.wasmBlockType ? 'void' : { inputs: argTypes, outputs: outTypes };
-      // We have input state in stack (because of args)
-      const outIdx: number[] = [];
-      for (let i = 0; i < n.args?.length; i++) {
-        const setId = getNextId(argTypes[i] as TypeName, false);
-        outIdx.push(setId);
+      const passthrough = n.kind === 'block' && canPassthroughBlock(idx, n);
+      if (passthrough) {
+        ops.length = 0; // remove unchanged state args pushed before dispatch
+        passthroughOut[idx] = n.args;
+        callIdx[idx] = [];
+        ops.push({ TAG: n.kind, data: 'void', hoist: [] });
+        for (let i = 0; i < n.nodes!.length; i++) {
+          if (!n.nodes![i]) continue;
+          pushOps(processNode(utils.Path._encode([...nPath, i])));
+        }
+        ops.push({ TAG: 'end' });
+        isVoid = true;
+      } else {
+        const argTypes = getRetTypes(n.args);
+        const outTypes = getRetTypes(n.outputs); // same as args
+        const blockType = !opts.wasmBlockType ? 'void' : { inputs: argTypes, outputs: outTypes };
+        // We have input state in stack (because of args)
+        const outIdx: number[] = [];
+        for (let i = 0; i < n.args?.length; i++) {
+          const setId = getNextId(argTypes[i] as TypeName, false);
+          outIdx.push(setId);
+        }
+        callIdx[idx] = outIdx; // can do this once
+        const saveState = (changed?: boolean[], drop = false) => {
+          for (let i = outIdx.length - 1; i >= 0; i--) {
+            if (!changed || changed[i]) ops.push({ TAG: 'local.set', data: BigInt(outIdx[i]) });
+            else if (drop) ops.push({ TAG: 'drop' });
+          }
+        };
+        // save arguments to state
+        if (!opts.wasmBlockType) saveState();
+        ops.push({ TAG: n.kind, data: blockType, hoist: outIdx });
+        if (opts.wasmBlockType) saveState();
+        for (let i = 0; i < n.nodes!.length; i++) {
+          if (!n.nodes![i]) continue;
+          pushOps(processNode(utils.Path._encode([...nPath, i])));
+        }
+        const changed = n.outputs.map((id, i) => !isBlockArg(id, idx, i));
+        const branched = branchChanges(idx, n);
+        const returnedChanged = changed.map((id, i) => id || branched[i]);
+        if (opts.wasmBlockType) pushOps(n.outputs.flatMap((i) => getArg(i)));
+        else
+          for (let i = 0; i < n.outputs.length; i++) if (changed[i]) pushOps(getArg(n.outputs[i]));
+        // we have outputs on stack!
+        if (!opts.wasmBlockType) saveState(changed);
+        ops.push({ TAG: 'end' });
+        // save returned state
+        // Identity state slots are already in their locals; reassigning them only grows output.
+        if (opts.wasmBlockType) saveState(returnedChanged, true);
+        isVoid = true;
       }
-      callIdx[idx] = outIdx; // can do this once
-      const saveState = () => {
-        for (let i = outIdx.length - 1; i >= 0; i--)
-          ops.push({ TAG: 'local.set', data: BigInt(outIdx[i]) });
-      };
-      // save arguments to state
-      if (!opts.wasmBlockType) saveState();
-      ops.push({ TAG: n.kind, data: blockType, hoist: outIdx });
-      if (opts.wasmBlockType) saveState();
-      for (let i = 0; i < n.nodes!.length; i++) {
-        if (!n.nodes![i]) continue;
-        pushOps(processNode(utils.Path.encode([...nPath, i])));
-      }
-      pushOps(n.outputs.flatMap((i) => getArg(i)));
-      // we have outputs on stack!
-      if (!opts.wasmBlockType) saveState();
-      ops.push({ TAG: 'end' });
-      // save returned state
-      if (opts.wasmBlockType) saveState();
-      isVoid = true;
     } else if (isOp(n, 'br_if', 'br')) {
-      const { path } = utils.Path.decode(idx);
-      const parentIdx = [];
-      for (let i = 0; i < path.length; i++) parentIdx.push(utils.Path.encode(path.slice(0, i)));
-      const parents = parentIdx
-        .map((idx) => ({ idx, node: fn.ops.get(idx) }))
-        .filter((i) => ['loop', 'block'].includes(i.node.kind));
-
-      const pDepth = parents[parents.length - n.opts.depth - 1];
+      const pDepth = branchTarget(idx, n);
+      const pNode = as(pDepth.node, 'block', 'loop');
       const outIdx = callIdx[pDepth.idx];
-      if (!opts.wasmBlockType && n.op === 'br_if' && n.args.length > 1) {
+      const targetArgIds = blockArgIds(pDepth.idx, pNode);
+      const len = n.args.length - (n.op === 'br_if' ? 1 : 0);
+      // getArg returns either one instruction or an instruction list; normalize before scans.
+      const asInstrs = (instrs: Instr | Instr[]) => (Array.isArray(instrs) ? instrs : [instrs]);
+      const yieldInstrs = argInstrs.slice(0, len).map(asInstrs);
+      const condInstr = n.op === 'br_if' ? asInstrs(argInstrs[argInstrs.length - 1]) : undefined;
+      const pureBranchValue = (op: Instr) => op.TAG === 'local.get' || op.TAG.endsWith('.const');
+      const guardBranch =
+        opts.wasmBlockType &&
+        opts.lowerWasm &&
+        n.op === 'br_if' &&
+        len > 4 &&
+        yieldInstrs.every((instrs) => instrs.every(pureBranchValue));
+      const changed = n.args.slice(0, len).map((id, i) => !isBlockArg(id, pDepth.idx, i));
+      const saveBranchState = (values: any[]) => {
+        if (parallelHazard(n.args.slice(0, len), targetArgIds, changed)) {
+          const outTypes = getRetTypes(pNode.args);
+          const tmp: number[] = [];
+          for (let i = 0; i < outIdx.length; i++) {
+            if (!changed[i]) continue;
+            pushOps(values[i]);
+            tmp[i] = getNextId(outTypes[i] as TypeName, false);
+            ops.push({ TAG: 'local.set', data: BigInt(tmp[i]) });
+          }
+          for (let i = outIdx.length - 1; i >= 0; i--) {
+            if (!changed[i]) continue;
+            ops.push({ TAG: 'local.get', data: BigInt(tmp[i]) });
+            ops.push({ TAG: 'local.set', data: BigInt(outIdx[i]) });
+          }
+          return;
+        }
+        for (let i = 0; i < outIdx.length; i++) if (changed[i]) pushOps(values[i]);
+        for (let i = outIdx.length - 1; i >= 0; i--)
+          if (changed[i]) ops.push({ TAG: 'local.set', data: BigInt(outIdx[i]) });
+      };
+      const passthrough = pDepth ? passthroughOut[pDepth.idx] : undefined;
+      if (passthrough && branchValues(n).length === passthrough.length) {
+        ops.length = 0; // remove yielded values; passthrough block has no result stack.
+        if (n.op === 'br_if') pushOps(condInstr!);
+        ops.push({ TAG: n.op, data: BigInt(n.opts.depth) });
+      } else if (!opts.wasmBlockType && n.op === 'br_if' && n.args.length > 1) {
         if (opts.wasmTee) throw new Error('wasmTee not supported in non wasmBlockType');
-        // requires guard block
         ops.length = 0; // remove args
-        const condInstr = argInstrs[argInstrs.length - 1];
-        const yieldInstrs = argInstrs.slice(0, outIdx.length);
+        if (!changed.includes(true)) {
+          pushOps(condInstr!);
+          ops.push({ TAG: 'br_if', data: BigInt(n.opts.depth) });
+          isVoid = true;
+          return ops;
+        }
+        // requires guard block
         ops.push({ TAG: 'block', data: 'void' }); // guard
-        pushOps(condInstr);
+        pushOps(condInstr!);
         ops.push({ TAG: 'i32.eqz' });
         ops.push({ TAG: 'br_if', data: _0n }); // skip assign+branch if cond==0
-        // assign yields -> parent's locals, in order
-        for (let i = 0; i < outIdx.length; i++) {
-          pushOps(yieldInstrs[i]);
-          ops.push({ TAG: 'local.set', data: BigInt(outIdx[i]) });
-        }
+        saveBranchState(yieldInstrs);
+        ops.push({ TAG: 'br', data: BigInt(n.opts.depth + 1) });
+        ops.push({ TAG: 'end' });
+      } else if (guardBranch) {
+        // Guarding avoids pushing many pure branch values only to drop them when cond is false.
+        ops.length = 0;
+        ops.push({ TAG: 'block', data: 'void', hoist: [] });
+        pushOps(condInstr!);
+        ops.push({ TAG: 'i32.eqz' });
+        ops.push({ TAG: 'br_if', data: _0n });
+        for (const instrs of yieldInstrs) pushOps(instrs);
         ops.push({ TAG: 'br', data: BigInt(n.opts.depth + 1) });
         ops.push({ TAG: 'end' });
       } else {
         if (!opts.wasmBlockType) {
-          for (let i = outIdx.length - 1; i >= 0; i--)
-            ops.push({ TAG: 'local.set', data: BigInt(outIdx[i]) });
+          if (n.op === 'br') {
+            ops.length = 0;
+            saveBranchState(yieldInstrs);
+          } else {
+            for (let i = outIdx.length - 1; i >= 0; i--)
+              ops.push({ TAG: 'local.set', data: BigInt(outIdx[i]) });
+          }
         }
         ops.push({ TAG: n.op, data: BigInt(n.opts.depth) });
         // won't eat wholes stack if condition failed: need to drop
-        const len = n.args.length - (n.op === 'br_if' ? 1 : 0);
         if (opts.wasmBlockType) for (let i = 0; i < len; i++) ops.push({ TAG: 'drop' });
       }
       isVoid = true;
@@ -1326,15 +1806,26 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
         opts.wasmTee &&
         canInline &&
         !isUsedByBlock[idx] &&
-        (opts.wasmTeeSimd || typeName !== 'v128')
+        // Multi-use v128 values materialize as local.set, not tee-cache: they are wide-block
+        // members consumed via cheap gets, and inlining their producers into expression streams
+        // measurably collapsed every v128-heavy kernel (chacha20 +8%, blake3 +6%, md5/ripemd
+        // set->tee signature). 32-bit values keep tee-cache. typeName is post-normType, so
+        // SIMD == 'v128' here (types.SIMDType.has(typeName) never matches). A 64-bit-lane
+        // exception was probed and measured as noise (blake512/keccak +-0.2%), so the simple
+        // rule stays.
+        typeName !== 'v128'
       ) {
         // TODO: this is fragile and will break if tee is re-inlined again
         // Also, loops
-        const owners = usedBy.get(idx);
         if (owners && owners.size && utils.Path.isSiblings(owners)) {
           ops.push({ TAG: 'local.tee', data: BigInt(setId) });
           teeCache[idx] = { varIdx: setId, ops: ops.slice() };
-          return []; // remember stack value, but do nothing
+          teeType[idx] = typeName; // placement rule below routes on element width
+          // Statement-level source marker: the expansion pass decides PLACEMENT per value —
+          // sink the body to its first use (default tee behavior) or emit body+set here at the
+          // source, off the consumers' critical path (rule #12 below). Placeholders/scheduling
+          // are unaffected; a marker that stays lazy expands to nothing.
+          return [{ TAG: 'local.tee_src', idx }];
         }
       }
       varIdx[idx] = setId;
@@ -1346,8 +1837,85 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
   if (opts.wasmTee) {
     // We cannot know which consumer is first before linearization, so we insert tee here
     const teeUsed = new Set();
-    const newOps = [];
+    const newOps: any[] = [];
+    // Tee placement rule (#12): a NESTED-first-use tee value (first use inside another tee
+    // body, invisible to the flat scan) emits eagerly — body+set at the source statement —
+    // iff its chain is NOT extract-bottomed AND (it interleaves with an independent chain OR
+    // is 64-bit typed). Everything else keeps the sink-to-first-use default. Mechanisms, each
+    // measured (task log 2026-07-02):
+    // - lazy-in-lazy chains compound the sink: the outer body drags the inner ever deeper
+    //   into the consumer's critical path; one level of sinking is the wanted tee behavior.
+    // - extract veto: a sunk extract_lane chain peels lanes off ONE live vector on demand;
+    //   eager bursts k scalars live at source (sha1 +9.6% without the veto).
+    // - interleave: >=2 independent chains serialize into contiguous mega-blocks under the
+    //   sink (ripemd -13.9% recovered by eager); a lone serial chain is a fused stack
+    //   expression the sink keeps intact (blake3 +1.45% when forced eager).
+    // - i64: serial 64-bit chains measure eager-positive (poly1305 carries, blake512 G);
+    //   serial i32 want the sink (sha1/md5/blake3). Width routing has v6/v128-tee precedent.
+    const eagerIds = new Set<NodeIdx>();
+    const src: Record<NodeIdx, number> = {};
+    const first: Record<NodeIdx, number> = {};
+    // Transitive boundary test: chains can reach extract_lane (vector->scalar) one or more tee
+    // levels down (sha1 W-chain: only 16/241 nested bodies hold the extract directly). The sink
+    // keeps one vector live instead of materializing the scalar fan-out early.
+    const extractMemo: Record<NodeIdx, boolean> = {};
+    const extractBottomed = (k: NodeIdx): boolean => {
+      if (extractMemo[k] !== undefined) return extractMemo[k];
+      extractMemo[k] = false; // cycle guard
+      let res = teeCache[k].ops.some((op) => op.TAG.includes('extract_lane'));
+      for (const r of collectTeeCache(teeCache[k].ops)) res = res || extractBottomed(r);
+      extractMemo[k] = res;
+      return res;
+    };
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i];
+      if (op.TAG === 'local.tee_src') src[op.idx] = i;
+      else if (op.TAG === 'local.tee_cache' && first[op.idx] === undefined) first[op.idx] = i;
+    }
+    // Interleave test in one interval check: topology puts X's descendants before src[X] and
+    // its ancestors at or after src[parent(X)], so ANY marker strictly between the two belongs
+    // to an independent chain.
+    const chainParents: Record<NodeIdx, NodeIdx[]> = {};
+    for (const y in teeCache)
+      for (const r of collectTeeCache(teeCache[y].ops)) {
+        if (!chainParents[r]) chainParents[r] = [];
+        chainParents[r].push(y);
+      }
+    const markerPos: number[] = Object.values(src).sort((a, b) => a - b);
+    const interleaved = (k: NodeIdx) => {
+      let near = Infinity;
+      for (const p of chainParents[k] || []) {
+        const sp = src[p];
+        if (sp !== undefined && sp > src[k]) near = Math.min(near, sp);
+      }
+      if (near === Infinity) return false;
+      let a = 0;
+      let b = markerPos.length;
+      while (a < b) {
+        const m = (a + b) >> 1;
+        if (markerPos[m] <= src[k]) a = m + 1;
+        else b = m;
+      }
+      return a < markerPos.length && markerPos[a] < near;
+    };
+    for (const k in src) {
+      // Only NESTED-first-use values (first use inside another tee body) are candidates;
+      // flat-first-use values keep the sink unconditionally (every eager slice of them
+      // measured negative or neutral — see rule #12 header above).
+      if (first[k] !== undefined) continue;
+      if (!extractBottomed(k) && (teeType[k] === 'i64' || interleaved(k))) eagerIds.add(k);
+    }
     const expandRec = (op: any): any[] => {
+      if (op.TAG === 'local.tee_src') {
+        const { varIdx, ops } = teeCache[op.idx];
+        if (!eagerIds.has(op.idx)) return [];
+        teeUsed.add(op.idx);
+        const body = ops
+          .slice(0, -1)
+          .map((i) => expandRec(i))
+          .flat();
+        return [...body, { TAG: 'local.set', data: BigInt(varIdx) }];
+      }
       if (op.TAG !== 'local.tee_cache') return [op];
       const { varIdx, ops } = teeCache[op.idx];
       if (teeUsed.has(op.idx)) return [{ TAG: 'local.get', data: BigInt(varIdx), info: 'first' }];
@@ -1359,6 +1927,7 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
     for (const op of ops) newOps.push(...expandRec(op));
     ops = newOps;
   }
+  ops = peepholeInstrs(ops);
 
   const res = {
     inputs: fnNode.inputs.map((i) => types.normType(i)),
@@ -1372,6 +1941,110 @@ function toInstr(fn: ModuleGraph, memory: Memory, opts: CompilerOpts = {}) {
   // console.dir(ops, { depth: null });
   return res;
 }
+const peepholeInstrs = (ops: any[]) => {
+  const res = [];
+  const intType = (tag: string) =>
+    tag.startsWith('i32.') ? 'i32' : tag.startsWith('i64.') ? 'i64' : undefined;
+  const cmpOps = 'eq ne lt_s ge_s lt_u ge_u gt_s le_s gt_u le_u'.split(' ');
+  const invertCmp = (tag: string) => {
+    const type = intType(tag);
+    if (!type) return;
+    const pos = cmpOps.indexOf(tag.slice(type.length + 1));
+    return pos < 0 ? undefined : `${type}.${cmpOps[pos ^ 1]}`;
+  };
+  const narrowStoreMask = (tag: string) => {
+    const type = intType(tag);
+    if (!type) return;
+    const op = tag.slice(type.length + 1);
+    if (!op.startsWith('store')) return;
+    const bits = Number(op.slice('store'.length));
+    const width = type === 'i32' ? 32 : 64;
+    if (!Number.isSafeInteger(bits) || bits <= 0 || bits >= width) return;
+    return (1n << BigInt(bits)) - 1n;
+  };
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i];
+    const next = ops[i + 1];
+    const next2 = ops[i + 2];
+    const next3 = ops[i + 3];
+    const tag = op.TAG;
+    const tag1 = next?.TAG;
+    const tag2 = next2?.TAG;
+    const tag3 = next3?.TAG;
+    const type = intType(tag);
+    const cmp = invertCmp(tag);
+    const mask = tag2 && narrowStoreMask(tag2);
+    if (type && tag === `${type}.const` && op.data == 0 && tag1 === `${type}.eq`) {
+      res.push({ TAG: `${type}.eqz` });
+      i++;
+    } else if (cmp && tag1 === 'i32.eqz') {
+      // Integer comparisons produce 0/1; float comparisons are excluded because NaN breaks inverse ordering.
+      res.push({ ...op, TAG: cmp });
+      i++;
+    } else if (tag === 'i32.eqz' && tag1 === 'i32.eqz' && (tag2 === 'br_if' || tag2 === 'select')) {
+      // In condition slots, `eqz(eqz(x))` has the same truthiness as `x` even when `x` is not 0/1.
+      res.push(next2);
+      i += 2;
+    } else if (
+      type &&
+      tag === `${type}.const` &&
+      tag1 === `${type}.and` &&
+      tag2 === `${type}.const` &&
+      tag3 === tag1
+    ) {
+      // Adjacent scalar masks compose; keeping both only burns const/and instructions.
+      const data = BigInt(op.data) & BigInt(next2.data);
+      res.push({ ...op, data: typeof op.data === 'bigint' ? data : Number(data) }, next);
+      i += 3;
+    } else if (
+      type &&
+      tag === `${type}.const` &&
+      tag1 === `${type}.and` &&
+      mask !== undefined &&
+      BigInt(op.data) === mask
+    ) {
+      // Narrow stores already truncate the value, so a matching low-bit mask is dead.
+      res.push(next2);
+      i += 2;
+    } else if (tag === 'local.set' && tag1 === 'local.get' && op.data === next.data) {
+      // Final lowering often materializes reusable values as set/get; tee is the Wasm peephole form.
+      res.push({ TAG: 'local.tee', data: op.data });
+      i++;
+    } else res.push(op);
+  }
+  return res;
+};
+const recordOpNgrams = (mod: string, fns: any[], opts: CompilerOpts, report: OpNgramReport) => {
+  const label = opts.opNgramLabel || mod;
+  const limit = opts.opNgramExamples || 0;
+  const bump = (obj: Record<string, number>, key: string) => (obj[key] = (obj[key] || 0) + 1);
+  const dataLabel = (data: any): string => {
+    if (typeof data === 'number') return Object.is(data, -0) ? '-0' : `${data}`;
+    if (data instanceof Uint8Array) return `[${Array.from(data).join(',')}]`;
+    if (Array.isArray(data)) return `[${data.map(dataLabel).join(',')}]`;
+    return `${data}`;
+  };
+  // Arithmetic peepholes depend on the immediate value, not just the const opcode.
+  const opLabel = (op: any) =>
+    op.TAG.endsWith('.const') ? `${op.TAG}(${dataLabel(op.data)})` : op.TAG;
+  for (const fn of fns) {
+    if (!Array.isArray(fn.instructions)) continue;
+    const tags = fn.instructions.map(opLabel);
+    const site = { module: mod, label, name: fn.name };
+    report.functions.push({ ...site, ops: tags.length });
+    for (const tag of tags) bump(report.ops, tag);
+    for (let n = 2; n <= 4; n++)
+      for (let i = 0; i <= tags.length - n; i++) {
+        const key = tags.slice(i, i + n).join(' ');
+        bump(report.ngrams, key);
+        if (!report.examples || !limit) continue;
+        const examples = report.examples[key] || (report.examples[key] = []);
+        if (examples.length >= limit) continue;
+        const context = tags.slice(Math.max(0, i - 2), i + n + 2);
+        examples.push({ id: `${label}:${site.name}@${i}`, ...site, at: i, context });
+      }
+  }
+};
 /**
  * Validates that function has valid memory structure
  */
@@ -1538,8 +2211,13 @@ export function toMod(m: Module<any, any>, opts: CompilerOpts = {}): LoweredModu
   for (const name in importFns) fns.push({ name, ...importFns[name], import: true });
   moduleNode.rewrite(opts);
   fns.push(...moduleNode.toInstrs(opts));
+  // A few lowering paths can leave final store/copy shapes after per-function emission; sweep once here too.
+  for (const fn of fns) if (fn.instructions) fn.instructions = peepholeInstrs(fn.instructions);
   // Always sort functions, so there are minimal changes in generated code
   fns.sort((a, b) => a.name.localeCompare(b.name));
+  // Read once because CompilerOpts may be supplied through a getter or Proxy.
+  const opNgrams = opts.opNgrams;
+  if (opNgrams) recordOpNgrams(mod.name, fns, opts, opNgrams);
   const wasmMod = {
     name: mod.name,
     memory: {

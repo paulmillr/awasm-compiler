@@ -31,35 +31,35 @@ type WasmBinary = { version: number; sections: WasmSection[] };
 export const LEB128: P.CoderType<bigint> = /* @__PURE__ */ (() =>
   deepFreeze(
     P.wrap({
-    encodeStream(w, value: bigint) {
-      let n = BigInt(value);
-      if (n < 0) throw new Error('negative integer');
-      const more = BigInt(0x80); // 0b10000000
-      const mask = BigInt(0x7f); // 0b01111111
-      while (true) {
-        let byte = n & mask;
-        n >>= BigInt(7); // Do the shift BEFORE the check
-        if (n === BigInt(0)) {
-          // Check AFTER shift
+      encodeStream(w, value: bigint) {
+        let n = BigInt(value);
+        if (n < 0) throw new Error('negative integer');
+        const more = BigInt(0x80); // 0b10000000
+        const mask = BigInt(0x7f); // 0b01111111
+        while (true) {
+          let byte = n & mask;
+          n >>= BigInt(7); // Do the shift BEFORE the check
+          if (n === BigInt(0)) {
+            // Check AFTER shift
+            w.byte(Number(byte));
+            break;
+          }
+          byte |= more;
           w.byte(Number(byte));
-          break;
         }
-        byte |= more;
-        w.byte(Number(byte));
-      }
-    },
-    decodeStream(r) {
-      let result = BigInt(0);
-      let shift = 0;
-      while (true) {
-        const byte = BigInt(r.byte());
-        result |= (byte & BigInt(0x7f)) << BigInt(shift);
-        // Stop when the continuation bit is not set.
-        if ((byte & BigInt(0x80)) === BigInt(0)) break;
-        shift += 7;
-      }
-      return result;
-    },
+      },
+      decodeStream(r) {
+        let result = BigInt(0);
+        let shift = 0;
+        while (true) {
+          const byte = BigInt(r.byte());
+          result |= (byte & BigInt(0x7f)) << BigInt(shift);
+          // Stop when the continuation bit is not set.
+          if ((byte & BigInt(0x80)) === BigInt(0)) break;
+          shift += 7;
+        }
+        return result;
+      },
     })
   ))();
 
@@ -67,38 +67,38 @@ export const LEB128: P.CoderType<bigint> = /* @__PURE__ */ (() =>
 export const SLEB128: P.CoderType<bigint> = /* @__PURE__ */ (() =>
   deepFreeze(
     P.wrap({
-    encodeStream(w, value: bigint) {
-      let n = BigInt(value);
-      const more = BigInt(0x80); // 0b10000000
-      const mask = BigInt(0x7f); // 0b01111111
-      while (true) {
-        let byte = n & mask;
-        n >>= BigInt(7);
-        // Determine if this is the last byte based on sign bit and remaining value
-        const isLast =
-          (n === BigInt(0) && (byte & BigInt(0x40)) === BigInt(0)) ||
-          (n === BigInt(-1) && (byte & BigInt(0x40)) !== BigInt(0));
-        if (!isLast) byte |= more; // Set the continuation bit if more bytes follow
-        w.byte(Number(byte));
-        if (isLast) break;
-      }
-    },
-    decodeStream(r) {
-      let result = BigInt(0);
-      let shift = 0;
-      let byte;
-      while (true) {
-        byte = BigInt(r.byte());
-        result |= (byte & BigInt(0x7f)) << BigInt(shift);
-        shift += 7;
-        // Stop when the continuation bit is not set.
-        if ((byte & BigInt(0x80)) === BigInt(0)) break;
-      }
-      // Perform sign extension if needed
-      const msb = BigInt(0x40); // Most significant bit in the last byte
-      if ((byte & msb) !== BigInt(0)) result |= BigInt(-1) << BigInt(shift);
-      return result;
-    },
+      encodeStream(w, value: bigint) {
+        let n = BigInt(value);
+        const more = BigInt(0x80); // 0b10000000
+        const mask = BigInt(0x7f); // 0b01111111
+        while (true) {
+          let byte = n & mask;
+          n >>= BigInt(7);
+          // Determine if this is the last byte based on sign bit and remaining value
+          const isLast =
+            (n === BigInt(0) && (byte & BigInt(0x40)) === BigInt(0)) ||
+            (n === BigInt(-1) && (byte & BigInt(0x40)) !== BigInt(0));
+          if (!isLast) byte |= more; // Set the continuation bit if more bytes follow
+          w.byte(Number(byte));
+          if (isLast) break;
+        }
+      },
+      decodeStream(r) {
+        let result = BigInt(0);
+        let shift = 0;
+        let byte;
+        while (true) {
+          byte = BigInt(r.byte());
+          result |= (byte & BigInt(0x7f)) << BigInt(shift);
+          shift += 7;
+          // Stop when the continuation bit is not set.
+          if ((byte & BigInt(0x80)) === BigInt(0)) break;
+        }
+        // Perform sign extension if needed
+        const msb = BigInt(0x40); // Most significant bit in the last byte
+        if ((byte & msb) !== BigInt(0)) result |= BigInt(-1) << BigInt(shift);
+        return result;
+      },
     })
   ))();
 
@@ -522,8 +522,7 @@ const importSection: P.CoderType<WasmImport[]> = /* @__PURE__ */ (() =>
       importType: P.tag(ImportKind, { function: idx, memory: MemLimits }),
     })
   ))();
-const memorySection: P.CoderType<WasmMemoryLimits[]> = /* @__PURE__ */ (() =>
-  section(MemLimits))();
+const memorySection: P.CoderType<WasmMemoryLimits[]> = /* @__PURE__ */ (() => section(MemLimits))();
 
 const LEB128_32: P.CoderType<number> = /* @__PURE__ */ (() =>
   P.apply(LEB128, P.coders.numberBigint))();
@@ -558,8 +557,9 @@ const BrTableArg: P.CoderType<{ targets: bigint[]; default: bigint }> = /* @__PU
     targets: P.array(LEB128, idx),
     default: idx,
   }))();
-const instruction = /* @__PURE__ */ (() => P.mappedTag(P.U8, {
-  /*
+const instruction = /* @__PURE__ */ (() =>
+  P.mappedTag(P.U8, {
+    /*
   TODO: fix:
 
 block/loop/if take a blocktype (not a generic Type): 0x40 | valtype (0x7F..0x7C) | typeidx (s33).
@@ -568,76 +568,86 @@ call_indirect order is typeidx then tableidx (old toolchains used a reserved 0x0
 
 
   */
-  unreachable: [0x00, EMPTY],
-  nop: [0x01, EMPTY],
-  block: [0x02, BlockType],
-  loop: [0x03, BlockType], // return type of block
-  if: [0x04, BlockType],
-  else: [0x05, EMPTY],
-  end: [0x0b, EMPTY],
-  br: [0x0c, idx],
-  br_if: [0x0d, idx],
-  br_table: [0x0e, BrTableArg],
-  return: [0x0f, EMPTY], // early return (before end?)
-  call: [0x10, idx],
-  call_indirect: [0x11, P.struct({ type: idx, table: idx })],
-  // paramentric?
-  drop: [0x1a, EMPTY], // pops value from stack
-  // [value1] [value2] [condition] from stack, select value based on condition?
-  select: [0x1b, EMPTY],
-  // memory
-  ...getInstructions(memory, EMPTY, 'local', 'global', 'table'),
-  'memory.size': [0x3f, P.magic(P.U8, 0x00)],
-  'memory.grow': [0x40, P.magic(P.U8, 0x00)],
-  // basic
-  ...getInstructions(basic, EMPTY, 'i32', 'i64', 'f32', 'f64'),
-  // references
-  null: [0xd0, RefNullType],
-  is_null: [0xd1, EMPTY],
-  func: [0xd2, idx],
-  // fb: gc + Reference-Typed Strings Proposal
-  // fc: FC extensions ()
-  FC: [
-    0xfc,
-    P.mappedTag(LEB128_32, {
-      // saturade truncation
-      'i32.trunc_sat_f32_s': [0, EMPTY],
-      'i32.trunc_sat_f32_u': [1, EMPTY],
-      'i32.trunc_sat_f64_s': [2, EMPTY],
-      'i32.trunc_sat_f64_u': [3, EMPTY],
-      'i64.trunc_sat_f32_s': [4, EMPTY],
-      'i64.trunc_sat_f32_u': [5, EMPTY],
-      'i64.trunc_sat_f64_s': [6, EMPTY],
-      'i64.trunc_sat_f64_u': [7, EMPTY],
-      // mem
-      'memory.init': [8, P.struct({ segment: idx, mem: idx })], // x 0x00
-      'memory.drop': [9, idx], // segment, x 0x00
-      'memory.copy': [10, P.struct({ dst: idx, src: idx })], // 0x00 0x00
-      'memory.fill': [11, idx], // 0x00
-      // tables
-      'table.init': [12, P.struct({ table: idx, elem: idx })],
-      'table.drop': [13, idx],
-      'table.copy': [14, P.struct({ dst: idx, src: idx })],
-      'table.grow': [15, idx],
-      'table.size': [16, idx],
-      'table.fill': [17, idx],
-    }),
-  ],
-  SIMD: [
-    0xfd,
-    P.mappedTag(LEB128_32, {
-      ...getInstructions(simd, EMPTY, 'v128', 'i8x16', 'i16x8', 'i32x4', 'i64x2', 'f32x4', 'f64x2'),
-    }),
-  ],
-  THREADS: [
-    0xfe,
-    P.mappedTag(LEB128_32, {
-      'atomic.notify': [0x00, memarg],
-      'atomic.fence': [0x03, P.magic(P.U8, 0x00)],
-      ...getInstructions(atomics, memarg, 'i32', 'i64'),
-    }),
-  ],
-}))();
+    unreachable: [0x00, EMPTY],
+    nop: [0x01, EMPTY],
+    block: [0x02, BlockType],
+    loop: [0x03, BlockType], // return type of block
+    if: [0x04, BlockType],
+    else: [0x05, EMPTY],
+    end: [0x0b, EMPTY],
+    br: [0x0c, idx],
+    br_if: [0x0d, idx],
+    br_table: [0x0e, BrTableArg],
+    return: [0x0f, EMPTY], // early return (before end?)
+    call: [0x10, idx],
+    call_indirect: [0x11, P.struct({ type: idx, table: idx })],
+    // paramentric?
+    drop: [0x1a, EMPTY], // pops value from stack
+    // [value1] [value2] [condition] from stack, select value based on condition?
+    select: [0x1b, EMPTY],
+    // memory
+    ...getInstructions(memory, EMPTY, 'local', 'global', 'table'),
+    'memory.size': [0x3f, P.magic(P.U8, 0x00)],
+    'memory.grow': [0x40, P.magic(P.U8, 0x00)],
+    // basic
+    ...getInstructions(basic, EMPTY, 'i32', 'i64', 'f32', 'f64'),
+    // references
+    null: [0xd0, RefNullType],
+    is_null: [0xd1, EMPTY],
+    func: [0xd2, idx],
+    // fb: gc + Reference-Typed Strings Proposal
+    // fc: FC extensions ()
+    FC: [
+      0xfc,
+      P.mappedTag(LEB128_32, {
+        // saturade truncation
+        'i32.trunc_sat_f32_s': [0, EMPTY],
+        'i32.trunc_sat_f32_u': [1, EMPTY],
+        'i32.trunc_sat_f64_s': [2, EMPTY],
+        'i32.trunc_sat_f64_u': [3, EMPTY],
+        'i64.trunc_sat_f32_s': [4, EMPTY],
+        'i64.trunc_sat_f32_u': [5, EMPTY],
+        'i64.trunc_sat_f64_s': [6, EMPTY],
+        'i64.trunc_sat_f64_u': [7, EMPTY],
+        // mem
+        'memory.init': [8, P.struct({ segment: idx, mem: idx })], // x 0x00
+        'memory.drop': [9, idx], // segment, x 0x00
+        'memory.copy': [10, P.struct({ dst: idx, src: idx })], // 0x00 0x00
+        'memory.fill': [11, idx], // 0x00
+        // tables
+        'table.init': [12, P.struct({ table: idx, elem: idx })],
+        'table.drop': [13, idx],
+        'table.copy': [14, P.struct({ dst: idx, src: idx })],
+        'table.grow': [15, idx],
+        'table.size': [16, idx],
+        'table.fill': [17, idx],
+      }),
+    ],
+    SIMD: [
+      0xfd,
+      P.mappedTag(LEB128_32, {
+        ...getInstructions(
+          simd,
+          EMPTY,
+          'v128',
+          'i8x16',
+          'i16x8',
+          'i32x4',
+          'i64x2',
+          'f32x4',
+          'f64x2'
+        ),
+      }),
+    ],
+    THREADS: [
+      0xfe,
+      P.mappedTag(LEB128_32, {
+        'atomic.notify': [0x00, memarg],
+        'atomic.fence': [0x03, P.magic(P.U8, 0x00)],
+        ...getInstructions(atomics, memarg, 'i32', 'i64'),
+      }),
+    ],
+  }))();
 const locals: P.CoderType<WasmLocal[]> = /* @__PURE__ */ (() =>
   P.array(LEB128, P.struct({ count: LEB128, type: ValType })))();
 const codeSection: P.CoderType<WasmCode[]> = /* @__PURE__ */ (() =>

@@ -671,6 +671,10 @@ function initWorkers(limit = 32) {
       let W = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency)
         ? navigator.hardwareConcurrency
         : 4;
+      // AWASM_WORKERS caps the pool (shared CI/bench machines where a per-core pool starves
+      // everything else); browsers have no process object and keep the default.
+      const envW = typeof globalThis.process !== 'undefined' && +globalThis.process.env.AWASM_WORKERS;
+      if (envW) W = Math.min(W, envW);
       W = Math.min(W, 32, limit);
       let workerSrc = ${JSON.stringify(workerSrc)};
       let initWorker;

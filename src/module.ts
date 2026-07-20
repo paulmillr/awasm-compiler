@@ -683,8 +683,7 @@ export class Module<M extends Segs = {}, F extends FnRegistry = {}> {
   use<NM extends Segs, NF extends FnRegistry>(
     f: (m: Module<M, F>) => Module<NM, NF>
   ): Module<NM, NF> {
-    if (typeof f !== 'function')
-      throw new TypeError(`"f" expected function, got type=${typeof f}`);
+    if (typeof f !== 'function') throw new TypeError(`"f" expected function, got type=${typeof f}`);
     return f(this);
   }
   mem<Name extends string, Spec extends ArraySpec | StructSpec>(

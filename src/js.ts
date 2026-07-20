@@ -8,23 +8,35 @@ import { initWorkers } from './workers.ts';
 
 class Stack extends Array<string> {
   lastSide = false;
+  lastMem = false;
   side: boolean[] = [];
+  mem: boolean[] = [];
   pushSide(value: string) {
     this.side.push(true);
+    this.mem.push(false);
+    return super.push(value);
+  }
+  pushMem(value: string) {
+    this.side.push(false);
+    this.mem.push(true);
     return super.push(value);
   }
   override push(...items: string[]) {
     this.side.push(...items.map(() => false));
+    this.mem.push(...items.map(() => false));
     return super.push(...items);
   }
   override pop() {
     this.lastSide = this.side.pop() || false;
+    this.lastMem = this.mem.pop() || false;
     return super.pop();
   }
   clear() {
     this.length = 0;
     this.side.length = 0;
+    this.mem.length = 0;
     this.lastSide = false;
+    this.lastMem = false;
   }
 }
 
@@ -46,13 +58,10 @@ export function genObject(obj: Record<string, any>, deep = true): string {
   const res = Object.entries(obj)
     .map(([k, v]) => {
       // `__proto__:` is a prototype setter in object literals, even when the key is quoted.
-      const key =
-        k === '__proto__'
-          ? `[${JSON.stringify(k)}]`
-          : /^[A-Za-z_$][0-9A-Za-z_$]*$/.test(k)
-            ? k
-            : JSON.stringify(k);
-      return `${key}: ${deep && typeof v === 'object' && v !== null ? genObject(v, true) : v}`;
+      const bare = k !== '__proto__' && /^[A-Za-z_$][0-9A-Za-z_$]*$/.test(k);
+      const key = k === '__proto__' ? `[${JSON.stringify(k)}]` : bare ? k : JSON.stringify(k);
+      const value = deep && typeof v === 'object' && v !== null ? genObject(v, true) : v;
+      return bare && value === k ? key : `${key}: ${value}`;
     })
     .join(', ');
   return `{${res}}`;
@@ -75,17 +84,18 @@ function memSegment(name: string, s: MemOpts, opts: CompilerOpts = {}) {
   const res: Record<string, string> = {};
   for (const [k, [pos, len, chunksCount, chunkSize]] of Object.entries(s.subRegions!)) {
     const regionName = k ? `${name}.${k}` : name;
+    const chunkPos = pos ? `${pos} + i*${chunkSize}` : `i*${chunkSize}`;
     // region consist of chunks (we can provide full)
     if (len >= chunkSize) {
       res[regionName] = `new Uint8Array(memoryExport.buffer, ${pos}, ${len})\n`;
     }
+    const chunkLen = Math.min(len, chunkSize);
     // If a lot of chunks, we don't want to create 10k elements array per element
     const expr =
-      `Array.from({length: ${chunksCount}},` +
-      `(_,i)=>new Uint8Array(memoryExport.buffer, ${pos} + i*${chunkSize}, ${Math.min(
-        len,
-        chunkSize
-      )}))`;
+      chunksCount === 1
+        ? `[new Uint8Array(memoryExport.buffer, ${pos}, ${chunkLen})]`
+        : `Array.from({length: ${chunksCount}},` +
+          `(_,i)=>new Uint8Array(memoryExport.buffer, ${chunkPos}, ${chunkLen}))`;
     res[`${regionName}_chunks`] = `${freeze(expr, opts)}\n`;
   }
   return res;
@@ -162,30 +172,158 @@ export const __TEST: Readonly<{ isLiveAfter: typeof isLiveAfter }> = /* @__PURE_
   isLiveAfter,
 });
 
+// Backreferences require both paths to save byte-identical state and jump to the same label.
+const commonStateJump =
+  /^if \((.+)\) \{\n((?:s\d+ = .+;\n)*)(s\d+ = .+;)continue (L\d+);\n}\n\2\3break \4;}$/gm;
+const hoistCommonStateJumps = (src: string) => {
+  let condIdx = 0;
+  return src.replace(commonStateJump, (original, condition, prefix, last, label) => {
+    const cond = `__awasm_cond${condIdx++}`;
+    const replace =
+      `const ${cond} = ${condition};\n${prefix}${last}\n` +
+      `if (${cond}) {\ncontinue ${label};\n}\nbreak ${label};}`;
+    return replace.length < original.length ? replace : original;
+  });
+};
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 function isNumber(n: string | number) {
   if (typeof n === 'number') return true;
   return `${+n}` === n;
 }
+
+const simpleName = (src: string) => /^[A-Za-z_$][0-9A-Za-z_$]*$/.test(src);
+
+const exprShape = (src: string) => {
+  let depth = 0;
+  let shape = src[0] === '(' && src[src.length - 1] === ')' ? 1 : 0;
+  for (let i = 0; i < src.length; i++) {
+    if (src[i] === '(') depth++;
+    else if (src[i] === ')') {
+      depth--;
+      if (depth === 0 && i !== src.length - 1) shape &= ~1;
+    } else if (depth === 0) {
+      const three = src.slice(i, i + 3);
+      const two = src.slice(i, i + 2);
+      if (
+        three === '===' ||
+        three === '!==' ||
+        two === '<=' ||
+        two === '>=' ||
+        src[i] === '<' ||
+        src[i] === '>'
+      )
+        shape |= 2;
+    }
+  }
+  return depth === 0 ? shape : shape & ~1;
+};
+const wrapped = (src: string) => !!(exprShape(src) & 1);
+
+const unwrap = (src: string) => {
+  let res = src;
+  for (; wrapped(res); ) res = res.slice(1, -1);
+  return res;
+};
+
+const topCompare = (src: string) => !!(exprShape(src) & 2);
+
+const conditionValue = (src: string) => {
+  const plus = src[0] === '+';
+  const body = unwrap(plus ? src.slice(1) : src);
+  if (plus && topCompare(body)) return body;
+  const suffix = ' | 0';
+  if (!body.endsWith(suffix)) return src;
+  const cmp = unwrap(body.slice(0, -suffix.length));
+  return topCompare(cmp) ? cmp : src;
+};
+const bitValue = (value: string) => {
+  const res = conditionValue(value);
+  return res === value ? value : `(${res})`;
+};
+// The pure IIFE lets exports that do not compile JS tree-shake this table.
+const reducedBinary = /* @__PURE__ */ (() =>
+  new Set(
+    `i32.xor i32.add f32.add f64.add i32.mul f32.mul f64.mul
+f32.min f64.min i32.min_s i32.min_u f32.max f64.max i32.max_s i32.max_u`.split(/\s+/)
+  ))();
+// prettier-ignore
+const binaryOp: Record<string, string> = { add: '+', mul: '*' };
+const binaryExpr = (tag: string, left: string, right: string) => {
+  const kind = tag.split('.')[1];
+  if (kind === 'xor') return `(${bitValue(left)} ^ ${bitValue(right)})`;
+  if (kind.startsWith('min') || kind.startsWith('max')) {
+    const op = kind.slice(0, 3);
+    const unsigned = kind.endsWith('_u');
+    const expr =
+      `Math.${op}(${left}${unsigned ? ' >>> 0' : ''}, ` + `${right}${unsigned ? ' >>> 0' : ''})`;
+    return unsigned ? `(${expr} | 0)` : expr;
+  }
+  if (tag === 'i32.mul') return `Math.imul(${left}, ${right})`;
+  const expr = `${left} ${binaryOp[kind]} ${right}`;
+  if (tag.startsWith('f32.')) return `Math.fround(${expr})`;
+  return tag === 'i32.add' ? `((${expr}) | 0)` : `(${expr})`;
+};
 
 // JS based stack machine for wasm compat
 type Instr = any;
 /**
  * Per instruction codegen (main part)
  */
-function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string | undefined {
+function processInstructions(
+  instr: Instr,
+  stack: Stack,
+  isLE: boolean,
+  materialize?: (value: string) => string
+): string | undefined {
   // byteSize -> shift
   const SH = (bs: 1 | 2 | 4 | 8) => (bs === 1 ? 0 : bs === 2 ? 1 : bs === 4 ? 2 : 3);
+  const ADD = (left: string, right: string) => {
+    const l = isNumber(left);
+    const r = isNumber(right);
+    if (l && r) return `${+left + +right}`;
+    if (l && +left === 0) return right;
+    if (r && +right === 0) return left;
+    return `${left} + ${right}`;
+  };
   // Stack i32 operands used by memory ops are unsigned wasm32 values.
-  const U32 = (value: string) => (isNumber(value) ? `${+value >>> 0}` : `((${value}) >>> 0)`);
+  const ARG = (value: string) => (simpleName(value) || wrapped(value) ? value : `(${value})`);
+  const U32_BODY = (value: string) => (isNumber(value) ? `${+value >>> 0}` : `${ARG(value)} >>> 0`);
+  const I32_BODY = (value: string) => (isNumber(value) ? `${+value | 0}` : `${ARG(value)} | 0`);
+  const U32 = (value: string) => (isNumber(value) ? U32_BODY(value) : `(${U32_BODY(value)})`);
+  const I32 = (value: string) => (isNumber(value) ? I32_BODY(value) : `(${I32_BODY(value)})`);
+  const CMP = (left: string, op: string, right: string) => `((${left} ${op} ${right}) | 0)`;
+  const BIT = bitValue;
+  const TERN = (value: string) =>
+    isNumber(value) || simpleName(value) || wrapped(value) ? value : `(${value})`;
+  const POP_RAW = () => {
+    const value = stack.pop()!;
+    return { value, mem: stack.lastMem };
+  };
+  // Direct memory loads often pessimize generated JS when nested deeply; materialize them
+  // at expression construction so scheduling does not depend on a backend-specific option.
+  const USE = (it: { value: string; mem: boolean }) =>
+    it.mem && materialize ? materialize(it.value) : it.value;
+  const POP = () => USE(POP_RAW());
+  const PAIR = (reduce = false) => {
+    const right = POP_RAW();
+    const left = POP_RAW();
+    if (reduce && !left.mem && !right.mem) return [USE(right), USE(left)] as const;
+    return [USE(left), USE(right)] as const;
+  };
+  const BINARY = (reduce = false) => {
+    const [left, right] = PAIR(reduce);
+    stack.push(binaryExpr(instr.TAG, left, right));
+  };
   // Wasm memory addresses are unsigned i32 values, and memarg offsets are unsigned.
   // Signed JS arithmetic aliases high-bit in-bounds addresses on memories above 2GiB.
   // OOB memory access is UB for this JS target; it does not synthesize Wasm traps.
-  const OFF = (addr: string, offset: number) =>
-    isNumber(addr) ? `${(+addr >>> 0) + (offset >>> 0)}` : `((${addr}) >>> 0) + ${offset >>> 0}`;
+  const OFF = (addr: string, offset: number) => ADD(U32(addr), `${offset >>> 0}`);
   const ALIGNED = (byte: string, bs: 2 | 4) => isNumber(byte) && (+byte & (bs - 1)) === 0;
   // address -> element index with memarg offset
   const IDX_BYTE = (byte: string, shift: number) =>
-    isNumber(byte) ? `${+byte >>> shift}` : `(${byte}) >>> ${shift}`;
+    isNumber(byte) ? `${+byte >>> shift}` : `${ARG(byte)} >>> ${shift}`;
   const IDX = (addr: string, offset: number, shift: number) => IDX_BYTE(OFF(addr, offset), shift);
   const ATOMIC_THROW = `(()=>{throw new Error('unaligned atomic access')})()`;
   const ATOMIC = (addr: string, offset: number, bs: 1 | 2 | 4, expr: (idx: string) => string) => {
@@ -206,21 +344,7 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
     expr: (idx: string) => string
   ) => `${ATOMIC(addr, offset, bs, expr)};`;
   if (['i32.const', 'f32.const', 'f64.const'].includes(instr.TAG)) stack.push(`${instr.data}`);
-  else if (instr.TAG === 'i32.xor') stack.push(`(${stack.pop()} ^ ${stack.pop()})`);
-  else if (instr.TAG === 'i32.add') stack.push(`((${stack.pop()} + ${stack.pop()}) | 0)`);
-  else if (instr.TAG === 'f32.add') stack.push(`Math.fround(${stack.pop()} + ${stack.pop()})`);
-  else if (instr.TAG === 'f64.add') stack.push(`(${stack.pop()} + ${stack.pop()})`);
-  else if (instr.TAG === 'i32.mul') stack.push(`Math.imul(${stack.pop()}, ${stack.pop()})`);
-  else if (instr.TAG === 'f32.mul') stack.push(`Math.fround(${stack.pop()} * ${stack.pop()})`);
-  else if (instr.TAG === 'f64.mul') stack.push(`(${stack.pop()} * ${stack.pop()})`);
-  else if (['f32.min', 'f64.min', 'i32.min_s'].includes(instr.TAG))
-    stack.push(`Math.min(${stack.pop()}, ${stack.pop()})`);
-  else if (instr.TAG === 'i32.min_u')
-    stack.push(`(Math.min(${stack.pop()} >>> 0, ${stack.pop()} >>> 0) | 0)`);
-  else if (['f32.max', 'f64.max', 'i32.max_s'].includes(instr.TAG))
-    stack.push(`Math.max(${stack.pop()}, ${stack.pop()})`);
-  else if (instr.TAG === 'i32.max_u')
-    stack.push(`(Math.max(${stack.pop()} >>> 0, ${stack.pop()} >>> 0) | 0)`);
+  else if (reducedBinary.has(instr.TAG)) BINARY(true);
   else if (instr.TAG === 'f32.copysign') {
     const y = stack.pop();
     const x = stack.pop();
@@ -240,86 +364,81 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
         ` :  Math.abs(${x})`
     );
   } else if (instr.TAG === 'i32.reinterpret_f32')
-    stack.push(`(new Int32Array(new Float32Array([${stack.pop()}]).buffer)[0])`);
+    stack.push(`(new Int32Array(new Float32Array([${POP()}]).buffer)[0])`);
   else if (instr.TAG === 'f32.reinterpret_i32')
-    stack.push(`(new Float32Array(new Int32Array([${stack.pop()}]).buffer)[0])`);
+    stack.push(`(new Float32Array(new Int32Array([${POP()}]).buffer)[0])`);
   else if (instr.TAG === 'i32.reinterpret_f64_low')
-    stack.push(`(new Uint32Array(new Float64Array([${stack.pop()}]).buffer)[0])`);
+    stack.push(`(new Uint32Array(new Float64Array([${POP()}]).buffer)[0])`);
   else if (instr.TAG === 'i32.reinterpret_f64_high')
-    stack.push(`(new Uint32Array(new Float64Array([${stack.pop()}]).buffer)[1])`);
+    stack.push(`(new Uint32Array(new Float64Array([${POP()}]).buffer)[1])`);
   else if (instr.TAG === 'f64.reinterpret_i32') {
     const hi = stack.pop();
     const lo = stack.pop();
     stack.push(`(new Float64Array(new Uint32Array([${lo}, ${hi}]).buffer)[0])`);
   } else if (instr.TAG === 'i32.sub') {
-    const a = stack.pop();
-    const b = stack.pop();
-    stack.push(`((${b} - ${a}) | 0)`);
+    const [left, right] = PAIR();
+    stack.push(`((${left} - ${right}) | 0)`);
   } else if (instr.TAG === 'f32.sub') {
-    const a = stack.pop();
-    const b = stack.pop();
-    stack.push(`Math.fround(${b} - ${a})`);
+    const [left, right] = PAIR();
+    stack.push(`Math.fround(${left} - ${right})`);
   } else if (instr.TAG === 'f64.sub') {
-    const a = stack.pop();
-    const b = stack.pop();
-    stack.push(`(${b} - ${a})`);
+    const [left, right] = PAIR();
+    stack.push(`(${left} - ${right})`);
   } else if (instr.TAG === 'f32.div') {
-    const a = stack.pop();
-    const b = stack.pop();
-    stack.push(`Math.fround(${b} / ${a})`);
+    const [left, right] = PAIR();
+    stack.push(`Math.fround(${left} / ${right})`);
   } else if (instr.TAG === 'f64.div') {
-    const a = stack.pop();
-    const b = stack.pop();
-    stack.push(`(${b} / ${a})`);
+    const [left, right] = PAIR();
+    stack.push(`(${left} / ${right})`);
   } else if (instr.TAG === 'f32.rem') {
     // Slightly different than Math.fround(b % a), this way it would be precise
-    const a = stack.pop();
-    const b = stack.pop();
-    stack.push(`Math.fround(${b} - (Math.trunc(${b} / ${a}) * ${a}))`);
+    const [left, right] = PAIR();
+    stack.push(`Math.fround(${left} - (Math.trunc(${left} / ${right}) * ${right}))`);
   } else if (instr.TAG === 'f64.rem') {
-    const a = stack.pop();
-    const b = stack.pop();
+    const [left, right] = PAIR();
     //    stack.push(`(${b} % ${a})`);
-    stack.push(`(${b} - (Math.trunc(${b} / ${a}) * ${a}))`);
+    stack.push(`(${left} - (Math.trunc(${left} / ${right}) * ${right}))`);
   } else if (instr.TAG === 'f32.demote_f64') {
-    stack.push(`Math.fround(${stack.pop()})`);
+    stack.push(`Math.fround(${POP()})`);
   } else if (instr.TAG === 'f32.convert_i32_s') {
-    stack.push(`Math.fround((${stack.pop()}) | 0)`);
+    stack.push(`Math.fround(${I32_BODY(POP())})`);
   } else if (instr.TAG === 'f32.convert_i32_u') {
-    stack.push(`Math.fround((${stack.pop()}) >>> 0)`);
+    stack.push(`Math.fround(${U32_BODY(POP())})`);
   } else if (instr.TAG === 'f64.convert_i32_s') {
-    stack.push(`((${stack.pop()}) | 0)`);
+    stack.push(I32(POP()));
   } else if (instr.TAG === 'f64.convert_i32_u') {
-    stack.push(`((${stack.pop()}) >>> 0)`);
+    stack.push(U32(POP()));
   } else if (['i32.trunc_f32_u', 'i32.trunc_f64_u'].includes(instr.TAG)) {
     // UB: callers must keep trunc inputs finite/in range; JS output has no trap model.
-    stack.push(`(Math.trunc(${stack.pop()}) >>> 0) | 0`);
+    stack.push(`(Math.trunc(${POP()}) >>> 0) | 0`);
   } else if (['i32.trunc_f32_s', 'i32.trunc_f64_s'].includes(instr.TAG)) {
     // UB: callers must keep trunc inputs finite/in range; JS output has no trap model.
-    stack.push(`(Math.trunc(${stack.pop()}) | 0)`);
+    stack.push(`(Math.trunc(${POP()}) | 0)`);
   } else if (instr.TAG === 'f64.promote_f32') {
-    stack.push(`${stack.pop()}`);
+    stack.push(`${POP()}`);
   } else if (instr.TAG === 'i32.and') {
-    stack.push(`(${stack.pop()} & ${stack.pop()})`);
+    const [left, right] = PAIR(true);
+    stack.push(`(${BIT(left)} & ${BIT(right)})`);
   } else if (instr.TAG === 'i32.or') {
-    stack.push(`(${stack.pop()} | ${stack.pop()})`);
+    const [left, right] = PAIR(true);
+    stack.push(`(${BIT(left)} | ${BIT(right)})`);
   } else if (instr.TAG === 'i32.not') {
-    stack.push(`(~${stack.pop()})`);
+    stack.push(`(~${BIT(POP())})`);
   } else if (instr.TAG === 'i32.abs') {
-    stack.push(`(Math.abs(${stack.pop()}) | 0)`);
+    stack.push(`(Math.abs(${POP()}) | 0)`);
   } else if (['f32.abs', 'f64.abs'].includes(instr.TAG)) {
-    stack.push(`Math.abs(${stack.pop()})`);
+    stack.push(`Math.abs(${POP()})`);
   } else if (['f32.ceil', 'f64.ceil'].includes(instr.TAG)) {
-    stack.push(`Math.ceil(${stack.pop()})`);
+    stack.push(`Math.ceil(${POP()})`);
   } else if (['f32.floor', 'f64.floor'].includes(instr.TAG)) {
-    stack.push(`Math.floor(${stack.pop()})`);
+    stack.push(`Math.floor(${POP()})`);
   } else if (['f32.trunc', 'f64.trunc'].includes(instr.TAG)) {
-    stack.push(`Math.trunc(${stack.pop()})`);
+    stack.push(`Math.trunc(${POP()})`);
   } else if (instr.TAG === 'f32.sqrt') {
     // f32 operations must round back to binary32; Math.sqrt returns f64.
-    stack.push(`Math.fround(Math.sqrt(${stack.pop()}))`);
+    stack.push(`Math.fround(Math.sqrt(${POP()}))`);
   } else if (instr.TAG === 'f64.sqrt') {
-    stack.push(`Math.sqrt(${stack.pop()})`);
+    stack.push(`Math.sqrt(${POP()})`);
   } else if (instr.TAG === 'f64.nearest') {
     stack.push(
       `((x)=>{` +
@@ -328,7 +447,7 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
         `const d = x - f;` +
         `let r = d < 0.5 ? f : d > 0.5 ? f + 1 : ((f % 2) === 0 ? f : f + 1);` +
         `return r === 0 ? ((x < 0 || 1/x === -Infinity) ? -0 : 0) : r;` +
-        `})(${stack.pop()})`
+        `})(${POP()})`
     );
   } else if (instr.TAG === 'f32.nearest') {
     stack.push(
@@ -339,35 +458,30 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
         `const d = x - f;` +
         `let r = d < 0.5 ? f : d > 0.5 ? f + 1 : ((f % 2) === 0 ? f : f + 1);` +
         `return r === 0 ? ((x < 0 || 1/x === -Infinity) ? -0 : 0) : r;` +
-        `})(${stack.pop()})` +
+        `})(${POP()})` +
         `)`
     );
   } else if (['f32.eqz', 'f64.eqz'].includes(instr.TAG)) {
-    stack.push(`+(${stack.pop()} === 0)`);
+    stack.push(`+(${POP()} === 0)`);
   } else if (['f32.isNaN', 'f64.isNaN'].includes(instr.TAG)) {
-    stack.push(`(Number.isNaN(${stack.pop()}) ? 1 : 0)`);
+    stack.push(`(Number.isNaN(${POP()}) ? 1 : 0)`);
   } else if (instr.TAG === 'i32.shl') {
-    const a = stack.pop();
-    const b = stack.pop();
-    stack.push(`(${b} << ${a})`);
+    const [left, right] = PAIR();
+    stack.push(`(${left} << ${right})`);
   } else if (instr.TAG === 'i32.shr_u') {
-    const a = stack.pop();
-    const b = stack.pop();
-    stack.push(`(${b} >>> ${a})`);
+    const [left, right] = PAIR();
+    stack.push(`(${left} >>> ${right})`);
   } else if (instr.TAG === 'i32.shr_s') {
-    const a = stack.pop();
-    const b = stack.pop();
-    stack.push(`(${b} >> ${a})`);
+    const [left, right] = PAIR();
+    stack.push(`(${left} >> ${right})`);
   } else if (instr.TAG === 'i32.rotr') {
-    const a = stack.pop();
-    const b = stack.pop();
+    const [left, right] = PAIR();
     // const rotr = (word: number, shift: number) => (word << (32 - shift)) | (word >>> shift);
-    stack.push(`(((${b} >>> ${a}) | ` + `(${b} << (32 - ${a}))))`);
+    stack.push(`(((${left} >>> ${right}) | ` + `(${left} << (32 - ${right}))))`);
   } else if (instr.TAG === 'i32.rotl') {
-    const a = stack.pop();
-    const b = stack.pop();
+    const [left, right] = PAIR();
     //          return (word << shift) | ((word >>> (32 - shift)) >>> 0);
-    stack.push(`((${b} << ${a}) | ((${b} >>> (32 - ${a})) >>> 0))`);
+    stack.push(`((${left} << ${right}) | ((${left} >>> (32 - ${right})) >>> 0))`);
   } else if (
     (instr.TAG.includes('.load') || instr.TAG.includes('.store')) &&
     !instr.TAG.includes('atomic')
@@ -386,17 +500,17 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
     const useTA4 = useTA && align4;
     const LE = instr.data.swapEndianness ? 'false' : 'true';
     // load, swap endianess
-    if (instr.TAG === 'i32.load' && useTA4) stack.push(`memory_i32[${offset4}]`);
-    else if (instr.TAG === 'i32.load16_u' && useTA2) stack.push(`memory_u16[${offset2}]`);
-    else if (instr.TAG === 'i32.load16_s' && useTA2) stack.push(`memory_i16[${offset2}]`);
-    else if (instr.TAG === 'i32.load8_u') stack.push(`memory[${offset}]`);
-    else if (instr.TAG === 'i32.load8_s') stack.push(`memory_i8[${offset}]`);
+    if (instr.TAG === 'i32.load' && useTA4) stack.pushMem(`memory_i32[${offset4}]`);
+    else if (instr.TAG === 'i32.load16_u' && useTA2) stack.pushMem(`memory_u16[${offset2}]`);
+    else if (instr.TAG === 'i32.load16_s' && useTA2) stack.pushMem(`memory_i16[${offset2}]`);
+    else if (instr.TAG === 'i32.load8_u') stack.pushMem(`memory[${offset}]`);
+    else if (instr.TAG === 'i32.load8_s') stack.pushMem(`memory_i8[${offset}]`);
     // load fallback
-    else if (instr.TAG === 'i32.load') stack.push(`memory_view.getInt32(${offset}, ${LE})`);
-    else if (instr.TAG === 'f32.load') stack.push(`memory_view.getFloat32(${offset}, ${LE})`);
-    else if (instr.TAG === 'f64.load') stack.push(`memory_view.getFloat64(${offset}, ${LE})`);
-    else if (instr.TAG === 'i32.load16_u') stack.push(`memory_view.getUint16(${offset}, ${LE})`);
-    else if (instr.TAG === 'i32.load16_s') stack.push(`memory_view.getInt16(${offset}, ${LE})`);
+    else if (instr.TAG === 'i32.load') stack.pushMem(`memory_view.getInt32(${offset}, ${LE})`);
+    else if (instr.TAG === 'f32.load') stack.pushMem(`memory_view.getFloat32(${offset}, ${LE})`);
+    else if (instr.TAG === 'f64.load') stack.pushMem(`memory_view.getFloat64(${offset}, ${LE})`);
+    else if (instr.TAG === 'i32.load16_u') stack.pushMem(`memory_view.getUint16(${offset}, ${LE})`);
+    else if (instr.TAG === 'i32.load16_s') stack.pushMem(`memory_view.getInt16(${offset}, ${LE})`);
     // store, aligned
     else if (instr.TAG === 'i32.store' && useTA4) return `memory_i32[${offset4}] = ${val};`;
     else if (instr.TAG === 'i32.store16' && useTA2) return `memory_i16[${offset2}] = ${val};`;
@@ -408,10 +522,10 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
     else if (instr.TAG === 'i32.store16') return `memory_view.setInt16(${offset}, ${val}, ${LE});`;
     else throw new Error('unknown instruction: ' + instr.TAG);
   } else if (instr.TAG === 'select') {
-    const cond = stack.pop();
+    const cond = conditionValue(stack.pop()!);
     const b = stack.pop();
     const a = stack.pop();
-    stack.push(`((${cond}) ? (${a}) : (${b}))`);
+    stack.push(`(${TERN(cond)} ? ${TERN(a!)} : ${TERN(b!)})`);
   } else if (instr.TAG === 'i32.addCarry') {
     const args = [];
     while (stack.length) args.push(stack.pop());
@@ -432,11 +546,11 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
     stack.push(`(Number(${stack.pop()}) & 0xffffffff)`);
   } else if (instr.TAG === 'i32.eqz') {
     const x = stack.pop();
-    stack.push(`((((${x}) | 0) === 0) | 0)`);
+    stack.push(CMP(I32(x!), '===', '0'));
   } else if (instr.TAG === 'i32.eq') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) | 0) === ((${a}) | 0)) | 0)`);
+    stack.push(CMP(I32(b!), '===', I32(a!)));
   } else if (['f32.eq', 'f64.eq'].includes(instr.TAG)) {
     const a = stack.pop(),
       b = stack.pop();
@@ -464,61 +578,61 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
   } else if (instr.TAG === 'i32.ne') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) | 0) !== ((${a}) | 0)) | 0)`);
+    stack.push(CMP(I32(b!), '!==', I32(a!)));
   } else if (instr.TAG === 'i32.lt_s') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) | 0) < ((${a}) | 0)) | 0)`);
+    stack.push(CMP(I32(b!), '<', I32(a!)));
   } else if (instr.TAG === 'i32.lt_u') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) >>> 0) < ((${a}) >>> 0)) | 0)`);
+    stack.push(CMP(U32(b!), '<', U32(a!)));
   } else if (instr.TAG === 'i32.gt_s') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) | 0) > ((${a}) | 0)) | 0)`);
+    stack.push(CMP(I32(b!), '>', I32(a!)));
   } else if (instr.TAG === 'i32.gt_u') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) >>> 0) > ((${a}) >>> 0)) | 0)`);
+    stack.push(CMP(U32(b!), '>', U32(a!)));
   } else if (instr.TAG === 'i32.le_s') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) | 0) <= ((${a}) | 0)) | 0)`);
+    stack.push(CMP(I32(b!), '<=', I32(a!)));
   } else if (instr.TAG === 'i32.le_u') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) >>> 0) <= ((${a}) >>> 0)) | 0)`);
+    stack.push(CMP(U32(b!), '<=', U32(a!)));
   } else if (instr.TAG === 'i32.ge_s') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) | 0) >= ((${a}) | 0)) | 0)`);
+    stack.push(CMP(I32(b!), '>=', I32(a!)));
   } else if (instr.TAG === 'i32.ge_u') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((${b}) >>> 0) >= ((${a}) >>> 0)) | 0)`);
+    stack.push(CMP(U32(b!), '>=', U32(a!)));
   } else if (instr.TAG === 'i32.div_s') {
     const a = stack.pop(),
       b = stack.pop();
     // UB: callers must keep integer div/rem operands valid; JS output has no trap/error model.
-    stack.push(`(((((${b})|0)/(((${a})|0)))|0))`);
+    stack.push(`((${I32(b!)} / ${I32(a!)}) | 0)`);
   } else if (instr.TAG === 'i32.div_u') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((((${b})>>>0)/(((${a})>>>0))))>>>0))`);
+    stack.push(`((${U32(b!)} / ${U32(a!)}) >>> 0)`);
   } else if (instr.TAG === 'i32.rem_s') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`(((((${b})|0)%(((${a})|0)))|0))`);
+    stack.push(`((${I32(b!)} % ${I32(a!)}) | 0)`);
   } else if (instr.TAG === 'i32.rem_u') {
     const a = stack.pop(),
       b = stack.pop();
-    stack.push(`((((((${b})>>>0)%(((${a})>>>0))))>>>0))`);
+    stack.push(`((${U32(b!)} % ${U32(a!)}) >>> 0)`);
   } else if (['i32.neg', 'f32.neg', 'f64.neg'].includes(instr.TAG)) {
     stack.push(`(-${stack.pop()})`);
   } else if (instr.TAG === 'i32.andnot') {
-    const a = stack.pop(),
-      b = stack.pop();
+    const a = BIT(stack.pop()!),
+      b = BIT(stack.pop()!);
     stack.push(`(${b} & ~${a})`);
   } else if (instr.TAG === 'i32.clz') {
     const a = stack.pop();
@@ -545,15 +659,15 @@ function processInstructions(instr: Instr, stack: Stack, isLE: boolean): string 
     const len = U32(stack.pop()!);
     const value = stack.pop()!;
     const pos = U32(stack.pop()!);
-    return `memory.fill(${value}, ${pos}, ${pos} + ${len})`;
+    return `memory.fill(${value}, ${pos}, ${ADD(pos, len)})`;
   } else if (instr.TAG === 'memory.copy') {
     // [dstPos, srcPos, len]
     const len = U32(stack.pop()!);
     const srcPos = U32(stack.pop()!);
     const dstPos = U32(stack.pop()!);
     //exp.copyWithin(dst, src, src + len)
-    return `memory.copyWithin(${dstPos}, ${srcPos}, ${srcPos}+${len});`;
-    // lines.push(`memory.subarray(${dstPos}).set(memory.subarray(${srcPos}, ${srcPos}+${len}));`);
+    return `memory.copyWithin(${dstPos}, ${srcPos}, ${ADD(srcPos, len)});`;
+    // lines.push(`memory.subarray(${dstPos}).set(memory.subarray(${srcPos}, ${ADD(srcPos, len)}));`);
   } else if (instr.TAG === 'drop') {
     const value = stack.pop();
     if (value && stack.lastSide)
@@ -815,17 +929,29 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true, sta
   let maxCallIdx = 0;
   let labelIdx = 0;
   let lStateIdx = 0;
+  let saveTmpIdx = 0;
+  let stackTmpIdx = 0;
   let stackArgs: Set<number> = new Set();
   let stackLines: string[] = [];
   let stackProvides: number[] = [];
+  // Split helpers are top-level functions; pending break/continue lines must stay with labels.
+  let stackControl = false;
+  const controlOp = { TAG: 'stack-control' };
   const forcedMutable = new Set<number>();
   const forcedDeclared = new Set<number>(inputs.map((_: string, i: number) => i));
+  for (const i of instructions) {
+    // Guard blocks are also void blocks, but only state-carrying blocks have hoist locals.
+    if ((i.TAG === 'block' || i.TAG === 'loop') && i.data === 'void')
+      for (const id of i.hoist || []) forcedMutable.add(id);
+  }
   const collapseStack: {
     line: string;
     args: typeof stackArgs;
     op?: any;
     provides: number[];
+    aliases: Record<number, string>;
   }[] = []; // new instructions
+  const aliases: Record<number, string> = {};
 
   const stackPop = (pos: number) => {
     if (!stack.length) {
@@ -848,25 +974,69 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true, sta
         throw new Error('non empty stack after static line');
       }
       if (line) stackLines.push(line);
+      if (op) stackControl = true;
       if (provides !== undefined) {
         if (Array.isArray(provides)) stackProvides.push(...provides);
         else stackProvides.push(provides);
       }
     } else {
+      const collapseLine = [...stackLines, line].join('\n');
+      const hasStateAlias = opts.jsStateArray && /\bs\d+\b/.test(collapseLine);
       collapseStack.push({
-        line: [...stackLines, line].join('\n'),
+        line: collapseLine,
         args: stackArgs,
-        op,
+        op: op || (stackControl || hasStateAlias ? controlOp : undefined),
         provides: stackProvides.concat(provides !== undefined ? provides : []),
+        aliases: { ...aliases },
       });
       if (!peek) {
         stackArgs = new Set();
         stackLines = [];
         stackProvides = [];
+        stackControl = false;
       }
     }
   };
-  const getVar = (id: number) => (opts.jsStateArray ? `${vName}[${id}]` : `v${id}`);
+  const getVar = (id: number) => aliases[id] || (opts.jsStateArray ? `${vName}[${id}]` : `v${id}`);
+  const setVarName = (id: number) => (opts.jsStateArray ? `${vName}[${id}]` : `v${id}`);
+  const nameRegExp = (name: string, flags = '') =>
+    simpleName(name)
+      ? new RegExp(`\\b${escapeRegExp(name)}\\b`, flags)
+      : new RegExp(escapeRegExp(name), flags);
+  const hasName = (src: string, name: string) => nameRegExp(name).test(src);
+  const replaceName = (src: string, name: string, value: string) =>
+    src.replace(nameRegExp(name, 'g'), value);
+  const preserveStackRefs = (id: number) => {
+    if (!stack.length) return '';
+    const name = setVarName(id);
+    if (!stack.some((i) => hasName(i, name))) return '';
+    const tmp = `__awasm_stack${stackTmpIdx++}`;
+    for (let i = 0; i < stack.length; i++) stack[i] = replaceName(stack[i], name, tmp);
+    return `const ${tmp} = ${name};\n`;
+  };
+  const materializeMem = (value: string) => {
+    const tmp = `__awasm_mem${stackTmpIdx++}`;
+    stackLines.push(`const ${tmp} = ${value};`);
+    return tmp;
+  };
+  const saveStateVars = (stateVars: number[], args: string[]) => {
+    const saves = stateVars
+      .map((id, pos) => ({ id, value: args[pos] }))
+      .filter(({ id, value }) => value !== `s${id}`);
+    const targets = saves.map(({ id }) => `s${id}`);
+    const temps: string[] = [];
+    const lines: string[] = [];
+    for (const save of saves) {
+      let value = save.value;
+      if (targets.some((name) => hasName(value, name))) {
+        const tmp = `__awasm_state${saveTmpIdx++}`;
+        temps.push(`const ${tmp} = ${value};`);
+        value = tmp;
+      }
+      lines.push(`s${save.id} = ${value};`);
+    }
+    return temps.concat(lines).join('\n');
+  };
   const stateValue = (id: number, value: string) => {
     const type = stateTypes[id];
     if (type === 'i32') return `((${value}) | 0)`;
@@ -879,6 +1049,7 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true, sta
     return `((${value}) | 0)`;
   };
   const getSetVar = (id: number, value: string) => {
+    delete aliases[id];
     let res = `${getVar(id)} = ${opts.jsStateArray ? stateValue(id, value) : value};`;
     if (!opts.jsStateArray && forcedMutable.has(id)) {
       if (!forcedDeclared.has(id)) {
@@ -897,6 +1068,7 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true, sta
         line: stackLines.join('\n'),
         args: stackArgs,
         provides: stackProvides,
+        aliases: { ...aliases },
       });
     stackArgs = new Set();
     stackLines = [];
@@ -906,27 +1078,66 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true, sta
     [];
   for (let pos = 0; pos < instructions.length; pos++) {
     const i = instructions[pos];
-    const eatTail = (outs: string[], forceMutableOnControl = false) => {
+    const eatTail = (
+      outs: string[],
+      forceMutableOnControl = false,
+      ids?: number[],
+      aliasSets = false
+    ) => {
       let line = '';
       const sets = instructions.slice(pos + 1, pos + 1 + outs.length);
       const nextPos = pos + 1 + outs.length;
-      const idx = [];
-      for (let i of sets) {
-        if (i.TAG !== 'local.set') throw new Error('non set after call');
-        idx.push(Number(i.data));
+      const tails: { idx?: number; tee: boolean }[] = [];
+      for (let j = 0; j < sets.length; j++) {
+        const i = sets[j];
+        if (i.TAG === 'drop') {
+          tails.push({ tee: false });
+          continue;
+        }
+        if (i.TAG !== 'local.set' && i.TAG !== 'local.tee')
+          throw new Error('non set/drop after result');
+        // Result tails consume call/block/end outputs in reverse order. A tee is only valid
+        // in the final raw tail slot where it preserves the one value a following get used.
+        if (i.TAG === 'local.tee' && j !== sets.length - 1) throw new Error('non-final tee tail');
+        tails.push({ idx: Number(i.data), tee: i.TAG === 'local.tee' });
       }
       pos += outs.length; // +1 after for should compensate? (not sure!)
-      idx.reverse(); // they will eat stack in reverse order? (not sure!)
+      tails.reverse(); // they will eat stack in reverse order? (not sure!)
       const live: number[] = [];
+      const pushes: { idx: number; value: string }[] = [];
       for (let i = 0; i < outs.length; i++) {
+        const { idx: id, tee } = tails[i];
+        if (id === undefined) {
+          // Dropped typed-block identity results are still readable from the block state temp.
+          if (ids) aliases[ids[i]] = outs[i];
+          continue;
+        }
+        if (aliasSets && ids) {
+          // Typed-block arg locals are immutable aliases for the current block state temp.
+          aliases[id] = outs[i];
+          // A tail tee still leaves that block input on the operand stack for an immediate branch.
+          if (tee) pushes.push({ idx: id, value: getVar(id) });
+          continue;
+        }
         let crossesControl = false;
-        const liveAfter = isLiveAfter(instructions, nextPos, idx[i], () => (crossesControl = true));
-        if (isDeadVar(idx[i]) || !liveAfter) continue;
-        if (crossesControl && forceMutableOnControl) forcedMutable.add(idx[i]);
-        line += `${getSetVar(idx[i], outs[i])}\n`;
-        live.push(idx[i]);
+        const liveAfter = isLiveAfter(instructions, nextPos, id, () => (crossesControl = true));
+        const shouldSet = tee || (!isDeadVar(id) && liveAfter);
+        if (shouldSet) {
+          if (crossesControl && forceMutableOnControl) forcedMutable.add(id);
+          line += `${getSetVar(id, outs[i])}\n`;
+          live.push(id);
+        }
+        if (tee) pushes.push({ idx: id, value: getVar(id) });
       }
-      return { line, idx: live };
+      return { line, idx: live, pushes };
+    };
+    const pushTail = (pushes: { idx: number; value: string }[]) => {
+      // Tail tee values must be pushed after control lines are flushed as control boundaries;
+      // otherwise the splitter can move branches outside the labels they target.
+      for (const p of pushes) {
+        stack.push(p.value);
+        stackArgs.add(p.idx);
+      }
     };
 
     if (i.TAG === 'local.get') {
@@ -942,7 +1153,7 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true, sta
         continue;
       }
       // local.set(); push(local.get)
-      flushStack(getSetVar(id, value), undefined, id, true);
+      flushStack(`${preserveStackRefs(id)}${getSetVar(id, value)}`, undefined, id, true);
       stack.push(getVar(id));
     } else if (i.TAG === 'local.set') {
       const id = Number(i.data);
@@ -953,9 +1164,9 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true, sta
         flushPending();
         continue;
       }
-      flushStack(getSetVar(id, value), undefined, id, true);
+      flushStack(`${preserveStackRefs(id)}${getSetVar(id, value)}`, undefined, id, true);
     } else if (['br', 'br_if'].includes(i.TAG)) {
-      const cond = i.TAG === 'br_if' ? stackPop(pos) : undefined;
+      const cond = i.TAG === 'br_if' ? conditionValue(stackPop(pos)) : undefined;
       const target = blockStack[blockStack.length - 1 - Number(i.data)];
       if (!target) throw new Error('wrong br target');
       const jmp = `${target.kind === 'loop' ? 'continue' : 'break'} ${target.label};`;
@@ -965,7 +1176,7 @@ function generateInstructions(fn: any, opts: CompilerOpts = {}, isLE = true, sta
         const args: string[] = stack.slice(-op.data.inputs.length);
         if (args.length !== op.data.inputs.length)
           throw new Error('args.length !== op.data.inputs.length');
-        const saveState = stateVars.map((i, j) => `s${i} = ${args[j]};`).join('\n');
+        const saveState = saveStateVars(stateVars, args);
         if (cond) {
           line = `if (${cond}) {
 ${saveState}${jmp}
@@ -997,12 +1208,13 @@ ${saveState}${jmp}
         }
         const outs = [];
         for (const i of stateVars) outs.push(`s${i}`);
-        const { line: tailLine, idx } = eatTail(outs);
+        const { line: tailLine, idx, pushes } = eatTail(outs, false, i.hoist, true);
         line += loopLine;
         line += tailLine;
         flushStack(line, i, idx);
+        pushTail(pushes);
         continue;
-      } else if (!opts.jsStateArray && i.hoist.length) {
+      } else if (!opts.jsStateArray && i.hoist?.length) {
         const hoist = i.hoist.filter(
           (id: number) => !(forcedMutable.has(id) && forcedDeclared.has(id))
         );
@@ -1025,9 +1237,10 @@ ${saveState}${jmp}
         const outs = [];
         if (i.opts.outTypes.length === 1) outs.push(tmp);
         else for (let k = 0; k < i.opts.outTypes.length; k++) outs.push(`${tmp}[${k}]`);
-        const { line: tailLine, idx } = eatTail(outs, true);
+        const { line: tailLine, idx, pushes } = eatTail(outs, true);
         line += tailLine;
         flushStack(line, undefined, idx);
+        pushTail(pushes);
       }
     } else if (i.TAG === 'end') {
       const target = blockStack[blockStack.length - 1];
@@ -1038,11 +1251,13 @@ ${saveState}${jmp}
           const args: string[] = [];
           for (const _ of op.data.inputs) args.push(stackPop(pos));
           args.reverse();
-          const saveState = stateVars.map((i, j) => `s${i} = ${args[j]};`).join('\n');
+          const saveState = saveStateVars(stateVars, args);
           const outs = [];
           for (let i of stateVars) outs.push(`s${i}`);
-          const { line: tailLine, idx } = eatTail(outs);
+          // `drop` tails mark identity results that do not need a result local after the block.
+          const { line: tailLine, idx, pushes } = eatTail(outs, false, op.hoist, true);
           flushStack(`${saveState}${end}${tailLine}`, i, idx);
+          pushTail(pushes);
           blockStack.pop();
           continue;
         } else {
@@ -1066,7 +1281,7 @@ ${saveState}${jmp}
       flushStack(`return ${line};`, i);
       blockStack.pop();
     } else {
-      const line = processInstructions(i, stack, isLE);
+      const line = processInstructions(i, stack, isLE, materializeMem);
       if (!line) continue; // pushed to stack
       flushStack(line); // don't care about op here, non control!
     }
@@ -1100,15 +1315,14 @@ ${saveState}${jmp}
     let size = 0;
     const inputs = new Set<number>();
     const outputs = new Set<number>();
+    const provided = new Set<number>();
     for (let i = 0; i < len; i++) {
       const it = collapseStack[pos + i];
       size += it.line.length;
-      for (const a of it.args) inputs.add(a);
+      // A variable written later in the helper is still an input if this region reads it first.
+      for (const a of it.args) if (!provided.has(a)) inputs.add(a);
       for (const p of it.provides) outputs.add(p);
-    }
-    // remove locals defined inside region from inputs
-    for (let i = 0; i < len; i++) {
-      for (const p of collapseStack[pos + i].provides) inputs.delete(p);
+      for (const p of it.provides) provided.add(p);
     }
     // keep only outputs that are used outside the region
     for (const o of outputs) {
@@ -1131,6 +1345,7 @@ ${saveState}${jmp}
     };
   }
   let partIdx = 0;
+  let splitTmpIdx = 0;
 
   // PRECOMPUTE once inside generateInstructions, before emitRegion():
   // maps local id -> first provide index in collapseStack (global)
@@ -1142,6 +1357,37 @@ ${saveState}${jmp}
   }
   function emitRegion(pos: number, len: number): { res: string[]; call: string } {
     type Chunk = { start: number; len: number; size: number; lines: string };
+    const helperLine = (it: (typeof collapseStack)[number], stateArray = false) => {
+      let line = it.line;
+      for (const a of it.args) {
+        const alias = it.aliases[a];
+        // Split helpers are top-level functions; rewrite only captured block-state aliases.
+        // A broad vN rewrite would corrupt user function names like an import named `v1`.
+        if (/^s\d+$/.test(alias))
+          line = replaceName(line, alias, stateArray ? `${vName}[${a}]` : `v${a}`);
+      }
+      return line;
+    };
+    const declareAssigned = (lines: string, params: number[]) => {
+      const declared = new Set(params);
+      return lines
+        .split('\n')
+        .map((line) => {
+          const decl = line.match(/^(?:const|let) v(\d+)\b/);
+          if (decl) {
+            const id = Number(decl[1]);
+            // Split params share helper scope with generated locals; assigning keeps wasm-local semantics.
+            if (declared.has(id)) return line.replace(/^(?:const|let) /, '');
+            declared.add(id);
+            return line;
+          }
+          const set = line.match(/^v(\d+) = /);
+          if (!set || declared.has(Number(set[1]))) return line;
+          declared.add(Number(set[1]));
+          return `let ${line}`;
+        })
+        .join('\n');
+    };
 
     // 1) chunking (unchanged)
     const chunks: Chunk[] = [];
@@ -1161,7 +1407,8 @@ ${saveState}${jmp}
       if (chunkLen === 0) chunkLen = 1;
 
       let lines = '';
-      for (let i = 0; i < chunkLen; i++) lines += collapseStack[start + i].line + '\n';
+      for (let i = 0; i < chunkLen; i++)
+        lines += helperLine(collapseStack[start + i], opts.jsStateArray) + '\n';
       chunks.push({ start, len: chunkLen, size: chunkSize, lines });
 
       start += chunkLen;
@@ -1173,7 +1420,8 @@ ${saveState}${jmp}
     const regionOuts = regionMeta.outputs;
 
     const parts: string[] = [];
-    const names: string[] = chunks.map(() => `${name}_part${partIdx++}`);
+    // Helper names share top-level scope with user functions/imports; keep them in the reserved namespace.
+    const names: string[] = chunks.map(() => `__awasm_${name}_part${partIdx++}`);
 
     if (opts.jsStateArray) {
       // ---- STATE ARRAY MODE ----
@@ -1198,6 +1446,30 @@ ${cur.lines}${tail}
     const suffixArgs: number[][] = [];
     const carried: number[][] = [];
     const params: number[][] = [];
+    const providedAt: Record<number, number> = {};
+    for (let p = pos; p < endPos; p++)
+      for (const id of collapseStack[p].provides)
+        if (providedAt[id] === undefined) providedAt[id] = p;
+    const linesParamAction = (lines: string, id: number) => {
+      const name = `v${id}`;
+      for (const line of lines.split('\n')) {
+        const decl = line.match(/^(?:const|let) v(\d+)\b/);
+        const set = line.match(/^v(\d+) = /);
+        const writes = Number((decl || set)?.[1]) === id;
+        const rhs = writes ? line.slice(line.indexOf('=') + 1) : line;
+        if (hasName(rhs, name)) return true;
+        // Collapse metadata is per item; a tee item can declare vN then use it later in the same item.
+        if (writes) return false;
+      }
+      return undefined;
+    };
+    const suffixNeedsParam = (startChunk: number, id: number) => {
+      for (let k = startChunk; k < chunks.length; k++) {
+        const action = linesParamAction(chunks[k].lines, id);
+        if (action !== undefined) return action;
+      }
+      return true;
+    };
 
     for (let k = 0; k < chunks.length; k++) {
       const s = chunks[k].start;
@@ -1206,15 +1478,15 @@ ${cur.lines}${tail}
 
       const carry: number[] = [];
       for (const o of regionOuts) {
-        const fp = firstProvidePos[o];
-        if (fp !== undefined && fp < s && fp >= pos) carry.push(o);
+        // Outputs can be pre-existing locals that are reassigned inside this split region.
+        if (providedAt[o] < s) carry.push(o);
       }
       carried[k] = Array.from(new Set(carry)).sort((a, b) => a - b);
     }
     for (let k = 0; k < chunks.length; k++) {
       const set = new Set<number>();
-      for (const a of suffixArgs[k]) set.add(a);
-      for (const c of carried[k]) set.add(c);
+      for (const a of suffixArgs[k]) if (suffixNeedsParam(k, a)) set.add(a);
+      for (const c of carried[k]) if (suffixNeedsParam(k, c)) set.add(c);
       params[k] = Array.from(set).sort((a, b) => a - b);
     }
 
@@ -1224,15 +1496,18 @@ ${cur.lines}${tail}
       const paramsIdList = params[k].map((id) => `v${id}`).join(', ');
       let ret: string;
       if (k < chunks.length - 1) {
-        const nextArgsExpr = params[k + 1].map(getVar).join(', ');
+        const nextArgsExpr = params[k + 1].map((id) => `v${id}`).join(', ');
         ret = `return ${names[k + 1]}(${nextArgsExpr});`;
       } else {
-        const outsObj = regionOuts.map((id) => `v${id}: ${getVar(id)}`).join(', ');
+        const outsObj = regionOuts
+          .map((id) => (getVar(id) === `v${id}` ? `v${id}` : `v${id}: ${getVar(id)}`))
+          .join(', ');
         ret = regionOuts.length ? `return {${outsObj}};` : `return;`;
       }
+      const lines = declareAssigned(cur.lines, params[k]);
       parts.push(
         `function ${names[k]}(${paramsIdList}){
-${cur.lines}${ret}
+${lines}${ret}
 }`
       );
     }
@@ -1240,9 +1515,25 @@ ${cur.lines}${ret}
     // Main call: destructure identifiers (v${id}) and pass expression args (getVar)
     const callArgsExpr = params[0].map(getVar).join(', ');
     const finalOutsBind = regionOuts.map((id) => `v${id}`).join(', ');
-    const call = regionOuts.length
-      ? `const {${finalOutsBind}} = ${names[0]}(${callArgsExpr});`
-      : `${names[0]}(${callArgsExpr});`;
+    const callExpr = `${names[0]}(${callArgsExpr})`;
+    let call = `${callExpr};`;
+    if (regionOuts.length) {
+      const oldOuts = regionOuts.filter((id) => firstProvidePos[id] < pos);
+      const newOuts = regionOuts.filter((id) => firstProvidePos[id] >= pos);
+      const decl = newOuts.some((id) => varMutable.has(id) || forcedMutable.has(id))
+        ? 'let'
+        : 'const';
+      if (!oldOuts.length) call = `${decl} {${finalOutsBind}} = ${callExpr};`;
+      else if (!newOuts.length) call = `({${finalOutsBind}} = ${callExpr});`;
+      else {
+        const tmp = `__awasm_split${splitTmpIdx++}`;
+        call = [
+          `const ${tmp} = ${callExpr};`,
+          `${decl} {${newOuts.map((id) => `v${id}`).join(', ')}} = ${tmp};`,
+          `({${oldOuts.map((id) => `v${id}`).join(', ')}} = ${tmp});`,
+        ].join('\n');
+      }
+    }
 
     return { res: parts, call };
   }
@@ -1324,7 +1615,7 @@ function ${name}(${inputs.join(', ')}) {
   // console.log('----- GENERATED -----');
   // console.log(res);
   // console.log('---------------------');
-  return res;
+  return hoistCommonStateJumps(res);
 }
 
 /**
@@ -1363,9 +1654,38 @@ export function createJS(
   // Compiler JS should reach here with i64/u64 lowered to i32/u32 parts.
   // BigInt paths are too slow.
   const createBuf = `new ${bufType}(${modMemory.size})`;
+  const ident = /^[A-Za-z_$][0-9A-Za-z_$]*$/;
+  const reservedFnNames = new Set(
+    `arguments await break case catch class const continue debugger default delete do else enum eval
+export extends false finally for function if implements import in instanceof interface let new null
+package private protected public return static super switch this throw true try typeof undefined var
+void while with yield buffer code codeFn env init_module instance memory memoryExport memory_i8
+memory_i16 memory_i32 memory_u16 memory_u32 memory_view module pool segments workers
+Array ArrayBuffer Atomics BigInt DataView Error Float32Array Float64Array Infinity Int8Array
+Int16Array Int32Array Math
+NaN Number Object SharedArrayBuffer Uint8Array Uint16Array Uint32Array WebAssembly _cache _exports
+_imports _importsEmbed __buf atob parseInt`.split(/\s+/)
+  );
+  const unsafeFnName = (name: string) =>
+    !ident.test(name) || reservedFnNames.has(name) || /^(?:[vrs]\d+|SV\d+|__awasm_)/.test(name);
+  const usedFnNames = new Set<string>();
+  const jsFnNames: Record<string, string> = {};
+  let nextFnName = 0;
+  for (const fn of mod.functions) {
+    if (jsFnNames[fn.name]) throw new Error(`createJS: re-declared function ${fn.name}`);
+    let jsName = unsafeFnName(fn.name) ? '' : fn.name;
+    while (!jsName || usedFnNames.has(jsName)) jsName = `__awasm_fn${nextFnName++}`;
+    usedFnNames.add(jsName);
+    jsFnNames[fn.name] = jsName;
+  }
   const fixInstructions = (fn: ElementOf<typeof mod.functions>) => ({
     ...fn,
-    instructions: fn.instructions!.map((i) => i),
+    name: jsFnNames[fn.name],
+    instructions: fn.instructions!.map((i: any) =>
+      i.TAG === 'call' && typeof i.data === 'string' && jsFnNames[i.data]
+        ? { ...i, data: jsFnNames[i.data] }
+        : i
+    ),
   });
   // State-array names are per generated module; process-global counters
   // make repeated builds drift.
@@ -1395,22 +1715,18 @@ export function createJS(
   for (const f of mod.functions.filter((f) => f.import)) {
     const modName = f.module || 'env';
     if (!importFns[modName]) importFns[modName] = [];
-    importFns[modName].push(f.name);
+    const jsName = jsFnNames[f.name];
+    importFns[modName].push(jsName === f.name ? f.name : `${JSON.stringify(f.name)}: ${jsName}`);
   }
   // Function imports keep the explicit import module; env is just the default.
   for (const modName in importFns) {
     const src = modName === 'env' ? 'env' : `_imports[${JSON.stringify(modName)}]`;
     out += `const {${importFns[modName].join(', ')}} = ${src};\n`;
   }
-  const fnNames: Record<string, ElementOf<typeof mod.functions>> = {};
-  for (const fn of mod.functions) {
-    if (fnNames[fn.name]) throw new Error(`createJS: re-declared function ${fn.name}`);
-    fnNames[fn.name] = fn;
-  }
   out += fnBody;
   out += '\n';
   const exportMap: Record<string, string> = {};
-  for (const fn of mod.functions) if (fn.export) exportMap[fn.name] = fn.name;
+  for (const fn of mod.functions) if (fn.export) exportMap[fn.name] = jsFnNames[fn.name];
   if (modMemory.export) exportMap.memory = `{ buffer: __buf }`;
   out += `const instance = { exports: ${genObject(exportMap)}};\n`;
   if (opts.useThreads) {

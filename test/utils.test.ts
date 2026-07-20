@@ -182,6 +182,7 @@ describe('Utils', () => {
         deepStrictEqual(utils.Path.mapParent('1.2', '9', '1.2'), '9');
         deepStrictEqual(utils.Path.mapParent('1.2', '9', '1.2.3'), '9.3');
         deepStrictEqual(utils.Path.mapParent('1.2', '9', '1.2.3w'), '9.3w');
+        deepStrictEqual(utils.Path.mapParent('1', '', '1.2w'), '2w');
         throws(() => utils.Path.mapParent('1.2', '9', '1.20.3'), /wrong child/);
       });
     });

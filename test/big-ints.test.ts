@@ -272,6 +272,135 @@ describe('BigInt', () => {
       deepStrictEqual(read256(), shiftExpected);
     });
   });
+  should('literal scalar ops preserve every BigInt type', () => {
+    const defs = [
+      { type: 'i128', bits: 128, coder: P.I128LE, signed: true },
+      { type: 'u128', bits: 128, coder: P.U128LE, signed: false },
+      { type: 'i256', bits: 256, coder: P.I256LE, signed: true },
+      { type: 'u256', bits: 256, coder: P.U256LE, signed: false },
+    ] as const;
+    const expected = (bits: number, signed: boolean, a: bigint, b: bigint) => {
+      const cast = signed ? BigInt.asIntN : BigInt.asUintN;
+      const val = (n: bigint) => cast(bits, n);
+      const u = (n: bigint) => BigInt.asUintN(bits, n);
+      const width = BigInt(bits);
+      const shift = BigInt(bits + 5) & (width - 1n);
+      const mask = (1n << width) - 1n;
+      const av = val(a);
+      const bv = val(b);
+      return {
+        values: [
+          val(av + bv),
+          val(av * bv),
+          val(av - bv),
+          val(av / bv),
+          val(av % bv),
+          val(u(av) & u(bv)),
+          val(u(av) | u(bv)),
+          val(u(av) ^ u(bv)),
+          val(~u(av)),
+          val(u(av) << shift),
+          val(signed ? av >> shift : u(av) >> shift),
+          val(((u(av) << shift) | (u(av) >> (width - shift))) & mask),
+          val(((u(av) >> shift) | (u(av) << (width - shift))) & mask),
+        ],
+        flags: [
+          +(av === av),
+          +(av !== bv),
+          +(av < bv),
+          +(av > bv),
+          +(av <= bv),
+          +(av >= bv),
+          +(av === 0n),
+          1,
+        ],
+      };
+    };
+    const m = new Module('bigIntLiteralOps');
+    const cases = defs.map(({ type, bits, coder, signed }) => {
+      const width = BigInt(bits);
+      const a = signed ? -(1n << (width - 2n)) + 0x12345n : (1n << width) - 0x12345n;
+      const b = 97n;
+      const { values, flags } = expected(bits, signed, a, b);
+      const name = `out_${type}`;
+      const cmp = `cmp_${type}`;
+      m.mem(name, array(type, {}, values.length));
+      m.mem(cmp, array('u32', {}, flags.length));
+      m.fn(type, [], 'void', (f) => {
+        const T = f.types[type] as any;
+        const A = T.const(a);
+        const B = T.const(b);
+        const Z = T.const(0);
+        const S = T.const(BigInt(bits + 5));
+        const out = [
+          T.add(A, B),
+          T.mul(A, B),
+          T.sub(A, B),
+          T.div(A, B),
+          T.rem(A, B),
+          T.and(A, B),
+          T.or(A, B),
+          T.xor(A, B),
+          T.not(A),
+          T.shl(A, S),
+          T.shr(A, S),
+          T.rotl(A, S),
+          T.rotr(A, S),
+        ];
+        for (let i = 0; i < out.length; i++) (f.memory as any)[name][i].set(out[i]);
+        const masks = [
+          T.eq(A, A),
+          T.ne(A, B),
+          T.lt(A, B),
+          T.gt(A, B),
+          T.le(A, B),
+          T.ge(A, B),
+          T.eqz(A),
+          T.eqz(Z),
+        ];
+        for (let i = 0; i < masks.length; i++) (f.memory as any)[cmp][i].set(masks[i]);
+        return [];
+      });
+      return { type, coder, name, cmp, values, flags };
+    });
+    testBothOpts(m, BIG_OPTS, (mod) => {
+      for (const { type, coder, name, cmp, values, flags } of cases) {
+        mod[type]();
+        deepStrictEqual(P.array(values.length, coder).decode(mod.segments[name]), values);
+        deepStrictEqual(P.array(flags.length, P.U32LE).decode(mod.segments[cmp]), flags);
+      }
+    });
+  });
+  should('dynamic scalar eqz preserves every BigInt type', () => {
+    const defs = [
+      { type: 'i128', bits: 128, coder: P.I128LE, signed: true },
+      { type: 'u128', bits: 128, coder: P.U128LE, signed: false },
+      { type: 'i256', bits: 256, coder: P.I256LE, signed: true },
+      { type: 'u256', bits: 256, coder: P.U256LE, signed: false },
+    ] as const;
+    const m = new Module('bigIntDynamicEqz');
+    for (const { type } of defs) {
+      const input = `in_${type}`;
+      const output = `eqz_${type}`;
+      m.mem(input, array(type, {}, 2));
+      m.mem(output, array('u32', {}, 2));
+      m.fn(type, [], 'void', (f) => {
+        const T = f.types[type] as any;
+        const mem = f.memory as any;
+        mem[output][0].set(T.eqz(mem[input][0].get()));
+        mem[output][1].set(T.eqz(mem[input][1].get()));
+        return [];
+      });
+    }
+    testBothOpts(m, BIG_OPTS, (mod) => {
+      for (const { type, bits, coder, signed } of defs) {
+        const values = [0n, signed ? -1n : (1n << BigInt(bits)) - 1n];
+        mod.segments[`in_${type}`].set(P.array(2, coder).encode(values));
+        mod[type]();
+        deepStrictEqual(P.array(2, P.U32LE).decode(mod.segments[`eqz_${type}`]), [1, 0]);
+      }
+    });
+  });
 });
 
 should.runWhen(import.meta.url);

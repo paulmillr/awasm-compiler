@@ -5,6 +5,7 @@ import {
   type ModuleGraph,
   type Node,
   type NodeIdx,
+  type NodeOf,
   as,
   is,
   isOp,
@@ -27,6 +28,503 @@ export type RewriteFn = (fn: ModuleGraph, opts?: CompilerOpts) => Rewrite;
 
 // These are very self-contained, so even if they small it is reasonable to move out them.
 // Maybe even separate files?
+const constKey = (value: any): string | undefined => {
+  if (typeof value === 'number') {
+    if (Number.isNaN(value)) return 'number:NaN';
+    if (Object.is(value, -0)) return 'number:-0';
+    return `number:${value}`;
+  }
+  if (typeof value === 'bigint') return `bigint:${value.toString()}`;
+  if (utils.isBytes(value)) return `bytes:${Array.from(value).join(',')}`;
+  return undefined;
+};
+const nonReusableOps = new Set([
+  'arg',
+  'nodeOutput',
+  'virtual',
+  'call',
+  'load',
+  'store',
+  'fill',
+  'copy',
+  'br',
+  'br_if',
+]);
+const reusableOp = (op: string) => !nonReusableOps.has(op) && !op.startsWith('atomic');
+const commutativeIntOp = (op: string) => types.opsVariadic.has(op) || op === 'eq' || op === 'ne';
+// CSE keys only need a deterministic operand order; numeric path ordering burns time decoding.
+const argCmp = (a: NodeIdx, b: NodeIdx) => (a < b ? -1 : a > b ? 1 : 0);
+// Keep this as a keying rule, not a rewrite: returning fn.op(sortedArgs) can hand
+// back the same cached node and make the rewrite fixpoint spin forever.
+const keyArgs = (type: TypeName, op: string, args: NodeIdx[]): NodeIdx[] => {
+  if (args.length < 2 || !commutativeIntOp(op) || !types.IntType.has(type)) return args;
+  if (args.length === 2) return argCmp(args[0], args[1]) <= 0 ? args : [args[1], args[0]];
+  return args.slice().sort(argCmp);
+};
+const keyArgsString = (type: TypeName, op: string, args: NodeIdx[]): string => {
+  if (args.length === 0) return '';
+  if (args.length === 1) return args[0];
+  if (args.length === 2 && commutativeIntOp(op) && types.IntType.has(type)) {
+    const a = args[0];
+    const b = args[1];
+    return argCmp(a, b) <= 0 ? `${a}|${b}` : `${b}|${a}`;
+  }
+  if (args.length > 2 && commutativeIntOp(op) && types.IntType.has(type))
+    return args.slice().sort(argCmp).join('|');
+  if (args.length === 2) return `${args[0]}|${args[1]}`;
+  return args.join('|');
+};
+const emptyOpts = (opts: Record<string, any>) => {
+  for (const _ in opts) return false;
+  return true;
+};
+// Integer-only: reassociating floats changes IEEE rounding/NaN/-0 behavior.
+const variadicCSE = (type: TypeName, op: string, opts: Record<string, any>) =>
+  types.IntType.has(type) && types.opsVariadic.has(op) && emptyOpts(opts);
+const versioned = <K, V>(fn: ModuleGraph, load: (key: K) => V) => {
+  let version = -1;
+  let cache = new Map<K, V>();
+  return (key: K): V => {
+    if (version !== fn.ops.version) {
+      version = fn.ops.version;
+      cache = new Map();
+    }
+    if (!cache.has(key)) cache.set(key, load(key));
+    return cache.get(key)!;
+  };
+};
+export const pureOpKey = (
+  type: TypeName,
+  op: string,
+  args: NodeIdx[],
+  opts: Record<string, any>
+): string | undefined => {
+  if (!reusableOp(op)) return;
+  if (op === 'const') {
+    let keys = 0;
+    let hasValue = false;
+    for (const k in opts) {
+      keys++;
+      if (k === 'value') hasValue = true;
+      else if (k === 'type') {
+        if (opts.type !== type) return;
+      } else return;
+    }
+    if (!hasValue || keys > 2) return;
+    const valueKey = constKey(opts.value);
+    if (valueKey === undefined) return;
+    return `${type}|${op}|${keyArgsString(type, op, args)}|${valueKey}`;
+  } else if (!emptyOpts(opts)) return;
+  return `${type}|${op}|${keyArgsString(type, op, args)}`;
+};
+
+// Transitive zero-pressure test: a value computable from args/consts alone (pure ops, no
+// memory/control deps). Shared by cse (subset reuse safety) and icse (clonability cut).
+// Memo is keyed by node OBJECT, not idx: cleanup() toposorts scopes and REUSES indices, so an
+// idx-keyed memo goes stale across sweeps (icse once treated a load as stable through a slot
+// a mul had vacated and cloned it forever).
+const stableValues = (fn: ModuleGraph) => {
+  const stable = new WeakMap<object, boolean>();
+  const getNode = versioned(fn, (idx: NodeIdx) => fn.ops.get(idx));
+  const stableValue = (idx: NodeIdx, stack = new Set<object>()): boolean => {
+    const node = getNode(idx);
+    const hit = stable.get(node);
+    if (hit !== undefined) return hit;
+    if (stack.has(node)) return false;
+    stack.add(node);
+    let ok = false;
+    if (isOp(node, 'arg', 'const')) ok = true;
+    else if (node.kind === 'op') {
+      if (reusableOp(node.op)) ok = node.args.every((arg) => stableValue(arg, stack));
+    }
+    stack.delete(node);
+    stable.set(node, ok);
+    return ok;
+  };
+  return stableValue;
+};
+
+export function cse(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
+  const seenVariadic = new Map<string, { idx: NodeIdx; args: NodeIdx[] }[]>();
+  const protectedVariadic = new Set<NodeIdx>();
+  // Subset reuse evaluates the subset before the leftover args; do not move memory/control deps.
+  const stableValue = stableValues(fn);
+  const getNode = versioned(fn, (idx: NodeIdx) => fn.ops.get(idx));
+  const exists = versioned(fn, (idx: NodeIdx) => fn.ops.exists(idx));
+  const parentOf = versioned(fn, (idx: NodeIdx) => utils.Path.parent(idx).parent);
+  const dominates = (scope: NodeIdx, target: NodeIdx) =>
+    scope === target || utils.Path.isParent(scope, target);
+  const pinned = versioned(fn, (idx: NodeIdx) => {
+    const parent = getNode(parentOf(idx));
+    if (is(parent, 'function', 'block', 'loop') && parent.outputs.includes(idx)) return true;
+    if (is(parent, 'function')) {
+      for (const k in parent.memOps) {
+        const op = parent.memOps[k];
+        if (op.write === idx || op.reads.includes(idx)) return true;
+      }
+    }
+    return false;
+  });
+  const flattenArgs = (node: Extract<Node, { kind: 'op' }>, idx: NodeIdx) => {
+    const parent = utils.Path.parent(idx).parent;
+    const out: NodeIdx[] = [];
+    const consumed = new Set<NodeIdx>();
+    let changed = false;
+    for (const arg of node.args) {
+      const argNode = getNode(arg);
+      if (
+        isOp(argNode, node.op) &&
+        argNode.type === node.type &&
+        emptyOpts(argNode.opts) &&
+        parentOf(arg) === parent
+      ) {
+        const users = fn.ops.usedBy.get(arg);
+        let times = 0;
+        for (const a of node.args) if (a === arg) times++;
+        if (
+          times === 1 &&
+          users?.size === 1 &&
+          users.has(idx) &&
+          !pinned(arg) &&
+          !protectedVariadic.has(arg)
+        ) {
+          out.push(...argNode.args);
+          consumed.add(arg);
+          changed = true;
+          continue;
+        }
+      }
+      out.push(arg);
+    }
+    return { args: out, changed, consumed };
+  };
+  const restWithout = (args: NodeIdx[], subsetKey: NodeIdx[]) => {
+    const left = subsetKey.slice();
+    const rest: NodeIdx[] = [];
+    // Match subsets by canonical key, but keep remaining args in their original evaluation order.
+    for (const arg of args) {
+      const pos = left.indexOf(arg);
+      if (pos === -1) rest.push(arg);
+      else left.splice(pos, 1);
+    }
+    if (left.length) return;
+    return rest;
+  };
+  const bestSubsets = (
+    group: string,
+    args: NodeIdx[],
+    idx: NodeIdx,
+    parent: NodeIdx,
+    consumed: Set<NodeIdx>
+  ) => {
+    const candidates = seenVariadic.get(group);
+    if (!candidates) return;
+    let rest = args.slice();
+    const hits: { idx: NodeIdx; args: NodeIdx[] }[] = [];
+    const hitIdx = new Set<NodeIdx>();
+    for (;;) {
+      let best: { idx: NodeIdx; args: NodeIdx[]; rest: NodeIdx[] } | undefined;
+      for (const cur of candidates) {
+        if (
+          cur.idx === idx ||
+          consumed.has(cur.idx) ||
+          hitIdx.has(cur.idx) ||
+          cur.args.length < 2 ||
+          cur.args.length > rest.length
+        )
+          continue;
+        const nextRest = restWithout(rest, cur.args);
+        if (!nextRest) continue;
+        if (!exists(cur.idx)) continue;
+        // Only reuse subsets whose defining scope dominates this use; child/sibling scopes are control-dependent.
+        if (!dominates(parentOf(cur.idx), parent)) continue;
+        if (!pinned(cur.idx) && !fn.ops.usedBy.get(cur.idx)?.size) continue;
+        if (!stableValue(cur.idx)) continue;
+        if (!hits.length && !nextRest.length) continue;
+        if (!best || cur.args.length > best.args.length) best = { ...cur, rest: nextRest };
+      }
+      if (!best) break;
+      hits.push(best);
+      hitIdx.add(best.idx);
+      rest = best.rest;
+    }
+    if (!hits.length) return;
+    return { hits, args: [...hits.map((i) => i.idx), ...rest] };
+  };
+  const rebuild = (node: NodeOf<'op'>, args: NodeIdx[]) =>
+    fn.op(
+      node.type,
+      node.op,
+      args.map((i) => fn.byIdx(i))
+    );
+  return (node, _args, idx) => {
+    if (node.kind === 'function') {
+      seenVariadic.clear();
+      return;
+    }
+    if (!isOp(node)) return;
+    const parent = parentOf(idx);
+    if (variadicCSE(node.type, node.op, node.opts)) {
+      const group = `${node.type}|${node.op}`;
+      // Flattened scalar64 reducers lengthen Wasm live ranges around saved block state. Keep the
+      // binary tree for that backend/type boundary; JS and narrower/vector reducers still flatten.
+      const preserveTree =
+        opts.lowerWasm && types.ScalarType.has(node.type) && types.sizeof(node.type) === 8;
+      const flat = preserveTree
+        ? { args: node.args, changed: false, consumed: new Set<NodeIdx>() }
+        : flattenArgs(node, idx);
+      const subsets = bestSubsets(group, flat.args, idx, parent, flat.consumed);
+      if (subsets) {
+        for (const subset of subsets.hits) protectedVariadic.add(subset.idx);
+        return rebuild(node, subsets.args);
+      }
+      if (flat.changed) return rebuild(node, flat.args);
+      let cur = seenVariadic.get(group);
+      if (!cur) seenVariadic.set(group, (cur = []));
+      const args = keyArgs(node.type, node.op, node.args);
+      if (args.length >= 2) cur.push({ idx, args });
+    }
+    return;
+  };
+}
+
+// Inverse CSE: clone shared values per use so they reach emission as single-use chains and
+// fuse into consumer expressions. Production codegen pressure-gates this for tee-less JS;
+// Wasm keeps tee-based materialization and skips the pass.
+// Root cause it attacks (task log 2026-07-02): generator-source value sharing emits as
+// long-lived materializations on wasm and one-op-per-const statements on JS, while the naive
+// per-use-recompute shape (CLEAN) wins both platforms through the same pipeline.
+// Cut: SINGLE-OP clones only — a pure op whose args are each a leaf (arg/const) OR a value
+// that stays materialized anyway (2+ live users; the clone references its var, so recompute
+// costs exactly one op and revives nothing — the R2 remat lesson). This is clean's measured
+// shape: it holds loads in vars and re-emits only the top op per use (blake512's
+// `(sigma ^ m_var)`, keccak's B-lane xors). The transitive-cone variant (v0) was measured
+// out: it clones per PATH, keccak wasm 51->146KB / js 53->188KB, and the JS function falls
+// off V8's optimizing tier (same cliff as graph-level unroll, +38.9%). Single-op clones are
+// linear in uses by construction. A per-value fan-out budget also bounds that linear cost:
+// high-fanout values are cheaper to keep materialized than to recompute for every consumer.
+// Runs OUTSIDE the main rewrite fixpoint (after lowerWasm, see codegen.rewrite): cse subset
+// reuse and construction CSE are direct antagonists, and motion must not hoist fresh clones
+// away from the consumers they were built next to. Clones of empty-opts pure ops carry a
+// unique {icse:n} marker so the per-scope construction cache cannot re-merge them.
+export function icse(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
+  let n = 0;
+  // usedBy retains entries for removed nodes (motion filters the same way) — counting
+  // ghosts here made the pass re-clone the same value forever.
+  const live = (idx: NodeIdx) => {
+    let res = 0;
+    for (const u of fn.ops.usedBy.get(idx) || []) if (fn.ops.exists(u)) res++;
+    return res;
+  };
+  // "Free" clone input: leaves cost nothing to reference; a 2+-user value stays a var either
+  // way, so the clone reads it like the original did. Single-user non-leaf args would inline
+  // their body into the clone (cone growth) — those keep the sharing.
+  const freeArg = (idx: NodeIdx) => isOp(fn.ops.get(idx), 'arg', 'const') || live(idx) >= 2;
+  // Clones are terminal: firing into a clone would re-clone its multi-user args next sweep
+  // and unroll whole chains per path — v0's explosion through a second channel.
+  const clones = new WeakSet<object>();
+  // ALU consumers only. Memory consumers measured out twice: address-only cloning is a JS
+  // no-op (+0.23 tie — on wasm addresses fold into load offset opts and never fire), and an
+  // address shared between a load and its wipe-store gets computed TWICE when cloned (md5-js
+  // flipped -1.15 win -> +2.0 loss vs clean on exactly that shape). Control/memory ops also
+  // keep original args — rebuilding them risks their linkage semantics.
+  const cloneInto = (node: Node) =>
+    is(node, 'op') &&
+    // JS lowers rotates to two shifts that each read operand 0; Wasm retains one native opcode.
+    (opts.lowerWasm || !isOp(node, 'rotl', 'rotr')) &&
+    reusableOp(node.op);
+  const ownerOf = (idx: NodeIdx) =>
+    fn.ops.getStack(idx).find(({ node }) => is(node, 'function'))?.node;
+  // Single-binary-operator ops only: recomputing `(a + b)` per use is cheaper than
+  // holding a named value across rounds (sha256 -5.7, blake512 -13). Composite-emission
+  // ops (rotl -> `(x<<n)|(x>>>m)`: 3 ops, arg read twice) cost more per use than the
+  // var reference they replace — ripemd-JS +18.5 / md5 +2.9 / blake3 +1.7 were exactly
+  // the rotation-heavy kernels. opsVariadic is the existing name for this class.
+  // CSE flattens reducers, so the variadic-op set alone also admits costly 3+-operand clones.
+  // Known residual: blake3-js pays 2.7-5.5% here (still ~10% ahead of clean). Its 2-user
+  // G links are shape-identical to blake512/keccak's 2-user WINNERS on every probed
+  // feature (user count v7, single-user fusion paths v8 — both falsified; task log
+  // 2026-07-03). Lowered-width provenance now exists for scheduling, but is intentionally
+  // not used as an ICSE selector without a full generic benchmark board.
+  // All-or-nothing: cloning pays only when the pass can RETIRE the value — every live
+  // user must itself be a clonable-into ALU op (and not a terminal clone), and the value
+  // must not be pinned (weak-linked or a scope output). One unclonable user keeps the
+  // var alive, making every clone a redundant recompute (md5's +4-address chain: links
+  // held by load+wipe-store were also cloned into successor adds — pure waste).
+  const candidate = (idx: NodeIdx, positions?: Map<NodeIdx, number>) => {
+    const node = fn.ops.get(idx);
+    const users = live(idx);
+    if (
+      !is(node, 'op') ||
+      isOp(node, 'arg', 'const') ||
+      !types.opsVariadic.has(node.op) ||
+      node.args.length !== 2 ||
+      clones.has(node) ||
+      !node.args.every(freeArg) ||
+      users < 2 ||
+      users > 16 ||
+      fn.ops.usedWeak.get(idx)?.size
+    )
+      return;
+    const parent = fn.ops.get(utils.Path.parent(idx).parent);
+    if (is(parent, 'function', 'block', 'loop') && parent.outputs.includes(idx)) return;
+    let end = positions?.get(idx);
+    if (positions && end === undefined) return;
+    for (const user of fn.ops.usedBy.get(idx)!) {
+      if (!fn.ops.exists(user)) continue;
+      const userNode = fn.ops.get(user);
+      if (!cloneInto(userNode) || clones.has(userNode)) return;
+      if (!positions) continue;
+      const pos = positions.get(user);
+      if (pos === undefined) return;
+      if (pos > end!) end = pos;
+    }
+    return { node, end };
+  };
+  const enabled = new WeakSet<object>();
+  if (opts.icseOps) {
+    const functions = new Map<object, NodeIdx[]>();
+    fn.ops.iter((node, idx) => {
+      if (!is(node, 'op')) return;
+      const owner = ownerOf(idx);
+      if (!owner) return;
+      const entries = functions.get(owner) || [];
+      entries.push(idx);
+      functions.set(owner, entries);
+    });
+    for (const [owner, entries] of functions) {
+      const positions = new Map(entries.map((idx, pos) => [idx, pos]));
+      const pressure = new Int32Array(entries.length + 1);
+      for (let pos = 0; pos < entries.length; pos++) {
+        const idx = entries[pos];
+        const value = candidate(idx, positions);
+        if (!value) continue;
+        pressure[pos]++;
+        pressure[value.end! + 1]--;
+      }
+      let live = 0;
+      for (const change of pressure) {
+        live += change;
+        if (live < 64) continue;
+        enabled.add(owner);
+        break;
+      }
+    }
+  }
+  return (node, args, _idx) => {
+    if (!is(node, 'op') || !cloneInto(node) || clones.has(node)) return;
+    if (opts.icseOps) {
+      const owner = ownerOf(_idx);
+      if (!owner || !enabled.has(owner)) return;
+    }
+    let changed = false;
+    const newArgs = args.map((arg) => {
+      const value = candidate(arg.idx);
+      if (!value) return arg;
+      changed = true;
+      n++;
+      const clone = fn.op(
+        value.node.type,
+        value.node.op,
+        value.node.args.map((i) => fn.byIdx(i)),
+        Object.keys(value.node.opts).length ? { ...value.node.opts } : { icse: n }
+      );
+      clones.add(fn.ops.get(clone.idx));
+      return clone;
+    });
+    if (!changed) return;
+    return fn.op(node.type, node.op, newArgs, node.opts);
+  };
+}
+
+export function motion(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite {
+  const stable = new Map<NodeIdx, boolean>();
+  const parentOf = (idx: NodeIdx) => utils.Path.parent(idx).parent;
+  const scopes = (idx: NodeIdx, kind?: 'block' | 'loop' | 'function') =>
+    fn.ops
+      .getStack(idx)
+      .filter(({ node }) => (kind ? node.kind === kind : is(node, 'block', 'loop', 'function')));
+  const pinned = (idx: NodeIdx) => {
+    if (fn.ops.usedWeak.get(idx)?.size) return true;
+    const parent = fn.ops.get(parentOf(idx));
+    if (is(parent, 'function', 'block', 'loop') && parent.outputs.includes(idx)) return true;
+    for (const cur of scopes(idx, 'function')) {
+      const node = as(cur.node, 'function');
+      for (const k in node.memOps) {
+        const op = node.memOps[k];
+        if (op.write === idx || op.reads.includes(idx)) return true;
+      }
+    }
+    return false;
+  };
+  const stableValue = (idx: NodeIdx, stack = new Set<NodeIdx>()): boolean => {
+    const hit = stable.get(idx);
+    if (hit !== undefined) return hit;
+    if (stack.has(idx) || pinned(idx)) return false;
+    stack.add(idx);
+    const node = fn.ops.get(idx);
+    let ok = false;
+    if (isOp(node, 'arg', 'const')) ok = true;
+    else if (node.kind === 'op') {
+      const key = pureOpKey(node.type, node.op, node.args, node.opts);
+      if (key !== undefined) ok = node.args.every((arg) => stableValue(arg, stack));
+    }
+    stack.delete(idx);
+    stable.set(idx, ok);
+    return ok;
+  };
+  const addAt = (parent: NodeIdx, node: Extract<Node, { kind: 'op' }>) =>
+    fn.byIdx(
+      fn.ops.add(
+        {
+          kind: 'op',
+          type: node.type,
+          op: node.op,
+          args: node.args.slice(),
+          opts: utils.deepClone(node.opts),
+        },
+        parent
+      )
+    );
+  const crossesIntoLoop = (from: NodeIdx, target: NodeIdx) => {
+    const fromLoops = new Set(scopes(from, 'loop').map((i) => i.idx));
+    for (const cur of scopes(target, 'loop')) if (!fromLoops.has(cur.idx)) return true;
+    return false;
+  };
+  const hoistTarget = (idx: NodeIdx, node: Extract<Node, { kind: 'op' }>) => {
+    const loops = scopes(idx, 'loop');
+    const loop = loops[loops.length - 1]?.idx;
+    if (!loop) return;
+    for (const arg of node.args) if (arg === loop || utils.Path.isParent(loop, arg)) return;
+    const target = parentOf(loop);
+    if (target !== parentOf(idx)) return target;
+    return;
+  };
+  const sinkTarget = (idx: NodeIdx) => {
+    const users = Array.from(fn.ops.usedBy.get(idx) || []).filter((user) => fn.ops.exists(user));
+    if (!users.length) return;
+    const parent = parentOf(idx);
+    const blocks = scopes(users[0], 'block')
+      .map((i) => i.idx)
+      .filter((block) => utils.Path.isParent(parent, block) && !crossesIntoLoop(idx, block))
+      .reverse();
+    for (const block of blocks) {
+      const contains = users.every((user) => {
+        const userNode = fn.ops.get(user);
+        return !is(userNode, 'block', 'loop') && utils.Path.isParent(block, user);
+      });
+      if (contains) return block;
+    }
+    return;
+  };
+  return (node, _args, idx) => {
+    if (!isOp(node) || pureOpKey(node.type, node.op, node.args, node.opts) === undefined) return;
+    if (!stableValue(idx)) return;
+    const target = hoistTarget(idx, node) || sinkTarget(idx);
+    if (!target || target === parentOf(idx)) return;
+    return addAt(target, node);
+  };
+}
 
 function loweringUtils(
   fn: ModuleGraph,
@@ -292,20 +790,32 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
     const U = (v: FnOp) => (useCast && lowUnsigned !== lowType ? cast(lowUnsigned, v) : v);
     const S = (v: FnOp) => (useCast && lowSigned !== lowType ? cast(lowSigned, v) : v);
     const LT = lowType;
-    const opLT = (op: string, args: FnOp[]) => fn.op(LT, op, args);
+    const markWide = (value: FnOp) => {
+      const lowered = as(fn.ops.get(value.idx), 'op');
+      lowered.wide = Math.max(lowered.wide || 0, bits);
+      return value;
+    };
+    // Mark operations created from a logical wide value, not their entire function: native
+    // u32 rounds often share a function with a u64 byte counter and need a different schedule.
+    const opLT = (op: string, args: FnOp[]) => markWide(fn.op(LT, op, args));
     const opU = (op: string, args: FnOp[]) =>
-      fn.op(
-        wordBits === 32 ? 'u32' : lowUnsigned,
-        op,
-        args.map((v) => U(v))
+      markWide(
+        fn.op(
+          wordBits === 32 ? 'u32' : lowUnsigned,
+          op,
+          args.map((v) => U(v))
+        )
       );
     const opS = (op: string, args: FnOp[]) =>
-      fn.op(
-        lowSigned,
-        op,
-        args.map((v) => S(v))
+      markWide(
+        fn.op(
+          lowSigned,
+          op,
+          args.map((v) => S(v))
+        )
       );
-    const opB = (op: string, args: FnOp[]) => fn.op(wordBits === 32 ? LT : 'u32', op, args);
+    const opB = (op: string, args: FnOp[]) =>
+      markWide(fn.op(wordBits === 32 ? LT : 'u32', op, args));
     const toLT = (v: FnOp) => {
       const vType = as(fn.ops.get(v.idx), 'op').type;
       if (vType === LT) return v;
@@ -323,6 +833,30 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
     const bitMask = constOf(LT, bits - 1);
     const wordConst = constOf(LT, wordBits);
     const pairOf = (i: number) => prev[i];
+    const widenArg = (i: number, mode: 'add' | 'arith' | 'store') => {
+      const arg = args[i];
+      const argType = as(fn.ops.get(arg.idx), 'op').type;
+      // u128 div emits 32-bit booleans used in u64 sub/mul arithmetic.
+      if ((argType === 'u32' || (mode === 'arith' && argType === 'i32')) && node.type === 'u64')
+        return [arg, zero];
+      if (argType === 'i32' && node.type === 'i64')
+        return [arg, opS('shr', [arg, constOf(LT, 31)])];
+      if (mode === 'add' && argType === node.type && (node.type === 'u64' || node.type === 'i64')) {
+        const argNode = as(fn.ops.get(arg.idx), 'op');
+        if (argNode.op === 'cast' && (argNode.opts.from === 'u32' || argNode.opts.from === 'i32')) {
+          const src = fn.byIdx(argNode.args[0]);
+          if (argNode.opts.from === 'u32') return [src, zero];
+          return [src, opS('shr', [src, constOf(LT, 31)])];
+        }
+      }
+      if (
+        mode === 'store' &&
+        (argType === 'u64' || argType === 'i64') &&
+        (node.type === 'u64' || node.type === 'i64')
+      )
+        return (fn.types as any)[argType].to(LT, arg);
+      return;
+    };
 
     const carryFromAdd = (a: FnOp, b: FnOp, sum: FnOp): FnOp => {
       const a_and_b = opLT('and', [a, b]);
@@ -382,20 +916,7 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
           });
       return virt(node.type, [l, h]);
     } else if (isOp(node, 'store')) {
-      const widenArg = () => {
-        const arg = args[1];
-        const argType = as(fn.ops.get(arg.idx), 'op').type;
-        if (argType === 'u32' && node.type === 'u64') return [arg, zero];
-        if (argType === 'i32' && node.type === 'i64')
-          return [arg, opS('shr', [arg, constOf(LT, 31)])];
-        if (
-          (argType === 'u64' || argType === 'i64') &&
-          (node.type === 'u64' || node.type === 'i64')
-        )
-          return (fn.types as any)[argType].to(LT, arg);
-        return;
-      };
-      const p = prev[1] || widenArg();
+      const p = prev[1] || widenArg(1, 'store');
       if (!p) {
         console.error('lowerU64', p, node.args[1], fn.ops.get(node.args[1]), node);
         console.error('GRAPH', fn.ops.format());
@@ -651,32 +1172,13 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
           const pj = pairs[j];
           ops[j] = pj ? pj[k] : args[j];
         }
-        outParts[k] = fn.op(loType, node.op, ops, opts);
+        outParts[k] = markWide(fn.op(loType, node.op, ops, opts));
       }
       return virt(node.type, outParts);
     } else if (isOp(node, 'add')) {
       // Gather pairs
-      const widenArg = (i: number) => {
-        const arg = args[i];
-        const argType = as(fn.ops.get(arg.idx), 'op').type;
-        if (argType === 'u32' && node.type === 'u64') return [arg, zero];
-        if (argType === 'i32' && node.type === 'i64')
-          return [arg, opS('shr', [arg, constOf(LT, 31)])];
-        if (argType === node.type && (node.type === 'u64' || node.type === 'i64')) {
-          const argNode = as(fn.ops.get(arg.idx), 'op');
-          if (
-            argNode.op === 'cast' &&
-            (argNode.opts.from === 'u32' || argNode.opts.from === 'i32')
-          ) {
-            const src = fn.byIdx(argNode.args[0]);
-            if (argNode.opts.from === 'u32') return [src, zero];
-            return [src, opS('shr', [src, constOf(LT, 31)])];
-          }
-        }
-        return;
-      };
       const pairs = node.args.map((i, j) => {
-        const p = pairOf(j) || widenArg(j);
+        const p = pairOf(j) || widenArg(j, 'add');
         if (!p) {
           console.error('lowerU64', fn.ops.format());
           throw new Error('add: missing prev pair for arg ' + i);
@@ -708,17 +1210,8 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
       }
       return virt(node.type, [L!, H]);
     } else if (isOp(node, 'sub')) {
-      const widenArg = (i: number) => {
-        const arg = args[i];
-        const argType = as(fn.ops.get(arg.idx), 'op').type;
-        // u128 div emits 32-bit booleans used in u64 arithmetic; widen to keep lowering stable.
-        if ((argType === 'u32' || argType === 'i32') && node.type === 'u64') return [arg, zero];
-        if (argType === 'i32' && node.type === 'i64')
-          return [arg, opS('shr', [arg, constOf(LT, 31)])];
-        return;
-      };
-      const A = pairOf(0) || widenArg(0);
-      const B = pairOf(1) || widenArg(1);
+      const A = pairOf(0) || widenArg(0, 'arith');
+      const B = pairOf(1) || widenArg(1, 'arith');
       if (!A || !B) throw new Error('sub: missing prev pair for args');
       const diffL = opLT('sub', [A[0], B[0]]);
       // borrow = ((~A.l & B.l) | (~(A.l ^ B.l) & diffL)) >>> 31
@@ -741,16 +1234,8 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
       return virt(node.type, [diffL, diffH]);
     } else if (isOp(node, 'mul')) {
       // Gather pairs
-      const widenArg = (i: number) => {
-        const arg = args[i];
-        const argType = as(fn.ops.get(arg.idx), 'op').type;
-        if ((argType === 'u32' || argType === 'i32') && node.type === 'u64') return [arg, zero];
-        if (argType === 'i32' && node.type === 'i64')
-          return [arg, opS('shr', [arg, constOf(LT, 31)])];
-        return;
-      };
       const pairs = node.args.map((i: string, j: number) => {
-        const p = pairOf(j) || widenArg(j);
+        const p = pairOf(j) || widenArg(j, 'arith');
         if (!p) {
           throw new Error('mul: missing prev pair for arg ' + i);
         }
@@ -954,8 +1439,8 @@ export function lowerWideInt(fn: ModuleGraph, _opts: CompilerOpts = {}, bits = 6
       if (node.op === 'eqz') {
         const a = pairOf(0);
         if (!a) throw new Error('eqz64: missing prev pair for arg0');
-        // (h|l) == 0
-        return opB('eq', [opLT('or', [a[1], a[0]]), zero]);
+        // Keep the operand width so another wide-lowering pass can split 128/256-bit comparisons.
+        return opLT('eq', [opLT('or', [a[1], a[0]]), zero]);
       } else {
         const a = pairOf(0),
           b = pairOf(1);
@@ -1151,19 +1636,371 @@ export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
     if (node.kind !== 'op' || node.op !== 'const') throw new Error('getConst: not const');
     return node.opts.value;
   };
+  const getFact = (arg: FnOp) => {
+    const node = fn.ops.get(arg.idx);
+    return node.kind === 'op' ? node.fact : undefined;
+  };
+  const fullMask = (type: TypeName) => (_1n << BigInt(types.sizeof(type) * 8)) - _1n;
+  const isBoolFact = (arg: FnOp) => {
+    const range = getFact(arg)?.range;
+    return !!range && range.min >= _0n && range.max <= _1n;
+  };
+  const isLowMask = (mask: bigint) => mask >= _0n && (mask & (mask + _1n)) === _0n;
+  const maskCovers = (arg: FnOp, mask: bigint, cleared: bigint) => {
+    const fact = getFact(arg);
+    const bits = fact?.bits;
+    if (bits && (bits.known & ~bits.value & cleared) === cleared) return true;
+    if (!isLowMask(mask)) return false;
+    const range = fact?.range;
+    if (range && range.min >= _0n && range.max <= mask) return true;
+    const node = opNode(arg);
+    if (
+      !node ||
+      !isOp(node, 'div', 'rem') ||
+      types.SignedType.has(node.type) ||
+      !types.ScalarType.has(node.type)
+    )
+      return false;
+    // Keep the trapping op in place: zero divisors still trap before the removed mask would run.
+    const left = getFact(fn.byIdx(node.args[0]))?.range;
+    if (left && left.min >= _0n && left.max <= mask) return true;
+    const right = getFact(fn.byIdx(node.args[1]))?.range;
+    return node.op === 'rem' && !!right && right.max > _0n && right.max - _1n <= mask;
+  };
+  const opNode = (arg: FnOp) => {
+    const node = fn.ops.get(arg.idx);
+    return node.kind === 'op' ? node : undefined;
+  };
+  const isConstValue = (arg: FnOp, value: number | bigint) =>
+    isConst(arg) && BigInt(getConst(arg)) === BigInt(value);
+  const constLike = (arg: FnOp) => {
+    if (isConst(arg)) return BigInt(getConst(arg));
+    const fact = getFact(arg);
+    const type = types.normType(types.nodeRetType(fn, arg)) as TypeName;
+    if (fact?.bits && fact.bits.known === fullMask(type)) return fact.bits.value;
+    return;
+  };
+  const constOfBits = (type: TypeName, value: bigint) => {
+    const width = types.sizeof(type) * 8;
+    const raw = types.SignedType.has(type)
+      ? BigInt.asIntN(width, value)
+      : BigInt.asUintN(width, value);
+    return (fn.types as any)[type].const(raw);
+  };
+  const foldBigIntConst = (node: Extract<Node, { kind: 'op' }>, args: FnOp[]) => {
+    const width = types.sizeof(node.type) * 8;
+    const vals = args.map((arg) => BigInt(getConst(arg)));
+    const wrap = (value: bigint) => constOfBits(node.type, value);
+    // Exact facts already fold literal comparisons, bitwise ops, shifts, and rotates.
+    // Keep arithmetic whose wrapping/signed/division behavior facts do not fully represent.
+    if (isOp(node, 'add')) return wrap(vals.reduce((acc, value) => acc + value, _0n));
+    if (isOp(node, 'mul')) return wrap(vals.reduce((acc, value) => acc * value, _1n));
+    const int = types.SignedType.has(node.type) ? BigInt.asIntN : BigInt.asUintN;
+    if (isOp(node, 'sub')) return wrap(int(width, vals[0]) - int(width, vals[1]));
+    if (isOp(node, 'div', 'rem')) {
+      const b = int(width, vals[1]);
+      if (b === _0n) return;
+      const a = int(width, vals[0]);
+      return wrap(node.op === 'div' ? a / b : a % b);
+    }
+    return;
+  };
+  const truthy32 = (arg: FnOp) => {
+    const node = opNode(arg);
+    if (!node) return;
+    if (node.op === 'ne' && ['i32', 'u32'].includes(node.type)) {
+      const args = node.args.map((idx) => fn.byIdx(idx));
+      if (isConst(args[0]) && getConst(args[0]) == 0) return args[1];
+      if (isConst(args[1]) && getConst(args[1]) == 0) return args[0];
+    }
+    if (node.op !== 'eqz') return;
+    const inner = opNode(fn.byIdx(node.args[0]));
+    if (!inner || inner.op !== 'eqz') return;
+    const value = fn.byIdx(inner.args[0]);
+    const type = `${types.normType(types.nodeRetType(fn, value))}`;
+    if (type === 'i32' || type === 'u32') return value;
+    return;
+  };
+  let selectDepsVersion = -1;
+  let selectDeps = new WeakMap<object, boolean>();
+  const dependsOnSelect = (arg: FnOp, seen = new Set<object>()): boolean => {
+    if (selectDepsVersion !== fn.ops.version) {
+      selectDepsVersion = fn.ops.version;
+      selectDeps = new WeakMap();
+    }
+    const node = opNode(arg);
+    if (!node) return false;
+    const cached = selectDeps.get(node);
+    if (cached !== undefined) return cached;
+    if (seen.has(node)) return false;
+    seen.add(node);
+    let res = false;
+    if (node.op === 'select') res = true;
+    else if (!isOp(node, 'arg', 'const', 'load', 'store', 'call', 'fill', 'copy', 'br', 'br_if')) {
+      // Profiled Noble target builds spend most optimizer time re-walking this predicate.
+      // The graph version keeps the cache local to a stable rewrite snapshot.
+      res = node.args.some((idx) => dependsOnSelect(fn.byIdx(idx), seen));
+    }
+    seen.delete(node);
+    selectDeps.set(node, res);
+    return res;
+  };
+  const zeroFact = (arg: FnOp) => {
+    const fact = getFact(arg);
+    // Facts describe the logical pseudo-type before BigInt lowering, so keep its full width here.
+    const type = types.nodeRetType(fn, arg);
+    const bits = fact?.bits;
+    if (bits) {
+      if (bits.known === fullMask(type) && bits.value === _0n) return true;
+      if ((bits.known & bits.value) !== _0n) return false;
+    }
+    const range = fact?.range;
+    if (range) {
+      if (range.min === _0n && range.max === _0n) return true;
+      if (range.min > _0n || range.max < _0n) return false;
+    }
+    return;
+  };
+  const cmpRange = (
+    op: string,
+    a: { min: bigint; max: bigint },
+    b: { min: bigint; max: bigint }
+  ) => {
+    if (op === 'eq' || op === 'ne') {
+      const disjoint = a.max < b.min || b.max < a.min;
+      const exact = a.min === a.max && b.min === b.max && a.min === b.min;
+      const res = disjoint ? false : exact ? true : undefined;
+      return op === 'ne' && res !== undefined ? !res : res;
+    }
+    if (op === 'gt' || op === 'ge') return cmpRange(op === 'gt' ? 'lt' : 'le', b, a);
+    if (op === 'lt') return a.max < b.min ? true : a.min >= b.max ? false : undefined;
+    if (op === 'le') return a.max <= b.min ? true : a.min > b.max ? false : undefined;
+    return;
+  };
+  const knownCmp = (op: string, type: TypeName, a: FnOp, b: FnOp) => {
+    if (op === 'eq' || op === 'ne') {
+      const ab = getFact(a)?.bits;
+      const bb = getFact(b)?.bits;
+      if (ab && bb) {
+        const mask = fullMask(type);
+        const known = ab.known & bb.known & mask;
+        if (((ab.value ^ bb.value) & known) !== _0n) return op === 'ne';
+        if ((ab.known & mask) === mask && (bb.known & mask) === mask) return op === 'eq';
+      }
+    }
+    const ar = getFact(a)?.range;
+    const br = getFact(b)?.range;
+    return ar && br ? cmpRange(op, ar, br) : undefined;
+  };
+  const boolConstCmp = (node: Node, args: FnOp[]) => {
+    if (!isOp(node, 'eq', 'ne') || args.length !== 2) return;
+    if (!types.IntType.has(node.type) || !types.ScalarType.has(node.type)) return;
+    const leftConst = isConst(args[0]);
+    const rightConst = isConst(args[1]);
+    if (leftConst === rightConst) return;
+    const raw = getConst(leftConst ? args[0] : args[1]);
+    // SIMD constants are byte arrays; this fold is only for scalar numeric boolean compares.
+    if (typeof raw !== 'number' && typeof raw !== 'bigint') return;
+    if (typeof raw === 'number' && !Number.isInteger(raw)) return;
+    const value = BigInt(raw);
+    if (value !== _0n && value !== _1n) return;
+    const arg = leftConst ? args[1] : args[0];
+    if (!isBoolFact(arg)) return;
+    const type = types.normType(types.nodeRetType(fn, arg));
+    const T = (fn.types as any)[type];
+    const same = node.op === 'eq' ? value === _1n : value === _0n;
+    return same ? arg : T.eqz(arg);
+  };
+  const foldMemoryOffset = (node: Node, args: FnOp[]) => {
+    if (!isOp(node, 'load', 'store')) return;
+    const addr = opNode(args[0]);
+    if (!addr || addr.op !== 'add' || addr.type !== 'u32') return;
+    const baseArgs = [];
+    let offset = BigInt(node.opts.offset || 0);
+    let max = _0n;
+    let hasConst = false;
+    for (const idx of addr.args) {
+      const arg = fn.byIdx(idx);
+      if (isConst(arg)) {
+        const c = BigInt(getConst(arg));
+        if (c < _0n) return;
+        offset += c;
+        hasConst = true;
+        continue;
+      }
+      const range = getFact(arg)?.range;
+      if (!range || range.min < _0n) return;
+      max += range.max;
+      baseArgs.push(arg);
+    }
+    const limit = fullMask('u32');
+    if (!hasConst || offset > limit || max + offset > limit) return;
+    const base =
+      baseArgs.length === 0
+        ? fn.types.u32.const(0)
+        : baseArgs.length === 1
+          ? baseArgs[0]
+          : fn.op('u32', 'add', baseArgs);
+    const opts = { ...node.opts, offset: Number(offset) };
+    if (node.op === 'load') return fn.op(node.type, 'load', [base], opts);
+    return fn.op(node.type, 'store', [base, args[1]], opts);
+  };
   const isPow2 = (n: bigint): boolean => n > _0n && (n & (n - _1n)) === _0n;
   const ctzBig = (n: bigint) => {
     let k = 0;
     for (; (n & _1n) === _0n; k++, n >>= _1n);
     return k;
   };
+  const signedRange = (type: TypeName, shift: bigint) => {
+    const w = BigInt(types.sizeof(type) * 8);
+    const bits = w - shift;
+    return { min: -(_1n << (bits - _1n)), max: (_1n << (bits - _1n)) - _1n };
+  };
+  const signExtendParts = (node: Node, args: FnOp[]) => {
+    if (!isOp(node, 'shr') || !types.SignedType.has(node.type) || !types.ScalarType.has(node.type))
+      return;
+    const right = constLike(args[1]);
+    if (right === undefined) return;
+    const src = opNode(args[0]);
+    if (!src || src.op !== 'shl' || src.type !== node.type) return;
+    const left = constLike(fn.byIdx(src.args[1]));
+    if (left === undefined) return;
+    const w = BigInt(types.sizeof(node.type) * 8);
+    const mask = w - _1n;
+    const shift = right & mask;
+    if (shift === _0n || (left & mask) !== shift) return;
+    return { value: fn.byIdx(src.args[0]), shift, type: node.type };
+  };
+  const signExtendArg = (arg: FnOp) => {
+    const node = opNode(arg);
+    if (!node) return;
+    return signExtendParts(
+      node,
+      node.args.map((idx) => fn.byIdx(idx))
+    );
+  };
+  const foldSignExtend = (node: Node, args: FnOp[]) => {
+    const parts = signExtendParts(node, args);
+    if (!parts) return;
+    const range = getFact(parts.value)?.range;
+    const signed = signedRange(parts.type, parts.shift);
+    if (range && range.min >= signed.min && range.max <= signed.max) return parts.value;
+    return;
+  };
+  const foldShiftMask = (node: Node, args: FnOp[]) => {
+    if (!isOp(node, 'shl') || !types.IntType.has(node.type) || !types.ScalarType.has(node.type))
+      return;
+    const shift = constLike(args[1]);
+    if (shift === undefined) return;
+    const width = BigInt(types.sizeof(node.type) * 8);
+    const s = shift & (width - _1n);
+    if (s === _0n) return;
+    const src = opNode(args[0]);
+    if (!src || src.op !== 'and' || src.type !== node.type) return;
+    // A left shift discards high source bits; masks that only clear those bits are dead.
+    const needed = (_1n << (width - s)) - _1n;
+    let changed = false;
+    const keep = [];
+    for (const idx of src.args) {
+      const arg = fn.byIdx(idx);
+      if (!isConst(arg)) {
+        keep.push(arg);
+        continue;
+      }
+      const mask = BigInt(getConst(arg)) & fullMask(node.type);
+      if ((mask & needed) === needed) {
+        changed = true;
+        continue;
+      }
+      keep.push(arg);
+    }
+    if (!changed || keep.length === 0) return;
+    const value = keep.length === 1 ? keep[0] : fn.op(node.type, 'and', keep);
+    return fn.op(node.type, 'shl', [value, args[1]], node.opts);
+  };
   return (node, args, _idx) => {
     if (node.kind !== 'op') return;
+    const mem = foldMemoryOffset(node, args);
+    if (mem) return mem;
+    const sign = foldSignExtend(node, args);
+    if (sign) return sign;
+    const shift = foldShiftMask(node, args);
+    if (shift) return shift;
+    if (isOp(node, 'br_if')) {
+      const cond = truthy32(args[args.length - 1]);
+      if (cond) return fn.op(node.type, node.op, [...args.slice(0, -1), cond], node.opts);
+    }
+    if (isOp(node, 'select')) {
+      const cond = truthy32(args[2]);
+      if (cond) return fn.op(node.type, node.op, [args[0], args[1], cond], node.opts);
+    }
     if (isOp(node, 'load', 'store', 'const', 'arg', 'fill', 'copy', 'call', 'br_if', 'br')) return;
     if (isOp(node, 'virtualPairs', 'virtualPairsArg', 'virtualMask')) return;
     if (node.op.includes('atomic')) return;
-    if (types.BigIntType.has(node.type)) return;
+    const allBigConst = types.BigIntScalarType.has(node.type) && args.every(isConst);
+    const rawType = types.nodeRetType(fn, fn.byIdx(_idx));
+    const rawBig = types.BigIntType.has(rawType);
+    // Big-int pseudo-types cannot be normalized; only literal constants use their raw type here.
+    const retType = (rawBig ? rawType : types.normType(rawType)) as TypeName;
+    if (
+      types.IntType.has(retType) &&
+      types.ScalarType.has(retType) &&
+      (!rawBig || allBigConst) &&
+      !dependsOnSelect(fn.byIdx(_idx))
+    ) {
+      const bits = node.fact?.bits;
+      const mask = fullMask(retType);
+      if (bits && (bits.known & mask) === mask) return constOfBits(retType, bits.value & mask);
+    }
+    if (
+      isOp(node, 'eq', 'ne', 'lt', 'gt', 'le', 'ge') &&
+      types.IntType.has(node.type) &&
+      types.ScalarType.has(node.type)
+    ) {
+      const known =
+        dependsOnSelect(args[0]) || dependsOnSelect(args[1])
+          ? undefined
+          : knownCmp(node.op, node.type, args[0], args[1]);
+      if (known !== undefined) return (fn.types as any)[types.maskType(node.type)].const(+known);
+    }
+    const boolCmp = boolConstCmp(node, args);
+    if (boolCmp) return boolCmp;
+    if (
+      isOp(node, 'eqz') &&
+      types.IntType.has(node.type) &&
+      types.ScalarType.has(node.type) &&
+      !dependsOnSelect(args[0])
+    ) {
+      // Fact-based eqz folding can erase producer evaluation; keep data selects visible for constant-time shapes.
+      const zero = zeroFact(args[0]);
+      if (zero !== undefined) return (fn.types as any)[types.maskType(node.type)].const(+zero);
+    }
+    if (types.BigIntType.has(node.type))
+      return allBigConst ? foldBigIntConst(node, args) : undefined;
     const T = (fn.types as any)[node.type];
+    if (
+      isOp(node, 'select') &&
+      (node.type === 'i32' || node.type === 'u32') &&
+      ['i32', 'u32'].includes(`${types.normType(types.nodeRetType(fn, args[2]))}`)
+    ) {
+      const C = (fn.types as any)[types.normType(types.nodeRetType(fn, args[2]))];
+      if (isConstValue(args[0], 1) && isConstValue(args[1], 0)) {
+        if (isBoolFact(args[2])) return args[2];
+        return C.ne(args[2], C.const(0));
+      }
+      if (isConstValue(args[0], 0) && isConstValue(args[1], 1)) return C.eqz(args[2]);
+    }
+    if (isOp(node, 'eq') && types.IntType.has(node.type) && types.ScalarType.has(node.type)) {
+      if (isConst(args[0]) && getConst(args[0]) == 0) return T.eqz(args[1]);
+      if (isConst(args[1]) && getConst(args[1]) == 0) return T.eqz(args[0]);
+    }
+    if (isOp(node, 'eqz') && types.IntType.has(node.type) && types.ScalarType.has(node.type)) {
+      const inner = opNode(args[0]);
+      if (inner?.op === 'eqz') {
+        const value = fn.byIdx(inner.args[0]);
+        if (isBoolFact(value)) return value;
+      }
+    }
     if (node.op === 'swizzle' && isConst(args[1]) && types.sizeof(node.type) === 16) {
       const maskBytes = getConst(args[1]) as Uint8Array;
       if (maskBytes.length === 16 && maskBytes.every((i) => i >= 0 && i < 16)) {
@@ -1217,6 +2054,53 @@ export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
     // all args constant
     const noExec: string[] = [];
     if (args.every(isConst) && !noExec.includes(node.op)) return exec(args);
+    if (isOp(node, 'shl', 'shr', 'rotl', 'rotr') && args.length === 2 && isConst(args[1])) {
+      // Constant-aware n-grams exposed zero shifts after variadic neutral folding had already run.
+      if (getConst(args[1]) == 0) return args[0];
+    }
+    if (
+      isOp(node, 'div', 'rem') &&
+      types.IntType.has(node.type) &&
+      types.ScalarType.has(node.type) &&
+      args.length === 2 &&
+      isConst(args[1])
+    ) {
+      // div/rem are not variadic, so they need their own constant-right operand fold.
+      const c = BigInt(getConst(args[1]));
+      if (c === _1n) return node.op === 'div' ? args[0] : T.const(0);
+      if (!types.SignedType.has(node.type) && isPow2(c)) {
+        const k = ctzBig(c);
+        if (node.op === 'div') return T.shr(args[0], k);
+        return T.and(args[0], constOfBits(node.type, c - _1n));
+      }
+    }
+    if (isOp(node, 'and') && types.IntType.has(node.type) && types.ScalarType.has(node.type)) {
+      const full = fullMask(node.type);
+      for (let i = 0; i < args.length; i++) {
+        if (!isConst(args[i])) continue;
+        const mask = BigInt(getConst(args[i])) & full;
+        const cleared = full & ~mask;
+        if (cleared === _0n) continue;
+        if (isLowMask(mask)) {
+          let changed = false;
+          const mapped = args.map((arg, j) => {
+            if (i === j) return arg;
+            const sx = signExtendArg(arg);
+            if (!sx) return arg;
+            const srcMask = (_1n << (BigInt(types.sizeof(sx.type) * 8) - sx.shift)) - _1n;
+            if (mask > srcMask) return arg;
+            changed = true;
+            return sx.value;
+          });
+          if (changed) return fn.op(node.type, 'and', mapped);
+        }
+        // Value facts let us remove masks even when a local/tee separates producer and consumer.
+        if (!args.some((arg, j) => i !== j && maskCovers(arg, mask, cleared))) continue;
+        const keep = args.filter((_arg, j) => i !== j);
+        if (keep.length === 1) return keep[0];
+        return fn.op(node.type, 'and', keep);
+      }
+    }
     // extmul instead of mul when possible
     if (node.op === 'mul' && ['u64x2', 'i64x2'].includes(node.type) && opts.optExtMul) {
       const T = fn.types[node.type] as GetOpsFnOp<any>;
@@ -1291,6 +2175,7 @@ export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
           // a & -1 = a, a & mask = a
           if (types.IntType.has(node.type)) {
             const mask = types.getMask(types.ScalarOf(node.type));
+            if (isOp(node, 'xor') && c == mask) return T.not(A());
             if (isOp(node, 'and') && (c == -1 || c == mask)) return A();
             if (isOp(node, 'or') && (c == -1 || c == mask)) return T.const(mask);
           }
@@ -1335,6 +2220,16 @@ export function optimize(fn: ModuleGraph, opts: CompilerOpts = {}): Rewrite {
           //console.log('Variadic op', node.op, c, c == 0);
         }
       } else if (argsConst.length) throw new Error('unexpected');
+    }
+    if (isOp(node, 'and') && types.IntType.has(node.type) && types.ScalarType.has(node.type)) {
+      for (let i = 0; i < args.length; i++) {
+        const not = opNode(args[i]);
+        if (!not || not.op !== 'not' || not.type !== node.type) continue;
+        const keep = args.filter((_arg, j) => j !== i);
+        if (!keep.length) continue;
+        const left = keep.length === 1 ? keep[0] : fn.op(node.type, 'and', keep);
+        return T.andnot(left, fn.byIdx(not.args[0]));
+      }
     }
   };
 }
@@ -1838,8 +2733,41 @@ export function lowerSmallInt(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrit
   const zeroExtend = (v: FnOp, mask: number) => {
     return fn.op('u32', 'and', [v, fn.types.u32.const(mask)]);
   };
+  const constNum = (idx: string) => {
+    const node = fn.ops.get(idx);
+    return isOp(node, 'const') ? Number(node.opts.value) : undefined;
+  };
+  const canDropSourceNorm = (idx: string) => {
+    const node = fn.ops.get(idx);
+    if (!isOp(node)) return false;
+    if (isOp(node, 'arg', 'nodeOutput')) return true;
+    const ret = types.nodeRetType(fn, fn.byIdx(idx));
+    return !isSmall(ret) && !types.SIMDType.has(ret);
+  };
+  const normalizedSource = (v: FnOp): { value: FnOp; width: number } | undefined => {
+    const node = fn.ops.get(v.idx);
+    if (isOp(node, 'and')) {
+      for (let i = 0; i < node.args.length; i++) {
+        const mask = constNum(node.args[i]);
+        if (mask !== 0xff && mask !== 0xffff) continue;
+        const value = node.args.find((_arg, j) => j !== i);
+        if (value && canDropSourceNorm(value))
+          return { value: fn.byIdx(value), width: mask === 0xff ? 8 : 16 };
+      }
+    }
+    if (!isOp(node, 'shr')) return;
+    const right = constNum(node.args[1]);
+    if (right !== 16 && right !== 24) return;
+    const src = fn.ops.get(node.args[0]);
+    if (!isOp(src, 'shl') || constNum(src.args[1]) !== right) return;
+    if (!canDropSourceNorm(src.args[0])) return;
+    return { value: fn.byIdx(src.args[0]), width: 32 - right };
+  };
   const normalize = (t: TypeName, v: FnOp) => {
     const { signed, width, mask } = info(t);
+    const src = normalizedSource(v);
+    // Narrowing observes only low target bits; keep small producers visible for later lowering.
+    if (src && width <= src.width) v = src.value;
     if (signed) return signExtend(v, width);
     return zeroExtend(v, mask);
   };
@@ -1869,6 +2797,10 @@ export function lowerSmallInt(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrit
       const toSigned = toType.startsWith('i');
       const toBase = (toSigned ? 'i32' : 'u32') as TypeName;
       const fromBase = (fromSigned ? 'i32' : 'u32') as TypeName;
+      if (fromSmall && toSmall && info(toType).width <= info(fromType).width) {
+        // Target normalization only reads low target bits; source normalization would be discarded.
+        return normalize(toType, args[0]);
+      }
       const asI32 = () => {
         if (fromType === 'i32' || fromType === 'u32') return args[0];
         if (fromType === 'i64' || fromType === 'u64') return fn.op(fromBase, 'wrap_i64', [args[0]]);
@@ -1995,6 +2927,7 @@ export function lowerSmallInt(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrit
       return norm(U.or(lo, hi));
     }
     if (types.opsCompare.has(node.op)) return fn.op(base, node.op, args, node.opts);
+    if (isOp(node, 'cast')) return norm(args[0]);
     return norm(fn.op(base, node.op, args, node.opts));
   };
 }

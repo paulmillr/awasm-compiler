@@ -6,6 +6,10 @@ import * as wasm from '../src/wasm.ts';
 describe('JS', () => {
   should('genObject', () => {
     deepStrictEqual(js.genObject({ a: { b: '3+2' } }), `{a: {b: 3+2}}`);
+    deepStrictEqual(
+      js.genObject({ a: 'a', nested: { b: 'b', c: '3+2' } }),
+      `{a, nested: {b, c: 3+2}}`
+    );
     const obj = { '': '1', 'a-b': '2', 'a.b': '3', normal: '4' };
     deepStrictEqual(Function(`return ${js.genObject(obj)}`)(), {
       '': 1,
@@ -38,6 +42,39 @@ describe('JS', () => {
       { TAG: 'end' },
     ];
     deepStrictEqual(js.__TEST.isLiveAfter(live as any, 3, 0), true);
+  });
+  should('split helper returns use object shorthand for locals', () => {
+    const n = 12;
+    const instructions = [];
+    for (let i = 0; i < n; i++)
+      instructions.push(
+        { TAG: 'i32.const', data: BigInt(i) },
+        { TAG: 'local.set', data: BigInt(i) }
+      );
+    instructions.push({ TAG: 'block', data: 'void', hoist: [] }, { TAG: 'end' });
+    for (let i = 0; i < n; i++) instructions.push({ TAG: 'local.get', data: BigInt(i) });
+    instructions.push({ TAG: 'end' });
+    const raw = js.createJS(
+      {
+        memory: { size: 0 },
+        functions: [
+          {
+            name: 'main',
+            export: true,
+            inputs: [],
+            outputs: Array(n).fill('i32'),
+            locals: [],
+            instructions,
+          },
+        ],
+      } as any,
+      {},
+      { jsOpsPerFn: 10 }
+    );
+    deepStrictEqual(
+      raw.split('\n').filter((line) => line.startsWith('return {v0')),
+      ['return {v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11};']
+    );
   });
   should('call tail remains live across skippable block assignment', () => {
     const mod = {
@@ -158,11 +195,22 @@ return { ..._exports, memory, segments };`
         pos: 0,
         size: 16,
         paddedSize: 16,
-        subRegions: { '': [0, 16, 4, 4] },
+        subRegions: { '': [0, 16, 4, 4], single: [8, 4, 1, 4] },
       },
     };
     const code = 'const instance = { exports: { memory: { buffer: new ArrayBuffer(32) } } };';
-    const out = js.exec(js.wrapModule(def as any, code, segments as any, {}, { freeze: true }));
+    const wrapped = js.wrapModule(def as any, code, segments as any, {}, { freeze: true });
+    deepStrictEqual(
+      wrapped.raw.split('\n').filter((line) => line.includes('data_chunks')),
+      [
+        ', data_chunks: Object.freeze(Array.from({length: 4},(_,i)=>new Uint8Array(memoryExport.buffer, i*4, 4)))',
+      ]
+    );
+    deepStrictEqual(
+      wrapped.raw.split('\n').filter((line) => line.includes('data.single_chunks')),
+      [', "data.single_chunks": Object.freeze([new Uint8Array(memoryExport.buffer, 8, 4)])']
+    );
+    const out = js.exec(wrapped);
     deepStrictEqual(Object.isFrozen(out), true);
     deepStrictEqual(Object.isFrozen(out.segments), true);
     deepStrictEqual(Object.isFrozen(out.segments.data_chunks), true);
@@ -207,9 +255,55 @@ function main() {
     Atomics.add(memory_i32, 0, (1|0))|0;
 return ;
 }
-const instance = { exports: {main: main, memory: { buffer: __buf }}};
+const instance = { exports: {main, memory: { buffer: __buf }}};
 `
     );
+  });
+  should('materializes direct memory-load operands before composing expressions', () => {
+    const mod = {
+      memory: { size: 1024, export: true },
+      functions: [
+        {
+          name: 'main',
+          export: true,
+          inputs: [],
+          outputs: ['i32'],
+          locals: [],
+          instructions: [
+            { TAG: 'i32.const', data: 0n },
+            { TAG: 'i32.load', data: { align: 2, offset: 0, trustedAlign: true } },
+            { TAG: 'i32.const', data: 4n },
+            { TAG: 'i32.load', data: { align: 2, offset: 0, trustedAlign: true } },
+            { TAG: 'i32.xor' },
+            { TAG: 'end' },
+          ],
+        },
+      ],
+    };
+    const raw = js.createJS(mod as any, {});
+    deepStrictEqual(
+      raw,
+      `
+const __buf = new ArrayBuffer(1024);
+if (!(__buf instanceof ArrayBuffer)) throw new Error('wrong buffer');
+
+const memory_i32 = new Int32Array(__buf);
+
+
+
+function main() {
+${'    '}
+    const __awasm_mem0 = memory_i32[0];
+const __awasm_mem1 = memory_i32[1];
+return (__awasm_mem0 ^ __awasm_mem1);
+}
+const instance = { exports: {main, memory: { buffer: __buf }}};
+`
+    );
+    const generated = js.exec(js.wrapModule(mod as any, raw, {}));
+    new Int32Array(generated.memory.buffer)[0] = 0xa5a5a5a5 | 0;
+    new Int32Array(generated.memory.buffer)[1] = 0x5a5a5a5a | 0;
+    deepStrictEqual(generated.main(), -1);
   });
 });
 

@@ -201,30 +201,12 @@ const opsBasicItems = /* @__PURE__ */ (() =>
   ] as const)();
 const opsShiftsItems = /* @__PURE__ */ (() => ['shr', 'shl', 'rotr', 'rotl'] as const)();
 const opsIntItems = /* @__PURE__ */ (() =>
-  [
-    'and',
-    'or',
-    'xor',
-    'andnot',
-    'not',
-    'clz',
-    'ctz',
-    'popcnt',
-    ...opsShiftsItems,
-  ] as const)();
+  ['and', 'or', 'xor', 'andnot', 'not', 'clz', 'ctz', 'popcnt', ...opsShiftsItems] as const)();
 const opsSignedItems = /* @__PURE__ */ (() => ['abs', 'neg'] as const)();
 const opsCompareItems = /* @__PURE__ */ (() =>
   [...opsCompareBaseItems, ...opsCompareFloatItems] as const)();
 const opsFloatItems = /* @__PURE__ */ (() =>
-  [
-    'sqrt',
-    'ceil',
-    'floor',
-    'trunc',
-    'nearest',
-    'copysign',
-    ...opsCompareFloatItems,
-  ] as const)();
+  ['sqrt', 'ceil', 'floor', 'trunc', 'nearest', 'copysign', ...opsCompareFloatItems] as const)();
 const opsAtomicsItems = /* @__PURE__ */ (() => ['add', 'sub', 'and', 'or', 'xor'] as const)();
 const opsVariadicItems = /* @__PURE__ */ (() =>
   ['add', 'mul', 'and', 'xor', 'or', 'min', 'max'] as const)();
@@ -359,7 +341,9 @@ export const SmallIntType = /* @__PURE__ */ filter(
 // Build the public name list through a pure call so single-export bundles can drop it when unused.
 /** Runtime list of non-bigint type names used by generators. */
 export const TypeName: TypeName[] = /* @__PURE__ */ (() =>
-  utils.deepFreeze(Object.keys(TYPES).filter((k) => !BigIntType.has(k as TypeName)) as TypeName[]))();
+  utils.deepFreeze(
+    Object.keys(TYPES).filter((k) => !BigIntType.has(k as TypeName)) as TypeName[]
+  ))();
 
 /** Scalar lane type extracted from a scalar or SIMD type name. */
 export type ScalarOf<N extends TypeName> = N extends `${infer P}x${number}`

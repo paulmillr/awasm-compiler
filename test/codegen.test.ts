@@ -95,6 +95,1116 @@ describe('Codegen', () => {
         );
       });
     });
+    type ReportSeq = { name: string; seq: string[] };
+    const opReport = () => ({ ops: {}, ngrams: {}, functions: [] });
+    const expectedReport = (mod: string, seqs: ReportSeq[]) => {
+      const expected: {
+        ops: Record<string, number>;
+        ngrams: Record<string, number>;
+        functions: { module: string; label: string; name: string; ops: number }[];
+      } = { ops: {}, ngrams: {}, functions: [] };
+      const bump = (obj: Record<string, number>, key: string) => {
+        if (!obj[key]) obj[key] = 0;
+        obj[key]++;
+      };
+      for (const { name, seq } of [...seqs].sort((a, b) => a.name.localeCompare(b.name))) {
+        expected.functions.push({ module: mod, label: mod, name, ops: seq.length });
+        for (const tag of seq) bump(expected.ops, tag);
+        for (let n = 2; n <= 4; n++) {
+          for (let i = 0; i <= seq.length - n; i++)
+            bump(expected.ngrams, seq.slice(i, i + n).join(' '));
+        }
+      }
+      return expected;
+    };
+    const checkReport = (m: Module, seqs: ReportSeq[], opts = {}) => {
+      const report = opReport();
+      toMod(m, { ...opts, wasmTee: false, opNgrams: report } as any);
+      deepStrictEqual(report, expectedReport(m.name, seqs));
+    };
+    const wasmFns = (m: Module, opts: any) =>
+      Object.fromEntries(
+        toMod(m, opts).wasmMod.functions.map((fn: any) => [fn.name, fn.instructions])
+      );
+    should('collects emitted op ngrams', () => {
+      const report = { ops: {}, ngrams: {}, functions: [] };
+      const m = new Module('ngrams');
+      m.fn('sum', ['i32', 'i32'], 'i32', (f, a, b) => {
+        const { i32 } = f.types;
+        return [i32.add(i32.add(a, b), i32.const(1))];
+      });
+      toMod(m, { optimize: false, wasmTee: false, opNgrams: report } as any);
+      deepStrictEqual(report, {
+        ops: {
+          'local.get': 2,
+          'i32.add': 2,
+          'i32.const(1)': 1,
+          'local.tee': 1,
+          end: 1,
+        },
+        ngrams: {
+          'local.get local.get': 1,
+          'local.get i32.add': 1,
+          'i32.add i32.const(1)': 1,
+          'i32.const(1) i32.add': 1,
+          'i32.add local.tee': 1,
+          'local.tee end': 1,
+          'local.get local.get i32.add': 1,
+          'local.get i32.add i32.const(1)': 1,
+          'i32.add i32.const(1) i32.add': 1,
+          'i32.const(1) i32.add local.tee': 1,
+          'i32.add local.tee end': 1,
+          'local.get local.get i32.add i32.const(1)': 1,
+          'local.get i32.add i32.const(1) i32.add': 1,
+          'i32.add i32.const(1) i32.add local.tee': 1,
+          'i32.const(1) i32.add local.tee end': 1,
+        },
+        functions: [{ module: 'ngrams', label: 'ngrams', name: 'sum', ops: 7 }],
+      });
+    });
+    should('reads the public opNgrams option once', () => {
+      const report = opReport();
+      const m = new Module('ngramGetter').fn('run', ['u32'], 'u32', (_f, x) => x);
+      let reads = 0;
+      const opts = Object.defineProperty({ wasmTee: false }, 'opNgrams', {
+        get() {
+          reads++;
+          return report;
+        },
+      });
+      toMod(m, opts as any);
+      deepStrictEqual(
+        { reads, report },
+        {
+          reads: 1,
+          report: expectedReport('ngramGetter', [{ name: 'run', seq: ['local.get', 'end'] }]),
+        }
+      );
+    });
+    should('collects exact public ngram examples', () => {
+      const report = { ...opReport(), examples: {} };
+      const m = new Module('ngramExamples')
+        .fn('alpha', [], 'i32', (f) => f.types.i32.const(7))
+        .fn('beta', [], 'i32', (f) => f.types.i32.const(7))
+        .fn('negativeZero', [], 'f64', (f) => f.types.f64.const(-0));
+      toMod(m, {
+        optimize: false,
+        wasmTee: false,
+        opNgrams: report,
+        opNgramLabel: 'custom',
+        opNgramExamples: 1,
+      } as any);
+      deepStrictEqual(report, {
+        ops: { 'i32.const(7)': 2, end: 3, 'f64.const(-0)': 1 },
+        ngrams: { 'i32.const(7) end': 2, 'f64.const(-0) end': 1 },
+        functions: [
+          { module: 'ngramExamples', label: 'custom', name: 'alpha', ops: 2 },
+          { module: 'ngramExamples', label: 'custom', name: 'beta', ops: 2 },
+          { module: 'ngramExamples', label: 'custom', name: 'negativeZero', ops: 2 },
+        ],
+        examples: {
+          'i32.const(7) end': [
+            {
+              id: 'custom:alpha@0',
+              module: 'ngramExamples',
+              label: 'custom',
+              name: 'alpha',
+              at: 0,
+              context: ['i32.const(7)', 'end'],
+            },
+          ],
+          'f64.const(-0) end': [
+            {
+              id: 'custom:negativeZero@0',
+              module: 'ngramExamples',
+              label: 'custom',
+              name: 'negativeZero',
+              at: 0,
+              context: ['f64.const(-0)', 'end'],
+            },
+          ],
+        },
+      });
+    });
+    should('optimizes zero shifts and rotates', () => {
+      const m = new Module('shiftZero');
+      const cases = [];
+      for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
+        for (const op of ['shl', 'shr', 'rotl', 'rotr'] as const) {
+          const name = `${type}_${op}`;
+          cases.push({ name, seq: ['local.get', 'end'] });
+          m.fn(name, [type], type, (f, a) => [(f.types[type] as any)[op](a, 0)]);
+        }
+      }
+      checkReport(m, cases, { optimize: true });
+    });
+    should('inverts comparisons followed by eqz', () => {
+      const m = new Module('cmpEqz');
+      const cases = [];
+      for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
+        for (const op of ['eq', 'ge', 'gt', 'le', 'lt', 'ne'] as const) {
+          const name = `${type}_${op}`;
+          cases.push({ type, op, name });
+          m.fn(name, [type, type], 'u32', (f, a, b) => {
+            const T = f.types[type] as any;
+            return [f.types.u32.eqz(T[op](a, b))];
+          });
+        }
+      }
+      const inverse: Record<string, string> = {
+        eq: 'ne',
+        ne: 'eq',
+        lt: 'ge',
+        gt: 'le',
+        le: 'gt',
+        ge: 'lt',
+      };
+      const seqs = cases.map((c) => {
+        const wasmType = c.type.endsWith('64') ? 'i64' : 'i32';
+        const suffix = c.op === 'eq' || c.op === 'ne' ? '' : c.type.startsWith('u') ? '_u' : '_s';
+        return {
+          name: c.name,
+          seq: [
+            'local.get',
+            'local.get',
+            `${wasmType}.${inverse[c.op]}${suffix}`,
+            'local.tee',
+            'end',
+          ],
+        };
+      });
+      checkReport(m, seqs, { optimize: false });
+    });
+    should('drops redundant masks before narrow stores', () => {
+      const m = new Module('storeMask')
+        .mem('buf32', array('u32', {}, 1))
+        .mem('buf64', array('u64', {}, 1));
+      const cases = [];
+      for (const type of ['i32', 'u32'] as const) {
+        for (const bits of [8, 16] as const) {
+          const tag = `i32.store${bits}`;
+          const name = `${type}_store${bits}`;
+          cases.push({ name, seq: ['i32.const(0)', 'local.get', tag, 'end'] });
+          m.fn(name, [type], 'void', (f, v) => {
+            const T = f.types[type] as any;
+            const view = bits === 8 ? f.memory.buf32.as8(type) : f.memory.buf32.as16(type);
+            view[0].set(T.and(v, T.const((1 << bits) - 1)));
+          });
+        }
+      }
+      for (const type of ['i64', 'u64'] as const) {
+        for (const bits of [8, 16, 32] as const) {
+          const tag = `i64.store${bits}`;
+          const name = `${type}_store${bits}`;
+          cases.push({ name, seq: ['i32.const(0)', 'local.get', tag, 'end'] });
+          m.fn(name, [type], 'void', (f, v) => {
+            const T = f.types[type] as any;
+            const view =
+              bits === 8
+                ? f.memory.buf64.as8(type)
+                : bits === 16
+                  ? f.memory.buf64.as16(type)
+                  : f.memory.buf64.as32(type);
+            view[0].set(T.and(v, T.const((1n << BigInt(bits)) - 1n)));
+          });
+        }
+      }
+      checkReport(m, cases, { optimize: false });
+    });
+    should('combines adjacent scalar masks', () => {
+      const m = new Module('maskChain');
+      const cases = [];
+      for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
+        const wasmType = type.endsWith('64') ? 'i64' : 'i32';
+        cases.push({
+          name: type,
+          seq: ['local.get', `${wasmType}.const(255)`, `${wasmType}.and`, 'local.tee', 'end'],
+        });
+        m.fn(type, [type], type, (f, v) => {
+          const T = f.types[type] as any;
+          const c0 = type.endsWith('64') ? 255n : 255;
+          const c1 = type.endsWith('64') ? 65535n : 65535;
+          return [T.and(T.and(v, T.const(c0)), T.const(c1))];
+        });
+      }
+      checkReport(m, cases, { optimize: false });
+    });
+    should('turns xor with all-one masks into not', () => {
+      const m = new Module('xorNot');
+      const cases = [];
+      for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
+        const wasmType = type.endsWith('64') ? 'i64' : 'i32';
+        // Unsigned constants must use their encoded all-one value; `-1` is rejected by coders.
+        const value =
+          type === 'u64'
+            ? BigInt('0xffffffffffffffff')
+            : type === 'i64'
+              ? -1n
+              : type === 'u32'
+                ? 0xffffffff
+                : -1;
+        cases.push({ name: type, seq: ['local.get', `${wasmType}.not`, 'local.tee', 'end'] });
+        m.fn(type, [type], type, (f, v) => {
+          const T = f.types[type] as any;
+          return [T.xor(v, T.const(value))];
+        });
+      }
+      checkReport(m, cases, { optimize: true });
+      const wasmReport = opReport();
+      toWasm(m, { wasmTee: false, opNgrams: wasmReport } as any);
+      deepStrictEqual(
+        wasmReport,
+        expectedReport(
+          'xorNot',
+          cases.map(({ name }) => {
+            const wasmType = name.endsWith('64') ? 'i64' : 'i32';
+            return {
+              name,
+              seq: ['local.get', `${wasmType}.const(-1)`, `${wasmType}.xor`, 'local.tee', 'end'],
+            };
+          })
+        )
+      );
+    });
+    should('folds scalar div/rem by one and unsigned powers of two', () => {
+      const m = new Module('divRemConst');
+      const cases = [];
+      for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
+        const wasmType = type.endsWith('64') ? 'i64' : 'i32';
+        const one = type.endsWith('64') ? 1n : 1;
+        cases.push({ name: `${type}_div1`, seq: ['local.get', 'end'] });
+        cases.push({ name: `${type}_rem1`, seq: [`${wasmType}.const(0)`, 'end'] });
+        m.fn(`${type}_div1`, [type], type, (f, v) => {
+          const T = f.types[type] as any;
+          return [T.div(v, T.const(one))];
+        });
+        m.fn(`${type}_rem1`, [type], type, (f, v) => {
+          const T = f.types[type] as any;
+          return [T.rem(v, T.const(one))];
+        });
+      }
+      for (const type of ['u32', 'u64'] as const) {
+        const wasmType = type.endsWith('64') ? 'i64' : 'i32';
+        const four = type.endsWith('64') ? 4n : 4;
+        cases.push({
+          name: `${type}_div4`,
+          seq: ['local.get', `${wasmType}.const(2)`, `${wasmType}.shr_u`, 'local.tee', 'end'],
+        });
+        cases.push({
+          name: `${type}_rem4`,
+          seq: ['local.get', `${wasmType}.const(3)`, `${wasmType}.and`, 'local.tee', 'end'],
+        });
+        m.fn(`${type}_div4`, [type], type, (f, v) => {
+          const T = f.types[type] as any;
+          return [T.div(v, T.const(four))];
+        });
+        m.fn(`${type}_rem4`, [type], type, (f, v) => {
+          const T = f.types[type] as any;
+          return [T.rem(v, T.const(four))];
+        });
+      }
+      checkReport(m, cases, { optimize: true });
+    });
+    should('turns equality with zero into eqz', () => {
+      const m = new Module('eqZero');
+      const cases = [];
+      for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
+        const wasmType = type.endsWith('64') ? 'i64' : 'i32';
+        const zero = type.endsWith('64') ? 0n : 0;
+        for (const side of ['left', 'right'] as const) {
+          const name = `${type}_${side}`;
+          cases.push({ name, seq: ['local.get', `${wasmType}.eqz`, 'local.tee', 'end'] });
+          m.fn(name, [type], 'u32', (f, v) => {
+            const T = f.types[type] as any;
+            const z = T.const(zero);
+            return [side === 'left' ? T.eq(z, v) : T.eq(v, z)];
+          });
+        }
+      }
+      checkReport(m, cases, { optimize: true });
+    });
+    should('turns final right-zero equality into eqz', () => {
+      const m = new Module('eqZeroFinal');
+      const cases = [];
+      for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
+        const wasmType = type.endsWith('64') ? 'i64' : 'i32';
+        const zero = type.endsWith('64') ? 0n : 0;
+        cases.push({ name: type, seq: ['local.get', `${wasmType}.eqz`, 'local.tee', 'end'] });
+        m.fn(type, [type], 'u32', (f, v) => {
+          const T = f.types[type] as any;
+          return [T.eq(v, T.const(zero))];
+        });
+      }
+      checkReport(m, cases, { optimize: false });
+    });
+    should('turns and-not shapes into andnot', () => {
+      const m = new Module('andNot');
+      const cases = [];
+      for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
+        const wasmType = type.endsWith('64') ? 'i64' : 'i32';
+        cases.push({
+          name: type,
+          seq: ['local.get', 'local.get', `${wasmType}.andnot`, 'local.tee', 'end'],
+        });
+        m.fn(type, [type, type], type, (f, a, b) => {
+          const T = f.types[type] as any;
+          return [T.and(T.not(a), b)];
+        });
+      }
+      checkReport(m, cases, { optimize: true });
+      const wasmReport = opReport();
+      toWasm(m, { wasmTee: false, opNgrams: wasmReport } as any);
+      deepStrictEqual(
+        wasmReport,
+        expectedReport(
+          'andNot',
+          cases.map(({ name }) => {
+            const wasmType = name.endsWith('64') ? 'i64' : 'i32';
+            return {
+              name,
+              seq: [
+                'local.get',
+                'local.get',
+                `${wasmType}.const(-1)`,
+                `${wasmType}.xor`,
+                `${wasmType}.and`,
+                'local.tee',
+                'end',
+              ],
+            };
+          })
+        )
+      );
+    });
+    should('removes redundant double eqz for booleans and condition slots', () => {
+      const exact = new Module('doubleEqzExact');
+      exact.fn('boolOr', ['u32', 'u32', 'u32'], 'u32', (f, a, b, c) => {
+        const { u32 } = f.types;
+        const x = u32.or(u32.lt(a, b), u32.lt(b, c));
+        return [u32.eqz(u32.eqz(x))];
+      });
+      checkReport(
+        exact,
+        [
+          {
+            name: 'boolOr',
+            seq: [
+              'local.get',
+              'local.get',
+              'i32.lt_u',
+              'local.get',
+              'local.get',
+              'i32.lt_u',
+              'i32.or',
+              'local.tee',
+              'end',
+            ],
+          },
+        ],
+        { optimize: true }
+      );
+      const cond = new Module('doubleEqzCond');
+      cond.fn('branch', ['u32'], 'u32', (f, c) => {
+        const { u32 } = f.types;
+        return f.block([u32.const(1)], (v) => {
+          f.brIf(0, u32.eqz(u32.eqz(c)), u32.const(2));
+          return [v];
+        });
+      });
+      cond.fn('select', ['u32', 'u32', 'u32'], 'u32', (f, a, b, c) => {
+        const { u32 } = f.types;
+        return [u32.select(u32.eqz(u32.eqz(c)), a, b)];
+      });
+      const fns = wasmFns(cond, { optimize: false, wasmTee: false });
+      deepStrictEqual(fns.branch, [
+        { TAG: 'i32.const', data: 1n },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'block', data: 'void', hoist: [1] },
+        { TAG: 'block', data: 'void' },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.eqz' },
+        { TAG: 'br_if', data: 0n },
+        { TAG: 'i32.const', data: 2n },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'br', data: 1n },
+        { TAG: 'end' },
+        { TAG: 'end' },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'end' },
+      ]);
+      deepStrictEqual(fns.select, [
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'local.get', data: 2n },
+        { TAG: 'select' },
+        { TAG: 'local.tee', data: 3n },
+        { TAG: 'end' },
+      ]);
+    });
+    should('folds scalar boolean selects with constant arms', () => {
+      const m = new Module('boolSelect');
+      m.fn('nonzero', ['u32'], 'u32', (f, c) => {
+        const { u32 } = f.types;
+        return [u32.select(c, u32.const(1), u32.const(0))];
+      });
+      m.fn('zero', ['u32'], 'u32', (f, c) => {
+        const { u32 } = f.types;
+        return [u32.select(c, u32.const(0), u32.const(1))];
+      });
+      m.fn('knownBool', ['u32'], 'u32', (f, c) => {
+        const { u32 } = f.types;
+        const ok = u32.eqz(c);
+        return [u32.select(ok, u32.const(1), u32.const(0))];
+      });
+      checkReport(
+        m,
+        [
+          { name: 'knownBool', seq: ['local.get', 'i32.eqz', 'local.tee', 'end'] },
+          { name: 'nonzero', seq: ['local.get', 'i32.const(0)', 'i32.ne', 'local.tee', 'end'] },
+          { name: 'zero', seq: ['local.get', 'i32.eqz', 'local.tee', 'end'] },
+        ],
+        { optimize: true }
+      );
+    });
+    should('uses 32-bit nonzero values directly as conditions', () => {
+      const m = new Module('nonzeroCond');
+      m.fn('branch', ['u32'], 'u32', (f, c) => {
+        const { u32 } = f.types;
+        return f.block([u32.const(1)], (v) => {
+          f.brIf(0, u32.ne(c, u32.const(0)), u32.const(2));
+          return [v];
+        });
+      });
+      m.fn('select', ['u32', 'u32', 'u32'], 'u32', (f, a, b, c) => {
+        const { u32 } = f.types;
+        return [u32.select(u32.ne(c, u32.const(0)), a, b)];
+      });
+      const fns = wasmFns(m, { optimize: true, wasmTee: false });
+      deepStrictEqual(fns.branch, [
+        { TAG: 'i32.const', data: 1n },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'block', data: 'void', hoist: [1] },
+        { TAG: 'block', data: 'void' },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.eqz' },
+        { TAG: 'br_if', data: 0n },
+        { TAG: 'i32.const', data: 2n },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'br', data: 1n },
+        { TAG: 'end' },
+        { TAG: 'end' },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'end' },
+      ]);
+      deepStrictEqual(fns.select, [
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'local.get', data: 2n },
+        { TAG: 'select' },
+        { TAG: 'local.tee', data: 3n },
+        { TAG: 'end' },
+      ]);
+    });
+    should('preserves data select and mask shapes for constant-time expressions', () => {
+      const m = new Module('constTimeSelect');
+      m.fn('sameArm32', ['u32', 'u32'], 'u32', (f, c, a) => {
+        const { u32 } = f.types;
+        // Same-arm selects still evaluate the condition; do not fold them into a plain value.
+        return [u32.select(c, a, a)];
+      });
+      m.fn('maskBlend', ['u32', 'u32', 'u32'], 'u32', (f, mask, a, b) => {
+        const { u32 } = f.types;
+        return [u32.or(u32.and(a, mask), u32.andnot(b, mask))];
+      });
+      const fns = wasmFns(m, { optimize: true, wasmTee: false });
+      deepStrictEqual(fns.sameArm32, [
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'select' },
+        { TAG: 'local.tee', data: 2n },
+        { TAG: 'end' },
+      ]);
+      deepStrictEqual(fns.maskBlend, [
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.and' },
+        { TAG: 'local.get', data: 2n },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.andnot' },
+        { TAG: 'i32.or' },
+        { TAG: 'local.tee', data: 3n },
+        { TAG: 'end' },
+      ]);
+      const m64 = new Module('constTimeSelect64');
+      m64.fn('sameArm64', ['u32', 'u64'], 'u64', (f, c, a) => {
+        const { u64 } = f.types;
+        return [u64.select(c, a, a)];
+      });
+      const mod64 = toMod(m64, {
+        optimize: true,
+        lowerWasm: true,
+        native64bit: true,
+        wasmTee: false,
+      });
+      deepStrictEqual(mod64.wasmMod.functions[0].instructions, [
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'select' },
+        { TAG: 'local.tee', data: 2n },
+        { TAG: 'end' },
+      ]);
+    });
+    should('uses guard blocks for large pure branch yields', () => {
+      const m = new Module('branchGuard');
+      m.fn('run', ['u32'], ['u32', 'u32', 'u32', 'u32', 'u32', 'u32'], (f, c) => {
+        const { u32 } = f.types;
+        return f.block(
+          [0, 1, 2, 3, 4, 5].map((i) => u32.const(i)),
+          (...v) => {
+            f.brIf(0, c, ...[10, 11, 12, 13, 14, 15].map((i) => u32.const(i)));
+            return v;
+          }
+        );
+      });
+      const mod = toMod(m, {
+        optimize: true,
+        lowerWasm: true,
+        wasmBlockType: true,
+        wasmTee: false,
+        useSIMD: true,
+        nativeSIMD: true,
+        native64bit: true,
+      });
+      deepStrictEqual(mod.wasmMod.functions[0].instructions, [
+        { TAG: 'i32.const', data: 0n },
+        { TAG: 'i32.const', data: 1n },
+        { TAG: 'i32.const', data: 2n },
+        { TAG: 'i32.const', data: 3n },
+        { TAG: 'i32.const', data: 4n },
+        { TAG: 'i32.const', data: 5n },
+        {
+          TAG: 'block',
+          data: {
+            inputs: ['i32', 'i32', 'i32', 'i32', 'i32', 'i32'],
+            outputs: ['i32', 'i32', 'i32', 'i32', 'i32', 'i32'],
+          },
+          hoist: [1, 2, 3, 4, 5, 6],
+        },
+        { TAG: 'local.set', data: 6n },
+        { TAG: 'local.set', data: 5n },
+        { TAG: 'local.set', data: 4n },
+        { TAG: 'local.set', data: 3n },
+        { TAG: 'local.set', data: 2n },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'block', data: 'void', hoist: [] },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.eqz' },
+        { TAG: 'br_if', data: 0n },
+        { TAG: 'i32.const', data: 10n },
+        { TAG: 'i32.const', data: 11n },
+        { TAG: 'i32.const', data: 12n },
+        { TAG: 'i32.const', data: 13n },
+        { TAG: 'i32.const', data: 14n },
+        { TAG: 'i32.const', data: 15n },
+        { TAG: 'br', data: 1n },
+        { TAG: 'end' },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'local.get', data: 2n },
+        { TAG: 'local.get', data: 3n },
+        { TAG: 'local.get', data: 4n },
+        { TAG: 'local.get', data: 5n },
+        { TAG: 'local.get', data: 6n },
+        { TAG: 'end' },
+        { TAG: 'local.set', data: 6n },
+        { TAG: 'local.set', data: 5n },
+        { TAG: 'local.set', data: 4n },
+        { TAG: 'local.set', data: 3n },
+        { TAG: 'local.set', data: 2n },
+        { TAG: 'local.tee', data: 1n },
+        { TAG: 'local.get', data: 2n },
+        { TAG: 'local.get', data: 3n },
+        { TAG: 'local.get', data: 4n },
+        { TAG: 'local.get', data: 5n },
+        { TAG: 'local.get', data: 6n },
+        { TAG: 'end' },
+      ]);
+    });
+    should('removes masks made redundant by known zero bits', () => {
+      const m = new Module('knownMask').mem('buf32', array('u32', {}, 1));
+      m.fn('load8', [], 'u32', (f) => {
+        const { u32 } = f.types;
+        return [u32.and(f.memory.buf32.as8('u32')[0].get(), u32.const(0xff))];
+      });
+      m.fn('cmp', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        return [u32.and(u32.lt(a, b), u32.const(1))];
+      });
+      m.fn('shr', ['u32'], 'u32', (f, a) => {
+        const { u32 } = f.types;
+        return [u32.and(u32.shr(a, 24), u32.const(0xff))];
+      });
+      m.fn('popcnt', ['u32'], 'u32', (f, a) => {
+        const { u32 } = f.types;
+        return [u32.and(u32.popcnt(a), u32.const(0xff))];
+      });
+      m.fn('divRange', ['u32'], 'u32', (f, a) => {
+        const { u32 } = f.types;
+        const masked = u32.and(a, u32.const(0xff));
+        return [u32.and(u32.div(masked, u32.const(3)), u32.const(0xff))];
+      });
+      m.fn('divTrapRange', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        const left = u32.and(a, u32.const(0xff));
+        const right = u32.and(b, u32.const(0xff));
+        return [u32.and(u32.div(left, right), u32.const(0xff))];
+      });
+      m.fn('remRange', ['u32'], 'u32', (f, a) => {
+        const { u32 } = f.types;
+        return [u32.and(u32.rem(a, u32.const(255)), u32.const(0xff))];
+      });
+      m.fn('remTrapRange', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        const right = u32.and(b, u32.const(0xff));
+        return [u32.and(u32.rem(a, right), u32.const(0xff))];
+      });
+      m.fn('zeroBitValue', ['u32'], 'u32', (f, a) => {
+        const { u32 } = f.types;
+        return [u32.and(u32.shl(a, 1), u32.const(1))];
+      });
+      m.fn('signedI8Mask', ['i32'], 'i32', (f, a) => {
+        const { i32 } = f.types;
+        const ext = i32.shr(i32.shl(a, 24), 24);
+        return [i32.and(ext, i32.const(0xff))];
+      });
+      m.fn('signedI64I16Mask', ['i64'], 'i64', (f, a) => {
+        const { i64 } = f.types;
+        const ext = i64.shr(i64.shl(a, 48), 48);
+        return [i64.and(ext, i64.const(0xffffn))];
+      });
+      m.fn('rangeSelect', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        const load = f.memory.buf32.as8('u32')[0].get();
+        const add = u32.add(load, u32.const(16));
+        return [u32.and(u32.select(u32.lt(a, b), add, u32.const(1)), u32.const(0x1ff))];
+      });
+      checkReport(
+        m,
+        [
+          { name: 'cmp', seq: ['local.get', 'local.get', 'i32.lt_u', 'local.tee', 'end'] },
+          {
+            name: 'divRange',
+            seq: [
+              'local.get',
+              'i32.const(255)',
+              'i32.and',
+              'i32.const(3)',
+              'i32.div_u',
+              'local.tee',
+              'end',
+            ],
+          },
+          {
+            name: 'divTrapRange',
+            seq: [
+              'local.get',
+              'i32.const(255)',
+              'i32.and',
+              'local.get',
+              'i32.const(255)',
+              'i32.and',
+              'i32.div_u',
+              'local.tee',
+              'end',
+            ],
+          },
+          { name: 'load8', seq: ['i32.const(0)', 'i32.load8_u', 'local.tee', 'end'] },
+          { name: 'popcnt', seq: ['local.get', 'i32.popcnt', 'local.tee', 'end'] },
+          {
+            name: 'rangeSelect',
+            seq: [
+              'i32.const(0)',
+              'i32.load8_u',
+              'local.tee',
+              'i32.const(16)',
+              'i32.add',
+              'i32.const(1)',
+              'local.get',
+              'local.get',
+              'i32.lt_u',
+              'select',
+              'local.tee',
+              'end',
+            ],
+          },
+          {
+            name: 'remRange',
+            seq: ['local.get', 'i32.const(255)', 'i32.rem_u', 'local.tee', 'end'],
+          },
+          {
+            name: 'remTrapRange',
+            seq: [
+              'local.get',
+              'local.get',
+              'i32.const(255)',
+              'i32.and',
+              'i32.rem_u',
+              'local.tee',
+              'end',
+            ],
+          },
+          { name: 'shr', seq: ['local.get', 'i32.const(24)', 'i32.shr_u', 'local.tee', 'end'] },
+          {
+            name: 'signedI64I16Mask',
+            seq: ['local.get', 'i64.const(65535)', 'i64.and', 'local.tee', 'end'],
+          },
+          {
+            name: 'signedI8Mask',
+            seq: ['local.get', 'i32.const(255)', 'i32.and', 'local.tee', 'end'],
+          },
+          { name: 'zeroBitValue', seq: ['i32.const(0)', 'end'] },
+        ],
+        { optimize: true }
+      );
+    });
+    should('removes masks before left shifts when masked bits shift out', () => {
+      const m = new Module('shiftMask');
+      const cases = [];
+      for (const type of ['i32', 'u32'] as const) {
+        const T = (f: any) => f.types[type] as any;
+        cases.push({
+          name: `${type}_u8`,
+          seq: ['local.get', 'i32.const(24)', 'i32.shl', 'local.tee', 'end'],
+        });
+        m.fn(`${type}_u8`, [type], type, (f, a) => [T(f).shl(T(f).and(a, T(f).const(0xff)), 24)]);
+        cases.push({
+          name: `${type}_keep`,
+          seq: [
+            'local.get',
+            'i32.const(255)',
+            'i32.and',
+            'i32.const(16)',
+            'i32.shl',
+            'local.tee',
+            'end',
+          ],
+        });
+        m.fn(`${type}_keep`, [type], type, (f, a) => [T(f).shl(T(f).and(a, T(f).const(0xff)), 16)]);
+      }
+      for (const type of ['i64', 'u64'] as const) {
+        const T = (f: any) => f.types[type] as any;
+        cases.push({
+          name: `${type}_u16`,
+          seq: ['local.get', 'i64.const(48)', 'i64.shl', 'local.tee', 'end'],
+        });
+        m.fn(`${type}_u16`, [type], type, (f, a) => [
+          T(f).shl(T(f).and(a, T(f).const(0xffffn)), 48),
+        ]);
+        cases.push({
+          name: `${type}_keep`,
+          seq: [
+            'local.get',
+            'i64.const(65535)',
+            'i64.and',
+            'i64.const(32)',
+            'i64.shl',
+            'local.tee',
+            'end',
+          ],
+        });
+        m.fn(`${type}_keep`, [type], type, (f, a) => [
+          T(f).shl(T(f).and(a, T(f).const(0xffffn)), 32),
+        ]);
+      }
+      checkReport(m, cases, { optimize: true });
+    });
+    should('skips redundant source normalization for narrowing small-int casts', () => {
+      const m = new Module('smallNarrowCast');
+      m.fn('u8_from_i16', ['i16'], 'u8', (f, a) => [f.types.u8.fromN('i16', a)]);
+      m.fn('i8_from_u16', ['u16'], 'i8', (f, a) => [f.types.i8.fromN('u16', a)]);
+      m.fn('u8_cast_i8', ['i8'], 'u8', (f, a) => [f.types.u8.castFrom('i8', a)]);
+      m.fn('u16_from_i8', ['i8'], 'u16', (f, a) => [f.types.u16.fromN('i8', a)]);
+      checkReport(
+        m,
+        [
+          {
+            name: 'i8_from_u16',
+            seq: [
+              'local.get',
+              'i32.const(24)',
+              'i32.shl',
+              'i32.const(24)',
+              'i32.shr_s',
+              'local.tee',
+              'end',
+            ],
+          },
+          {
+            name: 'u16_from_i8',
+            seq: [
+              'local.get',
+              'i32.const(24)',
+              'i32.shl',
+              'i32.const(24)',
+              'i32.shr_s',
+              'i32.const(65535)',
+              'i32.and',
+              'local.tee',
+              'end',
+            ],
+          },
+          {
+            name: 'u8_cast_i8',
+            seq: ['local.get', 'i32.const(255)', 'i32.and', 'local.tee', 'end'],
+          },
+          {
+            name: 'u8_from_i16',
+            seq: ['local.get', 'i32.const(255)', 'i32.and', 'local.tee', 'end'],
+          },
+        ],
+        { lowerSmallInt: true }
+      );
+    });
+    should('folds comparisons decided by value ranges', () => {
+      const m = new Module('rangeCmp').mem('buf32', array('u32', {}, 1));
+      m.fn('loadLt256', [], 'u32', (f) => {
+        const { u32 } = f.types;
+        return [u32.lt(f.memory.buf32.as8('u32')[0].get(), u32.const(256))];
+      });
+      m.fn('loadGe256', [], 'u32', (f) => {
+        const { u32 } = f.types;
+        return [u32.ge(f.memory.buf32.as8('u32')[0].get(), u32.const(256))];
+      });
+      m.fn('loadEq256', [], 'u32', (f) => {
+        const { u32 } = f.types;
+        return [u32.eq(f.memory.buf32.as8('u32')[0].get(), u32.const(256))];
+      });
+      m.fn('boolLe1', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        return [u32.le(u32.lt(a, b), u32.const(1))];
+      });
+      m.fn('boolEqZero', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        return [u32.eq(u32.lt(a, b), u32.const(0))];
+      });
+      m.fn('boolEqOne', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        return [u32.eq(u32.lt(a, b), u32.const(1))];
+      });
+      m.fn('boolNeZero', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        return [u32.ne(u32.lt(a, b), u32.const(0))];
+      });
+      m.fn('boolNeOne', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        return [u32.ne(u32.lt(a, b), u32.const(1))];
+      });
+      m.fn('maskedEqOne', ['u32'], 'u32', (f, a) => {
+        const { u32 } = f.types;
+        return [u32.eq(u32.and(a, u32.const(0x80)), u32.const(1))];
+      });
+      m.fn('maskedNeOne', ['u32'], 'u32', (f, a) => {
+        const { u32 } = f.types;
+        return [u32.ne(u32.and(a, u32.const(0x80)), u32.const(1))];
+      });
+      checkReport(
+        m,
+        [
+          { name: 'boolEqOne', seq: ['local.get', 'local.get', 'i32.lt_u', 'local.tee', 'end'] },
+          { name: 'boolEqZero', seq: ['local.get', 'local.get', 'i32.ge_u', 'local.tee', 'end'] },
+          { name: 'boolLe1', seq: ['i32.const(1)', 'end'] },
+          { name: 'boolNeOne', seq: ['local.get', 'local.get', 'i32.ge_u', 'local.tee', 'end'] },
+          { name: 'boolNeZero', seq: ['local.get', 'local.get', 'i32.lt_u', 'local.tee', 'end'] },
+          { name: 'loadEq256', seq: ['i32.const(0)', 'end'] },
+          { name: 'loadGe256', seq: ['i32.const(0)', 'end'] },
+          { name: 'loadLt256', seq: ['i32.const(1)', 'end'] },
+          { name: 'maskedEqOne', seq: ['i32.const(0)', 'end'] },
+          { name: 'maskedNeOne', seq: ['i32.const(1)', 'end'] },
+        ],
+        { optimize: true }
+      );
+    });
+    should('folds eqz decided by facts without removing data selects', () => {
+      const m = new Module('eqzFacts');
+      m.fn('zeroBit', ['u32'], 'u32', (f, a) => {
+        const { u32 } = f.types;
+        return [u32.eqz(u32.and(u32.shl(a, 1), u32.const(1)))];
+      });
+      m.fn('nonzeroBit', ['u32'], 'u32', (f, a) => {
+        const { u32 } = f.types;
+        return [u32.eqz(u32.or(u32.shl(a, 1), u32.const(1)))];
+      });
+      m.fn('selectNonzero', ['u32'], 'u32', (f, c) => {
+        const { u32 } = f.types;
+        return [u32.eqz(u32.select(c, u32.const(1), u32.const(2)))];
+      });
+      m.fn('selectRangeCmp', ['u32'], 'u32', (f, c) => {
+        const { u32 } = f.types;
+        return [u32.eq(u32.select(c, u32.const(1), u32.const(2)), u32.const(0))];
+      });
+      const fns = wasmFns(m, { optimize: true, wasmTee: false });
+      deepStrictEqual(fns.zeroBit, [{ TAG: 'i32.const', data: 1n }, { TAG: 'end' }]);
+      deepStrictEqual(fns.nonzeroBit, [{ TAG: 'i32.const', data: 0n }, { TAG: 'end' }]);
+      deepStrictEqual(fns.selectNonzero, [
+        { TAG: 'i32.const', data: 1n },
+        { TAG: 'i32.const', data: 2n },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'select' },
+        { TAG: 'i32.eqz' },
+        { TAG: 'local.tee', data: 1n },
+        { TAG: 'end' },
+      ]);
+      deepStrictEqual(fns.selectRangeCmp, [
+        { TAG: 'i32.const', data: 1n },
+        { TAG: 'i32.const', data: 2n },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'select' },
+        { TAG: 'i32.eqz' },
+        { TAG: 'local.tee', data: 1n },
+        { TAG: 'end' },
+      ]);
+    });
+    should('removes redundant signed subword normalization', () => {
+      const m = new Module('signNorm');
+      const cases = [];
+      for (const { type, shift } of [
+        { type: 'i32', shift: 24 },
+        { type: 'i32', shift: 16 },
+        { type: 'i64', shift: 48 },
+      ] as const) {
+        const name = `${type}_${shift}`;
+        cases.push({
+          name,
+          seq: [
+            'local.get',
+            `${type}.const(${shift})`,
+            `${type}.shl`,
+            `${type}.const(${shift})`,
+            `${type}.shr_s`,
+            'local.tee',
+            'end',
+          ],
+        });
+        m.fn(name, [type], type, (f, v) => {
+          const T = f.types[type] as any;
+          const once = T.shr(T.shl(v, shift), shift);
+          return [T.shr(T.shl(once, shift), shift)];
+        });
+      }
+      checkReport(m, cases, { optimize: true });
+    });
+    should('folds no-wrap address constants into memory offsets', () => {
+      const m = new Module('memOffset').mem('buf', array('u32', {}, 1024));
+      m.fn('safe', ['u32'], 'u32', (f, pos) => {
+        const { u32 } = f.types;
+        const base = u32.shl(u32.and(pos, u32.const(0xff)), 2);
+        return [f.memory.buf.as8('u32')[u32.add(base, u32.const(16))].get()];
+      });
+      m.fn('safeBlock', ['u32'], 'u32', (f, pos) => {
+        const { u32 } = f.types;
+        const base = u32.shl(u32.and(pos, u32.const(0xff)), 2);
+        return f.block([base], (addr) => [
+          f.memory.buf.as8('u32')[u32.add(addr, u32.const(16))].get(),
+        ]);
+      });
+      m.fn('safeMul', ['u32'], 'u32', (f, pos) => {
+        const { u32 } = f.types;
+        const base = u32.mul(u32.and(pos, u32.const(0xff)), u32.const(3));
+        return [f.memory.buf.as8('u32')[u32.add(base, u32.const(16))].get()];
+      });
+      m.fn('unsafe', ['u32'], 'u32', (f, pos) => {
+        const { u32 } = f.types;
+        return [f.memory.buf.as8('u32')[u32.add(pos, u32.const(16))].get()];
+      });
+      m.fn('unsafeMul', ['u32'], 'u32', (f, pos) => {
+        const { u32 } = f.types;
+        const base = u32.mul(pos, u32.const(3));
+        return [f.memory.buf.as8('u32')[u32.add(base, u32.const(16))].get()];
+      });
+      const fns = wasmFns(m, { optimize: true, lowerWasm: true, wasmTee: false });
+      deepStrictEqual(fns.safe, [
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.const', data: 255n },
+        { TAG: 'i32.and' },
+        { TAG: 'i32.const', data: 2n },
+        { TAG: 'i32.shl' },
+        {
+          TAG: 'i32.load8_u',
+          data: { align: 0, offset: 16, swapEndianness: undefined, trustedAlign: true },
+        },
+        { TAG: 'local.tee', data: 1n },
+        { TAG: 'end' },
+      ]);
+      deepStrictEqual(fns.safeBlock, [
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.const', data: 255n },
+        { TAG: 'i32.and' },
+        { TAG: 'i32.const', data: 2n },
+        { TAG: 'i32.shl' },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'block', data: 'void', hoist: [1] },
+        { TAG: 'local.get', data: 1n },
+        {
+          TAG: 'i32.load8_u',
+          data: { align: 0, offset: 16, swapEndianness: undefined, trustedAlign: true },
+        },
+        { TAG: 'local.tee', data: 2n },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'end' },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'end' },
+      ]);
+      deepStrictEqual(fns.safeMul, [
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.const', data: 255n },
+        { TAG: 'i32.and' },
+        { TAG: 'i32.const', data: 3n },
+        { TAG: 'i32.mul' },
+        {
+          TAG: 'i32.load8_u',
+          data: { align: 0, offset: 16, swapEndianness: undefined, trustedAlign: true },
+        },
+        { TAG: 'local.tee', data: 1n },
+        { TAG: 'end' },
+      ]);
+      deepStrictEqual(fns.unsafe, [
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.const', data: 16n },
+        { TAG: 'i32.add' },
+        {
+          TAG: 'i32.load8_u',
+          data: { align: 0, offset: 0, swapEndianness: undefined, trustedAlign: true },
+        },
+        { TAG: 'local.tee', data: 1n },
+        { TAG: 'end' },
+      ]);
+      deepStrictEqual(fns.unsafeMul, [
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'i32.const', data: 3n },
+        { TAG: 'i32.mul' },
+        { TAG: 'i32.const', data: 16n },
+        { TAG: 'i32.add' },
+        {
+          TAG: 'i32.load8_u',
+          data: { align: 0, offset: 0, swapEndianness: undefined, trustedAlign: true },
+        },
+        { TAG: 'local.tee', data: 1n },
+        { TAG: 'end' },
+      ]);
+    });
+    should('uses tee for call result tails in Wasm and JS', () => {
+      const mod = new Module('callTail')
+        .importFn('inc', ['u32'], 'u32', undefined, 'custom')
+        .fn('run', ['u32'], 'u32', (f, x) => f.functions.inc.call(x));
+      const wasmReport = opReport();
+      const jsReport = opReport();
+      toWasm(mod, { opNgrams: wasmReport } as any);
+      toJs(mod, { opNgrams: jsReport } as any);
+      deepStrictEqual(wasmReport.ops, { 'local.get': 1, call: 1, 'local.tee': 1, end: 1 });
+      deepStrictEqual(jsReport.ops, { 'local.get': 1, call: 1, 'local.tee': 1, end: 1 });
+      deepStrictEqual(exec(toJs(mod), { custom: { inc: (x: number) => x + 1 } }).run(41), 42);
+    });
   });
   describe('Memory', () => {
     should('Basic', () => {
@@ -3760,9 +4870,9 @@ describe('Codegen', () => {
                 ],
                 [
                   'i32.fill(u32.const(value=48), u32.const(value=0), u32.const(value=32), name=basic, isMut=true)',
-                  'i32.fill(u32.add(u32.mul(u32.const(value=1), u32.const(value=32)), u32.const(value=16)), u32.const(value=0), u32.const(value=32), name=basic, isMut=true)',
+                  'i32.fill(u32.add(u32.mul(u32.const(value=32), u32.const(value=1)), u32.const(value=16)), u32.const(value=0), u32.const(value=32), name=basic, isMut=true)',
                   'i32.fill(u32.const(value=48), u32.const(value=0), u32.mul(u32.const(value=32), u32.const(value=1)), name=basic, isMut=true)',
-                  'i32.fill(u32.add(u32.mul(u32.const(value=1), u32.const(value=32)), u32.const(value=16)), u32.const(value=0), u32.mul(u32.const(value=32), u32.const(value=1)), name=basic, isMut=true)',
+                  'i32.fill(u32.add(u32.mul(u32.const(value=32), u32.const(value=1)), u32.const(value=16)), u32.const(value=0), u32.mul(u32.const(value=32), u32.const(value=1)), name=basic, isMut=true)',
                 ],
               ]);
 
@@ -5226,6 +6336,771 @@ describe('Codegen', () => {
       });
       toWasm(mod);
     });
+    should('block state saves skip unchanged slots', () => {
+      const mod = new Module('blockStateSaves').fn('run', ['u32'], 'u32', (f, n) => {
+        const { u32 } = f.types;
+        const [i, same] = f.block(
+          [u32.const(0), n],
+          (i, same) => {
+            const next = u32.add(i, u32.const(1));
+            f.brIf(0, u32.lt(next, u32.const(3)), next, same);
+            return [next, same];
+          },
+          true
+        );
+        return [u32.add(i, same)];
+      });
+      deepStrictEqual(exec(toWasm(mod)).run(9), 12);
+      const jsOut = toJs(mod);
+      deepStrictEqual(exec(jsOut).run(9), 12);
+      deepStrictEqual(exec(toJs(mod, { jsStateArray: true })).run(9), 12);
+      deepStrictEqual(
+        jsOut.raw,
+        [
+          '',
+          'const _importsEmbed = {env: {}};',
+          '_imports = {..._importsEmbed,..._imports, env: {..._importsEmbed.env, ..._imports.env}};',
+          '',
+          '',
+          'const __buf = new ArrayBuffer(0);',
+          "if (!(__buf instanceof ArrayBuffer)) throw new Error('wrong buffer');",
+          '',
+          '',
+          '',
+          '',
+          'function run(v0) {',
+          '    ',
+          '    let s0 = 0, s1 = v0;',
+          'L0: for (;;) {',
+          'const v3 = ((1 + s0) | 0);',
+          'if ((v3 >>> 0) < 3) {',
+          's0 = v3;continue L0;',
+          '}',
+          's0 = v3;break L0;}',
+          '',
+          'return ((s1 + s0) | 0);',
+          '}',
+          'const instance = { exports: {run, memory: { buffer: __buf }}};',
+          '',
+          ';',
+          'const _exports = instance.exports;',
+          'const buffer = _exports.memory ? _exports.memory.buffer : new ArrayBuffer(0);',
+          'const memoryExport = new Uint8Array(buffer, 0, 0);',
+          'const segments = Object.freeze({});',
+          '',
+          'return Object.freeze({ ..._exports, memory: memoryExport, segments  });',
+        ].join('\n')
+      );
+      const instrs = (opts) =>
+        toMod(mod, opts).wasmMod.functions.find((fn) => fn.name === 'run')!.instructions;
+      deepStrictEqual(instrs({ wasmBlockType: true }), [
+        { TAG: 'i32.const', data: 0n },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'loop', data: { inputs: ['i32', 'i32'], outputs: ['i32', 'i32'] }, hoist: [1, 2] },
+        { TAG: 'local.set', data: 2n },
+        { TAG: 'local.tee', data: 1n },
+        { TAG: 'i32.const', data: 1n },
+        { TAG: 'i32.add' },
+        { TAG: 'local.tee', data: 3n },
+        { TAG: 'local.get', data: 2n },
+        { TAG: 'local.get', data: 3n },
+        { TAG: 'i32.const', data: 3n },
+        { TAG: 'i32.lt_u' },
+        { TAG: 'br_if', data: 0n },
+        { TAG: 'drop' },
+        { TAG: 'drop' },
+        { TAG: 'local.get', data: 3n },
+        { TAG: 'local.get', data: 2n },
+        { TAG: 'end' },
+        { TAG: 'drop' },
+        { TAG: 'local.tee', data: 1n },
+        { TAG: 'local.get', data: 2n },
+        { TAG: 'i32.add' },
+        { TAG: 'local.tee', data: 4n },
+        { TAG: 'end' },
+      ]);
+      deepStrictEqual(instrs({ wasmBlockType: false }), [
+        { TAG: 'i32.const', data: 0n },
+        { TAG: 'local.get', data: 0n },
+        { TAG: 'local.set', data: 2n },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'loop', data: 'void', hoist: [1, 2] },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'i32.const', data: 1n },
+        { TAG: 'i32.add' },
+        { TAG: 'local.set', data: 3n },
+        { TAG: 'block', data: 'void' },
+        { TAG: 'local.get', data: 3n },
+        { TAG: 'i32.const', data: 3n },
+        { TAG: 'i32.ge_u' },
+        { TAG: 'br_if', data: 0n },
+        { TAG: 'local.get', data: 3n },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'br', data: 1n },
+        { TAG: 'end' },
+        { TAG: 'local.get', data: 3n },
+        { TAG: 'local.set', data: 1n },
+        { TAG: 'end' },
+        { TAG: 'local.get', data: 1n },
+        { TAG: 'local.get', data: 2n },
+        { TAG: 'i32.add' },
+        { TAG: 'local.tee', data: 4n },
+        { TAG: 'end' },
+      ]);
+    });
+    should('block state aliases survive split helpers', () => {
+      const mod = new Module('splitBlockStateAliases').fn('run', ['u32'], 'u32', (f, n) => {
+        const { u32 } = f.types;
+        const [i, same] = f.block(
+          [u32.const(0), n],
+          (i, same) => {
+            const next = u32.add(i, u32.const(1));
+            f.brIf(0, u32.lt(next, u32.const(3)), next, same);
+            return [next, same];
+          },
+          true
+        );
+        return [u32.add(i, same)];
+      });
+      const jsOut = toJs(mod, { jsOpsPerFn: 1 });
+      deepStrictEqual(exec(jsOut).run(9), 12);
+      deepStrictEqual(
+        jsOut.raw,
+        [
+          '',
+          'const _importsEmbed = {env: {}};',
+          '_imports = {..._importsEmbed,..._imports, env: {..._importsEmbed.env, ..._imports.env}};',
+          '',
+          '',
+          'const __buf = new ArrayBuffer(0);',
+          "if (!(__buf instanceof ArrayBuffer)) throw new Error('wrong buffer');",
+          '',
+          '',
+          'function __awasm_run_part0(v1){',
+          'const v3 = ((1 + v1) | 0);',
+          'return {v3};',
+          '}',
+          '',
+          'function run(v0) {',
+          '    ',
+          '    let s0 = 0, s1 = v0;',
+          'L0: for (;;) {',
+          'const {v3} = __awasm_run_part0(s0);',
+          'if ((v3 >>> 0) < 3) {',
+          's0 = v3;continue L0;',
+          '}',
+          's0 = v3;break L0;}',
+          '',
+          'return ((s1 + s0) | 0);',
+          '}',
+          'const instance = { exports: {run, memory: { buffer: __buf }}};',
+          '',
+          ';',
+          'const _exports = instance.exports;',
+          'const buffer = _exports.memory ? _exports.memory.buffer : new ArrayBuffer(0);',
+          'const memoryExport = new Uint8Array(buffer, 0, 0);',
+          'const segments = Object.freeze({});',
+          '',
+          'return Object.freeze({ ..._exports, memory: memoryExport, segments  });',
+        ].join('\n')
+      );
+    });
+    should('block state control exits stay in parent split function', () => {
+      const mod = new Module('splitBlockStateBreak').fn(
+        'run',
+        ['u32', 'u32', 'u32', 'u32', 'u32'],
+        'u32',
+        (f, cond, a, b, c, d) => {
+          const { u32 } = f.types;
+          const out = f.block([a, b, c, d], (x, y, z, w) => {
+            const inner = f.block([x, y, z, w], (i, j, k, l) => {
+              f.brIf(1, cond, u32.add(l, u32.const(1)), i, l, u32.add(k, u32.const(2)));
+              return [u32.add(i, l), j, k, l];
+            });
+            return inner;
+          });
+          return [out.reduce((h, v) => u32.add(u32.mul(h, u32.const(131)), v), u32.const(0))];
+        }
+      );
+      for (const opts of [{ jsOpsPerFn: 1 }, { jsOpsPerFn: 1, jsStateArray: true }]) {
+        const out = exec(toJs(mod, opts));
+        deepStrictEqual([out.run(0, 1, 2, 3, 4), out.run(1, 1, 2, 3, 4)], [11275174, 11258145]);
+      }
+      const voidMod = new Module('splitVoidBlockState').fn(
+        'run',
+        ['u32', 'u32', 'u32', 'u32', 'u32'],
+        'u32',
+        (f, mask, a, b, c, d) => {
+          const { u32 } = f.types;
+          const out = f.block([a, b, c, d], (x, y, z, w) => {
+            const inner = f.block([x, y, z, w], (i, j, k, l) => {
+              f.brIf(0, u32.and(mask, u32.const(1)), u32.add(i, l), j, k, l);
+              f.brIf(
+                1,
+                u32.and(mask, u32.const(2)),
+                u32.mul(k, u32.const(6)),
+                u32.add(u32.mul(l, u32.const(3)), i),
+                l,
+                u32.add(l, u32.mul(k, u32.const(7)))
+              );
+              return [
+                u32.sub(i, u32.const(1)),
+                u32.mul(l, u32.const(6)),
+                u32.mul(l, u32.const(6)),
+                l,
+              ];
+            });
+            return inner;
+          });
+          return [out.reduce((h, v) => u32.add(u32.mul(h, u32.const(131)), v), u32.const(0))];
+        }
+      );
+      for (const opts of [
+        { wasmBlockType: false, wasmTee: false, jsOpsPerFn: 1 },
+        { wasmBlockType: false, wasmTee: false, jsOpsPerFn: 1, jsStateArray: true },
+      ]) {
+        const out = exec(toJs(voidMod, opts));
+        deepStrictEqual(
+          [0, 1, 2, 3].map((mask) => out.run(mask, 5, 5, 6, 6)),
+          [9614882, 24815598, 81326813, 24815598]
+        );
+      }
+    });
+    should('non-typed optimized branch state keeps removed arg identity', () => {
+      const mod = new Module('voidOptimizedBranchState').fn(
+        'run',
+        ['u32', 'u32', 'u32', 'u32', 'u32', 'u32'],
+        ['u32', 'u32', 'u32', 'u32', 'u32', 'u32'],
+        (f, mask, a, b, c, d, e) => {
+          const { u32 } = f.types;
+          const out = f.block(
+            [u32.const(0), a, b, c, d, e],
+            (i, s0, s1, s2, s3, s4) => {
+              const next = u32.add(i, u32.const(1));
+              const inner = f.block([s0, s1, s2, s3, s4], (x0, x1, x2, x3, x4) => {
+                f.brIf(
+                  0,
+                  u32.and(mask, u32.const(2)),
+                  u32.mul(x2, u32.const(3)),
+                  x0,
+                  x1,
+                  x4,
+                  u32.sub(x0, u32.const(7))
+                );
+                return [
+                  u32.add(x0, x1),
+                  u32.mul(x0, u32.const(4)),
+                  x1,
+                  u32.mul(x0, u32.const(4)),
+                  u32.add(u32.mul(x4, u32.const(8)), x2),
+                ];
+              });
+              f.brIf(
+                0,
+                u32.lt(next, u32.const(3)),
+                next,
+                u32.add(inner[4], inner[1]),
+                u32.mul(inner[0], u32.const(5)),
+                inner[3],
+                inner[0],
+                u32.xor(inner[1], inner[2])
+              );
+              return [
+                next,
+                u32.add(inner[2], u32.const(9)),
+                u32.sub(inner[2], u32.const(7)),
+                inner[3],
+                u32.mul(inner[3], u32.const(6)),
+                inner[3],
+              ];
+            },
+            true
+          );
+          return out;
+        }
+      );
+      const variants = [
+        toWasm(mod, { wasmBlockType: false, wasmTee: false }),
+        toJs(mod, { wasmBlockType: false, wasmTee: false }),
+        toJs(mod, { wasmBlockType: false, wasmTee: false, jsStateArray: true }),
+        toJs(mod, { wasmBlockType: false, wasmTee: false, jsOpsPerFn: 1 }),
+      ];
+      for (const variant of variants)
+        deepStrictEqual(exec(variant).run(2, 4, 4, 4, 6, 5), [3, 84, 68, 61, 366, 61]);
+    });
+    should('block state multi-digit names save in parallel', () => {
+      const mod = new Module('wideBlockStateSwap').fn('run', ['u32'], 'u32', (f, cond) => {
+        const { u32 } = f.types;
+        const init = Array.from({ length: 12 }, (_, i) => u32.const(i + 1));
+        const out = f.block(init, (...s) => {
+          f.brIf(0, cond, s[0], s[10], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[1], s[11]);
+          return s;
+        });
+        return [out.reduce((h, v) => u32.add(u32.mul(h, u32.const(131)), v), u32.const(0))];
+      });
+      const variants = [
+        (m) => exec(toWasm(m, { wasmBlockType: true })),
+        (m) => exec(toWasm(m, { wasmBlockType: false, wasmTee: false })),
+        (m) => exec(toJs(m, { wasmBlockType: true })),
+        (m) => exec(toJs(m, { wasmBlockType: false, wasmTee: false })),
+        (m) => exec(toJs(m, { wasmBlockType: true, jsStateArray: true })),
+        (m) => exec(toJs(m, { wasmBlockType: false, wasmTee: false, jsStateArray: true })),
+        (m) => exec(toJs(m, { wasmBlockType: true, jsOpsPerFn: 1 })),
+        (m) => exec(toJs(m, { wasmBlockType: false, wasmTee: false, jsOpsPerFn: 1 })),
+        (m) => exec(toJs(m, { wasmBlockType: true, jsStateArray: true, jsOpsPerFn: 1 })),
+        (m) =>
+          exec(
+            toJs(m, { wasmBlockType: false, wasmTee: false, jsStateArray: true, jsOpsPerFn: 1 })
+          ),
+      ];
+      for (const compile of variants) {
+        const out = compile(mod);
+        deepStrictEqual([out.run(0), out.run(1)], [1269449710, -383548860]);
+      }
+    });
+    should('split helpers carry reassigned block outputs', () => {
+      const mod = new Module('splitCarryBlockOutputs').fn(
+        'run',
+        ['u32', 'u32', 'u32', 'u32', 'u32', 'u32'],
+        'u32',
+        (f, cond, a, b, c, d, e) => {
+          const { u32 } = f.types;
+          const out = f.block([a, b, c, d, e], (x0, x1, x2, x3, x4) => {
+            f.brIf(0, cond, u32.mul(x2, u32.const(3)), x0, x1, x4, u32.sub(x0, u32.const(7)));
+            return [
+              u32.add(x0, x1),
+              u32.mul(x0, u32.const(4)),
+              x1,
+              u32.mul(x0, u32.const(4)),
+              u32.add(u32.mul(x4, u32.const(8)), x2),
+            ];
+          });
+          return [out.reduce((h, v) => u32.add(u32.mul(h, u32.const(131)), v), u32.const(0))];
+        }
+      );
+      const variants = [
+        (m) => exec(toWasm(m, { wasmBlockType: true })),
+        (m) => exec(toWasm(m, { wasmBlockType: false, wasmTee: false })),
+        (m) => exec(toJs(m, { wasmBlockType: true })),
+        (m) => exec(toJs(m, { wasmBlockType: false, wasmTee: false })),
+        (m) => exec(toJs(m, { wasmBlockType: false, wasmTee: false, jsStateArray: true })),
+        (m) => exec(toJs(m, { wasmBlockType: false, wasmTee: false, jsOpsPerFn: 1 })),
+        (m) =>
+          exec(
+            toJs(m, { wasmBlockType: false, wasmTee: false, jsStateArray: true, jsOpsPerFn: 1 })
+          ),
+      ];
+      const cases = [
+        [[0, 1, 2, 3, 4, 5], 892527016],
+        [[1, 1, 2, 3, 4, 5], -1642184945],
+        [[0, 4, 4, 4, 6, 5], -1902927688],
+        [[2, 4, 4, 4, 6, 5], -751906584],
+      ];
+      for (const compile of variants) {
+        const out = compile(mod);
+        deepStrictEqual(
+          cases.map(([args]) => out.run(...args)),
+          cases.map(([, exp]) => exp)
+        );
+      }
+    });
+    should('block state-array split helpers keep function names', () => {
+      const mod = new Module('stateArraySplitFunctionNames')
+        .importFn('v1', ['u32'], 'u32', undefined, 'env')
+        .fn('run', ['u32'], 'u32', (f, x) => {
+          const { u32 } = f.types;
+          const [out] = f.block([x], (s) => {
+            const [first] = f.functions.v1.call(s);
+            const [second] = f.functions.v1.call(u32.add(first, u32.const(1)));
+            return [second];
+          });
+          return [out];
+        });
+      const imports = { env: { v1: (x: number) => x + 10 } };
+      deepStrictEqual(exec(toWasm(mod), imports).run(1), 22);
+      deepStrictEqual(exec(toJs(mod, { jsStateArray: true, jsOpsPerFn: 1 }), imports).run(1), 22);
+    });
+    should('block state locals do not shadow imported function names', () => {
+      const mod = new Module('blockStateFunctionNameCollision')
+        .importFn('s1', ['u32'], 'u32', undefined, 'env')
+        .fn('run', ['u32'], 'u32', (f, x) => {
+          const { u32 } = f.types;
+          const [out] = f.block([x, u32.const(7)], (a, b) => {
+            const [called] = f.functions.s1.call(a);
+            return [u32.add(called, b), b];
+          });
+          return [out];
+        });
+      const imports = { env: { s1: (x: number) => x + 10 } };
+      deepStrictEqual(exec(toWasm(mod), imports).run(1), 18);
+      deepStrictEqual(exec(toJs(mod), imports).run(1), 18);
+    });
+    should('split helper names do not shadow imported functions', () => {
+      const mod = new Module('splitHelperFunctionNameCollision')
+        .importFn('run_part0', ['u32'], 'u32', undefined, 'env')
+        .fn('run', ['u32'], 'u32', (f, x) => {
+          const { u32 } = f.types;
+          const [called] = f.functions.run_part0.call(x);
+          return [u32.add(u32.add(called, u32.const(1)), u32.const(2))];
+        });
+      const imports = { env: { run_part0: (x: number) => x + 10 } };
+      deepStrictEqual(exec(toWasm(mod), imports).run(1), 14);
+      deepStrictEqual(exec(toJs(mod, { jsOpsPerFn: 1 }), imports).run(1), 14);
+    });
+    should('split helpers do not redeclare tee-provided locals', () => {
+      const mod = {
+        memory: { size: 0, export: true },
+        functions: [
+          {
+            name: 'run',
+            export: true,
+            inputs: ['i32', 'i32'],
+            outputs: ['i32'],
+            locals: [{ count: 3, type: 'i32' }],
+            instructions: [
+              { TAG: 'local.get', data: 0n },
+              { TAG: 'i32.const', data: 1n },
+              { TAG: 'i32.add' },
+              { TAG: 'local.set', data: 4n },
+              { TAG: 'local.get', data: 4n },
+              { TAG: 'local.get', data: 1n },
+              { TAG: 'local.tee', data: 2n },
+              { TAG: 'i32.add' },
+              { TAG: 'local.get', data: 0n },
+              { TAG: 'i32.add' },
+              { TAG: 'local.get', data: 2n },
+              { TAG: 'i32.add' },
+              { TAG: 'local.set', data: 3n },
+              { TAG: 'local.get', data: 3n },
+              { TAG: 'end' },
+            ],
+          },
+        ],
+      };
+      const opts = { jsOpsPerFn: 1 };
+      const code = wrapModule(mod as any, createJS(mod as any, {}, opts), {}, {}, opts);
+      deepStrictEqual(exec(code).run(3, 4), 15);
+      deepStrictEqual(
+        [
+          code.raw.match(/function __awasm_run_part1[^]*?\n}/)?.[0],
+          code.raw.match(/function __awasm_run_part0[^]*?\n}/)?.[0],
+        ],
+        [
+          [
+            'function __awasm_run_part1(v0, v1, v4){',
+            'const v2 = v1;',
+            'const v3 = ((v2 + ((v0 + ((v2 + v4) | 0)) | 0)) | 0);',
+            'return {v3};',
+            '}',
+          ].join('\n'),
+          [
+            'function __awasm_run_part0(v0, v1){',
+            'const v4 = ((1 + v0) | 0);',
+            'return __awasm_run_part1(v0, v1, v4);',
+            '}',
+          ].join('\n'),
+        ]
+      );
+    });
+    should('wrapper locals do not shadow exported function names', () => {
+      for (const name of ['buffer', 'memoryExport', '_importsEmbed', 'Object', 'class']) {
+        const mod = new Module(`wrapperCollision_${name}`).fn(name, ['u32'], 'u32', (f, x) =>
+          f.types.u32.add(x, f.types.u32.const(6))
+        );
+        deepStrictEqual(exec(toWasm(mod))[name](4), 10);
+        deepStrictEqual(exec(toJs(mod))[name](4), 10);
+      }
+    });
+    should('numeric globals and reserved words do not shadow exported function names', () => {
+      const names = [
+        'NaN',
+        'Infinity',
+        'Number',
+        'enum',
+        'super',
+        'instanceof',
+        'true',
+        'false',
+        'null',
+        'implements',
+        'interface',
+        'package',
+        'private',
+        'protected',
+        'public',
+        'static',
+        'eval',
+        'arguments',
+      ];
+      for (const name of names) {
+        const mod = new Module(`numericCollision_${name}`)
+          .fn(name, ['u32'], 'u32', (f, x) => f.types.u32.add(x, f.types.u32.const(1)))
+          .fn('nan', [], 'f64', (f) => f.types.f64.const(Number.NaN))
+          .fn('inf', [], 'f64', (f) => f.types.f64.const(Number.POSITIVE_INFINITY))
+          .fn('isnan', [], 'u32', (f) => f.types.f64.isNaN(f.types.f64.const(Number.NaN)));
+        const wasm = exec(toWasm(mod));
+        const jsCode = toJs(mod);
+        const js = exec(jsCode);
+        deepStrictEqual(
+          [
+            wasm[name](5),
+            Number.isNaN(wasm.nan()),
+            Number.isNaN(js.nan()),
+            wasm.inf(),
+            js.inf(),
+            wasm.isnan(),
+            js.isnan(),
+          ],
+          [6, true, true, Infinity, Infinity, 1, 1]
+        );
+        deepStrictEqual(
+          typeof new Function('_imports', 'pool', `"use strict";\n${jsCode.raw}`),
+          'function'
+        );
+      }
+    });
+    should('block state hoists common conditional save', () => {
+      const mod = new Module('blockStateCommonSave').fn('run', ['u32'], 'u32', (f, n) => {
+        const { u32 } = f.types;
+        const init = [
+          u32.const(0),
+          u32.const(1),
+          u32.const(2),
+          u32.const(3),
+          u32.const(4),
+          u32.const(5),
+          u32.const(6),
+          u32.const(7),
+        ];
+        const out = f.block(
+          init,
+          (...s) => {
+            const next = u32.add(s[0], u32.const(1));
+            const vals = [next, ...s.slice(1).map((v) => u32.add(v, next))];
+            f.brIf(0, u32.lt(next, n), ...vals);
+            return vals;
+          },
+          true
+        );
+        return [out.reduce((a, b) => u32.add(a, b))];
+      });
+      const jsOut = toJs(mod);
+      deepStrictEqual([exec(toWasm(mod)).run(1), exec(toWasm(mod)).run(3)], [36, 73]);
+      deepStrictEqual([exec(jsOut).run(1), exec(jsOut).run(3)], [36, 73]);
+      deepStrictEqual(
+        jsOut.raw,
+        [
+          '',
+          'const _importsEmbed = {env: {}};',
+          '_imports = {..._importsEmbed,..._imports, env: {..._importsEmbed.env, ..._imports.env}};',
+          '',
+          '',
+          'const __buf = new ArrayBuffer(0);',
+          "if (!(__buf instanceof ArrayBuffer)) throw new Error('wrong buffer');",
+          '',
+          '',
+          '',
+          '',
+          'function run(v0) {',
+          '    ',
+          '    let s0 = 0, s1 = 1, s2 = 2, s3 = 3, s4 = 4, s5 = 5, s6 = 6, s7 = 7;',
+          'L0: for (;;) {',
+          'const v9 = ((1 + s0) | 0);',
+          'const v10 = ((v9 + s1) | 0);',
+          'const v11 = ((v9 + s2) | 0);',
+          'const v12 = ((v9 + s3) | 0);',
+          'const v13 = ((v9 + s4) | 0);',
+          'const v14 = ((v9 + s5) | 0);',
+          'const v15 = ((v9 + s6) | 0);',
+          'const v16 = ((v9 + s7) | 0);',
+          'const __awasm_cond0 = (v9 >>> 0) < (v0 >>> 0);',
+          's0 = v9;',
+          's1 = v10;',
+          's2 = v11;',
+          's3 = v12;',
+          's4 = v13;',
+          's5 = v14;',
+          's6 = v15;',
+          's7 = v16;',
+          'if (__awasm_cond0) {',
+          'continue L0;',
+          '}',
+          'break L0;}',
+          '',
+          'return ((((((((((((((s7 + s6) | 0) + s5) | 0) + s4) | 0) + s3) | 0) + s2) | 0) + s1) | 0) + s0) | 0);',
+          '}',
+          'const instance = { exports: {run, memory: { buffer: __buf }}};',
+          '',
+          ';',
+          'const _exports = instance.exports;',
+          'const buffer = _exports.memory ? _exports.memory.buffer : new ArrayBuffer(0);',
+          'const memoryExport = new Uint8Array(buffer, 0, 0);',
+          'const segments = Object.freeze({});',
+          '',
+          'return Object.freeze({ ..._exports, memory: memoryExport, segments  });',
+        ].join('\n')
+      );
+    });
+    should('block state skips all-unchanged branch assignments', () => {
+      const branchIf = new Module('identityBranchIf').fn('run', ['u32'], 'u32', (f, n) => {
+        const { u32 } = f.types;
+        const [same] = f.block([n], (same) => {
+          f.brIf(0, u32.eq(same, u32.const(0)), same);
+          return [u32.add(same, u32.const(1))];
+        });
+        return [same];
+      });
+      const branch = new Module('identityBranch').fn('run', ['u32'], 'u32', (f, n) => {
+        const { u32 } = f.types;
+        const [same] = f.block([n], (same) => {
+          f.br(0, same);
+          return [u32.add(same, u32.const(1))];
+        });
+        return [same];
+      });
+      const opts = { wasmBlockType: false, wasmTee: false };
+      for (const compile of [toWasm, toJs]) {
+        const brIf = exec(compile(branchIf, opts));
+        deepStrictEqual([brIf.run(0), brIf.run(2)], [0, 3]);
+        const br = exec(compile(branch, opts));
+        deepStrictEqual([br.run(0), br.run(2)], [0, 2]);
+      }
+      deepStrictEqual(
+        toMod(branchIf, opts).wasmMod.functions.find((fn) => fn.name === 'run')!.instructions,
+        [
+          { TAG: 'local.get', data: 0n },
+          { TAG: 'local.set', data: 1n },
+          { TAG: 'block', data: 'void', hoist: [1] },
+          { TAG: 'local.get', data: 1n },
+          { TAG: 'i32.eqz' },
+          { TAG: 'br_if', data: 0n },
+          { TAG: 'local.get', data: 1n },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.add' },
+          { TAG: 'local.tee', data: 2n },
+          { TAG: 'local.set', data: 1n },
+          { TAG: 'end' },
+          { TAG: 'local.get', data: 1n },
+          { TAG: 'end' },
+        ]
+      );
+      deepStrictEqual(
+        toMod(branch, opts).wasmMod.functions.find((fn) => fn.name === 'run')!.instructions,
+        [
+          { TAG: 'local.get', data: 0n },
+          { TAG: 'local.set', data: 1n },
+          { TAG: 'block', data: 'void', hoist: [1] },
+          { TAG: 'br', data: 0n },
+          { TAG: 'local.get', data: 1n },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.add' },
+          { TAG: 'local.tee', data: 2n },
+          { TAG: 'local.set', data: 1n },
+          { TAG: 'end' },
+          { TAG: 'local.get', data: 1n },
+          { TAG: 'end' },
+        ]
+      );
+    });
+    should('block state swaps and rotates stay parallel across exits', () => {
+      const variants = [
+        (m) => exec(toWasm(m, { wasmBlockType: true })),
+        (m) => exec(toWasm(m, { wasmBlockType: false, wasmTee: false })),
+        (m) => exec(toJs(m, { wasmBlockType: true })),
+        (m) => exec(toJs(m, { wasmBlockType: false, wasmTee: false })),
+        (m) => exec(toJs(m, { jsStateArray: true })),
+        (m) => exec(toJs(m, { jsOpsPerFn: 1 })),
+      ];
+      const check = (mod, cases) => {
+        for (const compile of variants) {
+          const out = compile(mod);
+          deepStrictEqual(
+            cases.map(([args]) => out.run(...args)),
+            cases.map(([, exp]) => exp)
+          );
+        }
+      };
+      const swapBr = new Module('swapBr').fn('run', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        const [x, y] = f.block([a, b], (x, y) => {
+          f.br(0, y, x);
+          return [x, y];
+        });
+        return [u32.add(u32.mul(x, u32.const(10)), y)];
+      });
+      const swapBrIf = new Module('swapBrIf').fn(
+        'run',
+        ['u32', 'u32', 'u32'],
+        'u32',
+        (f, cond, a, b) => {
+          const { u32 } = f.types;
+          const [x, y] = f.block([a, b], (x, y) => {
+            f.brIf(0, cond, y, x);
+            return [x, y];
+          });
+          return [u32.add(u32.mul(x, u32.const(10)), y)];
+        }
+      );
+      const rotate = new Module('fallthroughRotate').fn(
+        'run',
+        ['u32', 'u32', 'u32'],
+        'u32',
+        (f, a, b, c) => {
+          const { u32 } = f.types;
+          const [x, y, z] = f.block([a, b, c], (x, y, z) => [y, z, x]);
+          return [u32.add(u32.mul(x, u32.const(100)), u32.add(u32.mul(y, u32.const(10)), z))];
+        }
+      );
+      const outerBreak = new Module('outerBreakSwap').fn(
+        'run',
+        ['u32', 'u32', 'u32'],
+        'u32',
+        (f, cond, a, b) => {
+          const { u32 } = f.types;
+          const [x, y] = f.block([a, b], (x, y) => {
+            f.block([x, y], (i, j) => {
+              f.brIf(1, cond, j, i);
+              return [i, j];
+            });
+            return [x, y];
+          });
+          return [u32.add(u32.mul(x, u32.const(10)), y)];
+        }
+      );
+      const loopSwap = new Module('loopSwap').fn('run', ['u32', 'u32'], 'u32', (f, a, b) => {
+        const { u32 } = f.types;
+        const [i, x, y] = f.block(
+          [u32.const(0), a, b],
+          (i, x, y) => {
+            const next = u32.add(i, u32.const(1));
+            f.brIf(0, u32.lt(next, u32.const(3)), next, y, x);
+            return [next, y, x];
+          },
+          true
+        );
+        return [u32.add(u32.mul(x, u32.const(100)), u32.add(u32.mul(y, u32.const(10)), i))];
+      });
+      check(swapBr, [
+        [[3, 7], 73],
+        [[9, 2], 29],
+      ]);
+      check(swapBrIf, [
+        [[0, 3, 7], 37],
+        [[1, 3, 7], 73],
+      ]);
+      check(rotate, [
+        [[1, 2, 3], 231],
+        [[7, 8, 9], 897],
+      ]);
+      check(outerBreak, [
+        [[0, 4, 8], 48],
+        [[1, 4, 8], 84],
+      ]);
+      check(loopSwap, [
+        [[4, 8], 843],
+        [[2, 9], 923],
+      ]);
+    });
     should('basic2', () => {
       const type = 'u32';
       const mod = new Module('loopTest')
@@ -6140,7 +8015,7 @@ describe('Review regressions', () => {
           { args: [], outputs: [], opts: {}, shape: undefined },
           () => {}
         );
-        for (let i = 0; i < 8; i++) mg.op('u32', 'const', [], { value: i });
+        for (let i = 1; i <= 8; i++) mg.op('u32', 'const', [], { value: i });
         const sibling = mg.op('u32', 'add', [first, first]);
         const block = mg.ops.get(blockIdx) as any;
         block.outputs = [sibling.idx];
@@ -6470,11 +8345,20 @@ describe('Review regressions', () => {
     const memory = new WebAssembly.Memory({ initial: 32769 });
     new Uint8Array(memory.buffer)[0x80000000] = 77;
     const imports = { env: { _memory: memory } };
+    const generatedCode = createJS(mod as any);
+    deepStrictEqual(
+      generatedCode.split('\n').filter((line) => line.includes('return memory[')),
+      [
+        '    return memory[2147483648];',
+        '    return memory[2147483648];',
+        '    return memory[(((2147483647 + 1) | 0) >>> 0)];',
+      ]
+    );
     const native = exec(
       wrapModule(mod as any, wrapWASM(mod as any, wasm.createWasm(mod as any)), {}),
       imports
     );
-    const generated = exec(wrapModule(mod as any, createJS(mod as any), {}), imports);
+    const generated = exec(wrapModule(mod as any, generatedCode, {}), imports);
     deepStrictEqual(
       {
         native: [native.dynamicAddress(), native.staticOffset(), native.computedAddress()],
@@ -6485,6 +8369,215 @@ describe('Review regressions', () => {
         ],
       },
       { native: [77, 77, 77], generated: [77, 77, 77] }
+    );
+  });
+
+  const rawFn = (name: string, inputs: string[], output: string, ops: any[]) => ({
+    name,
+    export: true,
+    inputs,
+    outputs: [output],
+    locals: [],
+    instructions: [
+      ...inputs.map((_, i) => ({ TAG: 'local.get', data: BigInt(i) })),
+      ...ops,
+      { TAG: 'end' },
+    ],
+  });
+
+  should('JS typed array indexes omit redundant wrapped byte operands', () => {
+    const mod = {
+      memory: { size: 65536 },
+      functions: [
+        rawFn('dynamic', ['i32'], 'i32', [
+          { TAG: 'i32.load', data: { align: 2, offset: 0, trustedAlign: true } },
+        ]),
+        rawFn('computed', ['i32'], 'i32', [
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.add' },
+          { TAG: 'i32.load', data: { align: 2, offset: 0, trustedAlign: true } },
+        ]),
+        rawFn('offset', ['i32'], 'i32', [
+          { TAG: 'i32.load', data: { align: 2, offset: 4, trustedAlign: true } },
+        ]),
+      ],
+    };
+    deepStrictEqual(
+      createJS(mod as any)
+        .split('\n')
+        .filter((line) => line.includes('return memory_i32')),
+      [
+        '    return memory_i32[(v0 >>> 0) >>> 2];',
+        '    return memory_i32[(((1 + v0) | 0) >>> 0) >>> 2];',
+        '    return memory_i32[((v0 >>> 0) + 4) >>> 2];',
+      ]
+    );
+  });
+
+  should('JS conditions use comparison truthiness without numeric boolean coercion', () => {
+    const mod = new Module('condSource');
+    mod.fn('branch', ['u32', 'u32'], 'u32', (f, a, b) => {
+      const { u32 } = f.types;
+      return f.block([u32.const(7)], (v) => {
+        f.brIf(0, u32.lt(a, b), u32.const(9));
+        return [v];
+      });
+    });
+    mod.fn('pick', ['u32', 'u32'], 'u32', (f, a, b) => {
+      const { u32 } = f.types;
+      return [u32.select(u32.lt(a, b), u32.const(1), u32.const(2))];
+    });
+    const generated = toJs(mod, { optimize: false, noRuntime: true } as any);
+    deepStrictEqual(
+      // Function declarations also contain v0/v1, so match the emitted comparison coercions.
+      generated.raw
+        .split('\n')
+        .filter((line) => line.includes('v0') && line.includes('v1') && line.includes('>>> 0')),
+      ['if ((v0 >>> 0) < (v1 >>> 0)) {', '    return (((v0 >>> 0) < (v1 >>> 0)) ? 1 : 2);']
+    );
+    const out = exec(generated);
+    deepStrictEqual(
+      [out.branch(1, 2), out.branch(2, 1), out.pick(1, 2), out.pick(2, 1)],
+      [9, 7, 1, 2]
+    );
+  });
+
+  should('JS integer comparisons omit numeric constant coercions', () => {
+    const mod = new Module('cmpConstSource');
+    mod.fn('signed', ['i32'], 'u32', (f, a) => {
+      const { i32 } = f.types;
+      return [i32.eq(a, i32.const(16))];
+    });
+    mod.fn('unsigned', ['u32'], 'u32', (f, a) => {
+      const { u32 } = f.types;
+      return [u32.lt(a, u32.const(16))];
+    });
+    const generated = toJs(mod, { optimize: false, noRuntime: true } as any);
+    deepStrictEqual(
+      generated.raw.split('\n').filter((line) => line.includes('return (((')),
+      ['    return (((v0 | 0) === 16) | 0);', '    return (((v0 >>> 0) < 16) | 0);']
+    );
+    const out = exec(generated);
+    deepStrictEqual(
+      [out.signed(16), out.signed(15), out.unsigned(15), out.unsigned(16)],
+      [1, 0, 1, 0]
+    );
+  });
+
+  should('JS bitwise ops use comparison truthiness without numeric boolean coercion', () => {
+    const mod = new Module('bitwiseCmpSource');
+    mod.fn('and', ['i32', 'i32'], 'i32', (f, a, b) => {
+      const { i32 } = f.types;
+      return [i32.and(i32.eq(a, i32.const(0)), i32.eq(b, i32.const(0)))];
+    });
+    mod.fn('or', ['i32', 'i32'], 'i32', (f, a, b) => {
+      const { i32 } = f.types;
+      return [i32.or(i32.eq(a, i32.const(0)), i32.eq(b, i32.const(0)))];
+    });
+    mod.fn('xor', ['i32', 'i32'], 'i32', (f, a, b) => {
+      const { i32 } = f.types;
+      return [i32.xor(i32.eq(a, i32.const(0)), i32.eq(b, i32.const(0)))];
+    });
+    mod.fn('not', ['i32'], 'i32', (f, a) => {
+      const { i32 } = f.types;
+      return [i32.not(i32.eq(a, i32.const(0)))];
+    });
+    mod.fn('andnot', ['i32', 'i32'], 'i32', (f, a, b) => {
+      const { i32 } = f.types;
+      return [i32.andnot(i32.eq(a, i32.const(0)), i32.eq(b, i32.const(0)))];
+    });
+    const generated = toJs(mod, { optimize: false, noRuntime: true } as any);
+    deepStrictEqual(
+      generated.raw.split('\n').filter((line) => line.startsWith('    return ')),
+      [
+        '    return (((v1 | 0) === 0) & ((v0 | 0) === 0));',
+        '    return (((v0 | 0) === 0) & ~((v1 | 0) === 0));',
+        '    return (~((v0 | 0) === 0));',
+        '    return (((v1 | 0) === 0) | ((v0 | 0) === 0));',
+        '    return (((v1 | 0) === 0) ^ ((v0 | 0) === 0));',
+      ]
+    );
+    const out = exec(generated);
+    deepStrictEqual(
+      [out.and(0, 0), out.and(0, 1), out.or(0, 1), out.xor(0, 1), out.not(0), out.andnot(0, 1)],
+      [1, 0, 1, 1, -2, 1]
+    );
+  });
+
+  should('JS conversion coercions omit simple local operand parentheses', () => {
+    const convert = (name: string, output: string, tag: string, add = false) =>
+      rawFn(name, ['i32'], output, [
+        ...(add ? [{ TAG: 'i32.const', data: 1n }, { TAG: 'i32.add' }] : []),
+        { TAG: tag },
+      ]);
+    const mod = {
+      memory: { size: 0 },
+      functions: [
+        convert('f32s', 'f32', 'f32.convert_i32_s'),
+        // The raw JS wrapper maps numeric params as i32; unsigned tags still exercise >>> 0.
+        convert('f32u', 'f32', 'f32.convert_i32_u'),
+        convert('f64s', 'f64', 'f64.convert_i32_s'),
+        convert('f64u', 'f64', 'f64.convert_i32_u'),
+        convert('f64AddS', 'f64', 'f64.convert_i32_s', true),
+        convert('f64AddU', 'f64', 'f64.convert_i32_u', true),
+      ],
+    };
+    const generatedCode = createJS(mod as any);
+    deepStrictEqual(
+      generatedCode.split('\n').filter((line) => line.startsWith('    return ')),
+      [
+        '    return Math.fround(v0 | 0);',
+        '    return Math.fround(v0 >>> 0);',
+        '    return (v0 | 0);',
+        '    return (v0 >>> 0);',
+        '    return (((1 + v0) | 0) | 0);',
+        '    return (((1 + v0) | 0) >>> 0);',
+      ]
+    );
+    const generated = exec(wrapModule(mod as any, generatedCode, {}));
+    deepStrictEqual(
+      [
+        generated.f32s(-1),
+        generated.f32u(-1),
+        generated.f64s(-1),
+        generated.f64u(-1),
+        generated.f64AddS(-2),
+        generated.f64AddU(-2),
+      ],
+      [-1, 4294967296, -1, 4294967295, -1, 4294967295]
+    );
+  });
+
+  should('JS integer div/rem omit redundant operand wrappers', () => {
+    const fn = (name: string, tag: string) => rawFn(name, ['i32', 'i32'], 'i32', [{ TAG: tag }]);
+    const mod = {
+      memory: { size: 0 },
+      functions: [
+        fn('div_s', 'i32.div_s'),
+        fn('div_u', 'i32.div_u'),
+        fn('rem_s', 'i32.rem_s'),
+        fn('rem_u', 'i32.rem_u'),
+      ],
+    };
+    const generatedCode = createJS(mod as any);
+    deepStrictEqual(
+      generatedCode.split('\n').filter((line) => line.startsWith('    return ')),
+      [
+        '    return (((v0 | 0) / (v1 | 0)) | 0);',
+        '    return (((v0 >>> 0) / (v1 >>> 0)) >>> 0);',
+        '    return (((v0 | 0) % (v1 | 0)) | 0);',
+        '    return (((v0 >>> 0) % (v1 >>> 0)) >>> 0);',
+      ]
+    );
+    const generated = exec(wrapModule(mod as any, generatedCode, {}));
+    deepStrictEqual(
+      [
+        generated.div_s(-7, 3),
+        generated.div_u(-7, 3),
+        generated.rem_s(-7, 3),
+        generated.rem_u(-7, 3),
+      ],
+      [-2, 1431655763, -1, 0]
     );
   });
 
@@ -6527,6 +8620,15 @@ describe('Review regressions', () => {
     };
     const native = wrapWASM(mod as any, wasm.createWasm(mod as any), {});
     const generated = createJS(mod as any);
+    deepStrictEqual(
+      generated
+        .split('\n')
+        .filter((line) => line.includes('memory.fill') || line.includes('copyWithin')),
+      [
+        '    memory.fill(91, 2147483648, 2147483649)',
+        '    memory.copyWithin(2147483649, 2147483648, 2147483649);',
+      ]
+    );
     deepStrictEqual(
       {
         native: [run(native, 'fillHigh'), run(native, 'copyHigh')],
