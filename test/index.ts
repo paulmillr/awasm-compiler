@@ -1,4 +1,4 @@
-import { should } from '@paulmillr/jsbt/test.js';
+import { should } from './jsbt.js';
 
 import './big-ints.test.ts';
 import './cast-to.test.ts';

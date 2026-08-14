@@ -1,9 +1,9 @@
-import { describe, it } from '@paulmillr/jsbt/test.js';
+import { describe, it } from './jsbt.js';
 import * as P from 'micro-packed';
 import { deepStrictEqual } from 'node:assert';
 import { Module, array } from '../src/module.ts';
 import { toRuntime } from '../src/runtime.ts';
-import { runtimeTypeMod, testBothOpts } from './utils.ts';
+import { getRuntimeTypeMod, testBothOpts } from './utils.ts';
 
 describe('BigInt', () => {
   const BIG_OPTS = { noRuntime: true, lowerU64: true };
@@ -230,7 +230,7 @@ describe('BigInt', () => {
       const T = f.getType('u64', lanes);
       f.memory.data[pos].set(T.add(T.fromN('u32', a), T.fromN('u32', b)));
     });
-    const mod = toRuntime(() => runtimeTypeMod, m)();
+    const mod = toRuntime(getRuntimeTypeMod, m)();
     mod.sum(0, 4, 0, 5, 7);
     const vals = P.array(8, P.U64LE).decode(mod.segments.data);
     deepStrictEqual(vals.slice(0, 4), [12n, 12n, 12n, 12n]);

@@ -1,4 +1,4 @@
-import { describe, it } from '@paulmillr/jsbt/test.js';
+import { describe, it } from './jsbt.js';
 import * as P from 'micro-packed';
 import { deepStrictEqual, throws } from 'node:assert';
 import { FnOp, ModuleGraph, toJs, toMod, toWasm } from '../src/codegen.ts';

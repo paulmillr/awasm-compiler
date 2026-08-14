@@ -1,4 +1,4 @@
-import { describe, it } from '@paulmillr/jsbt/test.js';
+import { describe, it } from './jsbt.js';
 import { deepStrictEqual, throws } from 'node:assert';
 import * as types from '../src/types.ts';
 import * as utils from '../src/utils.ts';
