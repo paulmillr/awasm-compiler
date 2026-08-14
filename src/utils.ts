@@ -1,4 +1,4 @@
-import { utils as baseUtils, type TArg, type TRet } from '@scure/base';
+import { type TArg, type TRet } from '@scure/base';
 import * as P from 'micro-packed';
 
 /** Extracts the element type from a readonly array. */
@@ -591,10 +591,10 @@ export function NamedDimensions<const O extends Record<string, number>>(
 
   const nd = named(names as K[]);
   const d = Dimensions(...dims);
-  const keyNamed = baseUtils.chain(P.coders.reverse(nd) as any, d.key) as P.Coder<
-    NamedIndex<O>,
-    number
-  >;
+  const keyNamed: P.Coder<NamedIndex<O>, number> = {
+    encode: (idx) => d.key.encode(nd.decode(idx)),
+    decode: (flat) => nd.encode(d.key.decode(flat)) as NamedIndex<O>,
+  };
   return {
     ...d,
     key: keyNamed,
