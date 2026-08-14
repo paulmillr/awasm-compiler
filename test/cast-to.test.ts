@@ -1,10 +1,10 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import { deepStrictEqual, throws } from 'node:assert';
 import { Module } from '../src/module.ts';
 import { testBoth } from './utils.ts';
 
 describe('CastTo', () => {
-  should('scalar casts', () => {
+  it('scalar casts', () => {
     const m = new Module('castScalar');
     m.fn('i32_to_u32', ['i32'], 'u32', (f, a) => {
       return [f.types.i32.castTo('u32', a)];
@@ -46,7 +46,7 @@ describe('CastTo', () => {
     });
   });
 
-  should('simd casts', () => {
+  it('simd casts', () => {
     const m = new Module('castSimd');
     m.fn('u8x16_to_i8x16_lane', [], 'i8', (f) => {
       const { u8, u8x16, i8x16 } = f.types;
@@ -66,7 +66,7 @@ describe('CastTo', () => {
     });
   });
 
-  should('more scalar casts', () => {
+  it('more scalar casts', () => {
     const m = new Module('castScalarMore');
     m.fn('i16_to_u32', ['i16'], 'u32', (f, a) => {
       return [f.types.u32.castFrom('i16', a)];
@@ -96,7 +96,7 @@ describe('CastTo', () => {
     });
   });
 
-  should('invalid casts', () => {
+  it('invalid casts', () => {
     const m0 = new Module('castBadScalar');
     m0.fn('bad_scalar', ['u8'], 'u16', (f, a) => {
       return [f.types.u16.castFrom('u8', a)];
@@ -120,4 +120,4 @@ describe('CastTo', () => {
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

@@ -1,4 +1,4 @@
-import mark from '@paulmillr/jsbt/bench.js';
+import mark from '@paulmillr/jsbt/benchmark.js';
 import { toJs, toWasm } from '../src/codegen.ts';
 import { Module, array } from '../src/module.ts';
 // exec lives in js.ts; codegen.ts doesn't export it.

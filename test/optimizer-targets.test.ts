@@ -1,4 +1,4 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import { deepStrictEqual, throws } from 'node:assert';
 import { ModuleGraph, toJs, toMod, toWasm } from '../src/codegen.ts';
 import { exec } from '../src/js.ts';
@@ -65,7 +65,7 @@ describe('Optimizer target tests', () => {
       icseOps: true,
     });
 
-  should('block no-op state does not emit JS or Wasm saved-state assignments', () => {
+  it('block no-op state does not emit JS or Wasm saved-state assignments', () => {
     const mod = blockStateChurn();
     const opts = { optimize: false, noRuntime: true } as any;
     const rawOpts = { ...opts, optBlockState: true };
@@ -87,7 +87,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('block no-op state can keep old saved-state lowering when disabled', () => {
+  it('block no-op state can keep old saved-state lowering when disabled', () => {
     const mod = blockStateChurn();
     const opts = { optimize: false, noRuntime: true, optBlockState: false } as any;
     const generated = toJs(mod, opts);
@@ -108,7 +108,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('public Wasm defaults keep saved block state while JS keeps passthrough', () => {
+  it('public Wasm defaults keep saved block state while JS keeps passthrough', () => {
     const opts = { optimize: false, noRuntime: true } as any;
     const wasm = toWasm(blockStateChurn(), opts).raw;
     const wasmSaved = toWasm(blockStateChurn(), { ...opts, optBlockState: false }).raw;
@@ -124,7 +124,7 @@ describe('Optimizer target tests', () => {
     throws(() => deepStrictEqual(js, jsSaved));
   });
 
-  should('ModuleGraph reuses duplicate pure op nodes on creation by default', () => {
+  it('ModuleGraph reuses duplicate pure op nodes on creation by default', () => {
     const mg = graph('reuse_edges');
     const ids: string[] = [];
     mg.subgraph(
@@ -158,7 +158,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(ids, ['0.0', '0.0', '0.1', '0.1', '0.1', '1.0', '1.0', '1.1', '1.1', '1.1']);
   });
 
-  should('construction CSE keeps reusing nodes after rewrite starts', () => {
+  it('construction CSE keeps reusing nodes after rewrite starts', () => {
     const mg = graph('reuse_phase');
     const ids: string[] = [];
     mg.addFn('before', {
@@ -186,7 +186,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(ids, ['0.0', '0.0', '0.0', '1.0', '1.0']);
   });
 
-  should('construction CSE keeps scope-local duplicate ops separate', () => {
+  it('construction CSE keeps scope-local duplicate ops separate', () => {
     const mg = graph('reuse_scope');
     const ids: string[] = [];
     mg.subgraph(
@@ -204,7 +204,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(ids, ['0.0', '0.1.0', '0.1.0']);
   });
 
-  should('construction CSE applies to direct TreeDAG add sites', () => {
+  it('construction CSE applies to direct TreeDAG add sites', () => {
     const mg = graph('reuse_direct_add');
     const ids: string[] = [];
     mg.subgraph(
@@ -225,7 +225,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(ids, ['0.0', '0.0']);
   });
 
-  should('construction CSE survives generated code lowering', () => {
+  it('construction CSE survives generated code lowering', () => {
     const mod = new Module('reuse_lowering').fn('run', ['u32'], 'u32', (f, x) =>
       f.types.u32.add(f.types.u32.rotl(x, 7), f.types.u32.rotl(x, 7))
     );
@@ -233,7 +233,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(out.run(0x12345678), 878082066);
   });
 
-  should('construction CSE reuses duplicate pure ops before rewrite variadic CSE', () => {
+  it('construction CSE reuses duplicate pure ops before rewrite variadic CSE', () => {
     const mg = graph('cse_edges');
     mg.addFn('run', {
       inputs: ['u32'],
@@ -256,7 +256,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('construction CSE merges same memory reads with the same parent write', () => {
+  it('construction CSE merges same memory reads with the same parent write', () => {
     let mg: ModuleGraph | undefined;
     const mod = new Module('mem_read_cse')
       .mem('state', array('u32', {}, 1))
@@ -282,7 +282,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('construction CSE merges consecutive identical memory writes', () => {
+  it('construction CSE merges consecutive identical memory writes', () => {
     let mg: ModuleGraph | undefined;
     const mod = new Module('mem_write_cse')
       .mem('state', array('u32', {}, 1))
@@ -304,7 +304,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('construction CSE keeps memory writes split across intervening reads', () => {
+  it('construction CSE keeps memory writes split across intervening reads', () => {
     let mg: ModuleGraph | undefined;
     const mod = new Module('mem_write_read_barrier')
       .mem('state', array('u32', {}, 1))
@@ -350,7 +350,7 @@ describe('Optimizer target tests', () => {
   const checkWasm = (mod: Module, ...rows: string[]) =>
     deepStrictEqual(wasmInstrs(mod), instructions(...rows));
 
-  should('wasm uses the same load-fed variadic schedule for integer reducers', () => {
+  it('wasm uses the same load-fed variadic schedule for integer reducers', () => {
     // Available leaves (the local and consts) anchor a wide block: the load emits first
     // (heaviest producer), cheap leaves land on the early reduce edge, folds at the end.
     const mod = (op: 'add' | 'xor') =>
@@ -372,7 +372,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('wasm does not inline loads past dependent writes', () => {
+  it('wasm does not inline loads past dependent writes', () => {
     const mod = new Module('load_write_barrier')
       .mem('state', array('u32', {}, 1))
       .fn('run', ['u32'], 'u32', (f, x) => {
@@ -389,7 +389,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('wasm streams scalar all-producer variadics in sorted order', () => {
+  it('wasm streams scalar all-producer variadics in sorted order', () => {
     // No available leaf to anchor a wide block: streaming keeps at most accumulator+leaf
     // live while each producer computes (the shape that fixed AES table-load reductions).
     const mod = new Module('schedule_scalar_stream').fn(
@@ -409,7 +409,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('wasm emits 32-bit SIMD variadics as source-order leaf blocks', () => {
+  it('wasm emits 32-bit SIMD variadics as source-order leaf blocks', () => {
     // Wide emission (leaves first, folds at the end) restores the fast reduction shape for
     // 32-bit rounds; streaming folds between SIMD producers was the measured sha1 regression.
     // Source order is kept: construction order already groups lanes/rounds (keccak/blake3).
@@ -431,7 +431,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('wasm keeps vector loads materialized before vector variadic reducers', () => {
+  it('wasm keeps vector loads materialized before vector variadic reducers', () => {
     const mod = new Module('schedule_vector_load')
       .mem('state', array('u32x4', {}, 2))
       .fn('run', ['u32'], 'u32', (f, x) => {
@@ -453,7 +453,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('wasm emits scalar variadics with an available leaf as heavy-first blocks', () => {
+  it('wasm emits scalar variadics with an available leaf as heavy-first blocks', () => {
     // An available leaf (const here) anchors a wide block; producers emit heavy-first so
     // cheap leaves land on the early reduce edge (fold-at-end reduces the last-pushed first).
     const mod = new Module('schedule_scalar_avail')
@@ -474,7 +474,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('tee-less JS streams only reducers with lowered-wide provenance', () => {
+  it('tee-less JS streams only reducers with lowered-wide provenance', () => {
     const mod = (wide: boolean) =>
       new Module(`schedule_js_wide_${wide}`).fn(
         'run',
@@ -503,7 +503,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('wide integer lowering records reducer provenance for scheduling', () => {
+  it('wide integer lowering records reducer provenance for scheduling', () => {
     let mg: ModuleGraph | undefined;
     const mod = new Module('schedule_wide_origin')
       .mem('state', array('u64', {}, 3))
@@ -537,7 +537,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cse preserves lowered-wide provenance when rebuilding reducers', () => {
+  it('cse preserves lowered-wide provenance when rebuilding reducers', () => {
     const mg = graph('cse_wide_origin');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32'],
@@ -559,7 +559,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(reducers, [{ args: 3, wide: 64 }]);
   });
 
-  should('wide provenance tracks element width rather than aggregate SIMD width', () => {
+  it('wide provenance tracks element width rather than aggregate SIMD width', () => {
     let mg: ModuleGraph | undefined;
     const mod = new Module('schedule_narrow_simd_origin')
       .mem('state', array('u32x4', {}, 1))
@@ -585,7 +585,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual({ widths: [...widths] }, { widths: [] });
   });
 
-  should('wasm balances 64-bit SIMD variadics in heavy-first order', () => {
+  it('wasm balances 64-bit SIMD variadics in heavy-first order', () => {
     // A balanced expression tree shortens simultaneous 64-bit live ranges while preserving the
     // scheduler's generic heavy-first leaf order; this is cross-environment flat and materially
     // faster for the affected Apple-Silicon SHA-512 target.
@@ -605,7 +605,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('wasm groups high-arity scalar64 variadics in source-order threes', () => {
+  it('wasm groups high-arity scalar64 variadics in source-order threes', () => {
     const mod = (five: boolean) =>
       new Module(`schedule_u64_chunks_${five}`).fn(
         'run',
@@ -635,7 +635,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cseOps does not reuse equal ops across sibling scopes', () => {
+  it('cseOps does not reuse equal ops across sibling scopes', () => {
     const mg = graph('cse_scope');
     mg.addFn('run', {
       inputs: ['u32'],
@@ -660,7 +660,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cseOps flattens single-use nested variadic ops', () => {
+  it('cseOps flattens single-use nested variadic ops', () => {
     const mg = graph('cse_variadic_flatten');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32'],
@@ -679,7 +679,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('Wasm CSE keeps scalar64 reducer trees while JS flattens them', () => {
+  it('Wasm CSE keeps scalar64 reducer trees while JS flattens them', () => {
     const rewrite = (lowerWasm: boolean) => {
       const mg = graph('cse_u64_backend');
       mg.addFn('run', {
@@ -708,7 +708,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cseOps rebuilds variadic ops through existing subsets', () => {
+  it('cseOps rebuilds variadic ops through existing subsets', () => {
     const mg = graph('cse_variadic_subset');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32'],
@@ -729,7 +729,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cseOps rebuilds variadic add through existing subsets', () => {
+  it('cseOps rebuilds variadic add through existing subsets', () => {
     const mg = graph('cse_variadic_add_subset');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32'],
@@ -750,7 +750,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cseOps rebuilds variadic add through multiple disjoint subsets', () => {
+  it('cseOps rebuilds variadic add through multiple disjoint subsets', () => {
     const mg = graph('cse_variadic_multi_subset');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32', 'u32'],
@@ -773,7 +773,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cseOps reuses ancestor variadic subsets in descendant blocks', () => {
+  it('cseOps reuses ancestor variadic subsets in descendant blocks', () => {
     const mg = graph('cse_variadic_ancestor_subset');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32'],
@@ -796,7 +796,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cseOps does not reuse child variadic subsets in parent blocks', () => {
+  it('cseOps does not reuse child variadic subsets in parent blocks', () => {
     const mg = graph('cse_variadic_child_subset');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32'],
@@ -818,7 +818,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cseOps does not reuse sibling variadic subsets', () => {
+  it('cseOps does not reuse sibling variadic subsets', () => {
     const mg = graph('cse_variadic_sibling_subset');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32'],
@@ -843,7 +843,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('icse rematerializes binary reducers without cloning variadic reducers', () => {
+  it('icse rematerializes binary reducers without cloning variadic reducers', () => {
     const mg = graph('icse_arity');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32', 'u32'],
@@ -867,7 +867,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('icse keeps shared values materialized for duplicated JS rotate operands', () => {
+  it('icse keeps shared values materialized for duplicated JS rotate operands', () => {
     const mg = graph('icse_linear_consumers');
     mg.addFn('run', {
       inputs: ['u32', 'u32', 'u32', 'u32'],
@@ -893,7 +893,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('icse only runs at the high shared ALU pressure boundary', () => {
+  it('icse only runs at the high shared ALU pressure boundary', () => {
     const mg = graph('icse_pressure');
     const add = (name: string, count: number) =>
       mg.addFn(name, {
@@ -921,7 +921,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(clones, { below: 0, at: 32 });
   });
 
-  should('icse bounds rematerialization for high-fanout values', () => {
+  it('icse bounds rematerialization for high-fanout values', () => {
     const mg = graph('icse_fanout');
     const add = (name: string, users: number) =>
       mg.addFn(name, {
@@ -948,7 +948,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(clones, { bounded: 15, excessive: 0 });
   });
 
-  should('icse pressure excludes values pinned by non-retireable consumers', () => {
+  it('icse pressure excludes values pinned by non-retireable consumers', () => {
     const mg = graph('icse_retireable_pressure');
     mg.addFn('blocked', {
       inputs: ['u32'],
@@ -973,7 +973,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(clones, 0);
   });
 
-  should('icse pressure counts only reducers the pass can rematerialize', () => {
+  it('icse pressure counts only reducers the pass can rematerialize', () => {
     const mg = graph('icse_actionable_pressure');
     mg.addFn('run', {
       inputs: ['u32'],
@@ -997,7 +997,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(clones, 0);
   });
 
-  should('motionOps sinks pure outer ops into their only inner block users', () => {
+  it('motionOps sinks pure outer ops into their only inner block users', () => {
     const mg = graph('motion_sink_block');
     mg.addFn('run', {
       inputs: ['u32'],
@@ -1019,7 +1019,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('motionOps hoists loop-invariant pure ops out of loops', () => {
+  it('motionOps hoists loop-invariant pure ops out of loops', () => {
     const mg = graph('motion_hoist_loop');
     mg.addFn('run', {
       inputs: ['u32'],
@@ -1047,7 +1047,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('motionOps does not sink load-dependent ops into blocks', () => {
+  it('motionOps does not sink load-dependent ops into blocks', () => {
     let mg: ModuleGraph | undefined;
     const mod = new Module('motion_load_barrier')
       .mem('state', array('u32', {}, 1))
@@ -1073,48 +1073,45 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should(
-    'wasmTee still inlines tee-backed single-use expressions in the same control scope',
-    () => {
-      const mod = new Module('tee_same_scope').fn('run', ['u32'], 'u32', (f, x) => {
-        const { u32 } = f.types;
-        const base = u32.add(x, u32.const(1));
-        const via = u32.sub(base, u32.const(2));
-        return u32.add(via, base);
-      });
-      const out = exec(toWasm(mod, { noRuntime: true }));
-      const wasmFn = toMod(mod, {
-        noRuntime: true,
-        optimize: false,
-        wasmBlockType: true,
-        wasmTee: true,
-      }).wasmMod.functions.find((fn) => fn.name === 'run');
-      deepStrictEqual(out.run(10), 20);
-      deepStrictEqual(
-        {
-          locals: wasmFn?.locals,
-          instructions: wasmFn?.instructions,
-        },
-        {
-          locals: [{ type: 'i32', count: 2 }],
-          instructions: [
-            { TAG: 'local.get', data: 0n },
-            { TAG: 'i32.const', data: 1n },
-            { TAG: 'i32.add' },
-            { TAG: 'local.tee', data: 1n },
-            { TAG: 'i32.const', data: 2n },
-            { TAG: 'i32.sub' },
-            { TAG: 'local.get', data: 1n, info: 'first' },
-            { TAG: 'i32.add' },
-            { TAG: 'local.tee', data: 2n },
-            { TAG: 'end' },
-          ],
-        }
-      );
-    }
-  );
+  it('wasmTee still inlines tee-backed single-use expressions in the same control scope', () => {
+    const mod = new Module('tee_same_scope').fn('run', ['u32'], 'u32', (f, x) => {
+      const { u32 } = f.types;
+      const base = u32.add(x, u32.const(1));
+      const via = u32.sub(base, u32.const(2));
+      return u32.add(via, base);
+    });
+    const out = exec(toWasm(mod, { noRuntime: true }));
+    const wasmFn = toMod(mod, {
+      noRuntime: true,
+      optimize: false,
+      wasmBlockType: true,
+      wasmTee: true,
+    }).wasmMod.functions.find((fn) => fn.name === 'run');
+    deepStrictEqual(out.run(10), 20);
+    deepStrictEqual(
+      {
+        locals: wasmFn?.locals,
+        instructions: wasmFn?.instructions,
+      },
+      {
+        locals: [{ type: 'i32', count: 2 }],
+        instructions: [
+          { TAG: 'local.get', data: 0n },
+          { TAG: 'i32.const', data: 1n },
+          { TAG: 'i32.add' },
+          { TAG: 'local.tee', data: 1n },
+          { TAG: 'i32.const', data: 2n },
+          { TAG: 'i32.sub' },
+          { TAG: 'local.get', data: 1n, info: 'first' },
+          { TAG: 'i32.add' },
+          { TAG: 'local.tee', data: 2n },
+          { TAG: 'end' },
+        ],
+      }
+    );
+  });
 
-  should('wasm schedules variadic operands as heavy-first wide blocks', () => {
+  it('wasm schedules variadic operands as heavy-first wide blocks', () => {
     // Available leaves (d, the const) anchor a wide block: producers emit heaviest-first as
     // an uninterrupted leaf block, folds happen at the end with cheap leaves on the early
     // reduce edge. Interleaving folds between producers was the measured md5/ripemd shape
@@ -1147,7 +1144,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('wasmTee keeps parent value live when an if-only block is skipped', () => {
+  it('wasmTee keeps parent value live when an if-only block is skipped', () => {
     const mod = new Module('tee_if_skip')
       .mem('state', array('u32', {}, 1))
       .fn('run', ['u32', 'u32'], 'u32', (f, x, cond) => {
@@ -1162,7 +1159,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(runBoth(mod, binaryCases), both(binaryCases, [115, 115, 110, 110]));
   });
 
-  should('wasmTee inlines tee-backed single-use expressions in unconditional nested blocks', () => {
+  it('wasmTee inlines tee-backed single-use expressions in unconditional nested blocks', () => {
     const mod = new Module('tee_nested_block_inline')
       .mem('state', array('u32', {}, 1))
       .fn('run', ['u32'], 'u32', (f, x) => {
@@ -1216,7 +1213,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('wasmTee keeps parent value live across both ifElse arms', () => {
+  it('wasmTee keeps parent value live across both ifElse arms', () => {
     const mod = new Module('tee_if_else')
       .mem('state', array('u32', {}, 1))
       .fn('run', ['u32', 'u32'], 'u32', (f, x, cond) => {
@@ -1239,7 +1236,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(runBoth(mod, binaryCases), both(binaryCases, [37, 27, 27, 17]));
   });
 
-  should('wasmTee keeps parent value live when an inner block breaks before first use', () => {
+  it('wasmTee keeps parent value live when an inner block breaks before first use', () => {
     const mod = new Module('tee_inner_break')
       .mem('state', array('u32', {}, 1))
       .fn('run', ['u32', 'u32'], 'u32', (f, x, skip) => {
@@ -1256,7 +1253,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(runBoth(mod, binaryCases), both(binaryCases, [115, 115, 110, 110]));
   });
 
-  should('wasmTee keeps outer-branch values live when a nested if-only block is skipped', () => {
+  it('wasmTee keeps outer-branch values live when a nested if-only block is skipped', () => {
     const mod = new Module('tee_nested_if_skip')
       .mem('state', array('u32', {}, 2))
       .fn('run', ['u32', 'u32', 'u32'], 'u32', (f, x, outer, inner) => {
@@ -1276,7 +1273,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(runBoth(mod, nestedCases), both(nestedCases, [0, 15, 27]));
   });
 
-  should('wasmTee keeps outer-branch values live across nested ifElse arms', () => {
+  it('wasmTee keeps outer-branch values live across nested ifElse arms', () => {
     const mod = new Module('tee_nested_if_else')
       .mem('state', array('u32', {}, 2))
       .fn('run', ['u32', 'u32', 'u32'], 'u32', (f, x, outer, inner) => {
@@ -1304,7 +1301,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(runBoth(mod, nestedCases), both(nestedCases, [0, 37, 27]));
   });
 
-  should('wasmTee keeps parent value live when a counted loop has zero iterations', () => {
+  it('wasmTee keeps parent value live when a counted loop has zero iterations', () => {
     const mod = new Module('tee_zero_loop')
       .mem('state', array('u32', {}, 1))
       .fn('run', ['u32', 'u32'], 'u32', (f, x, count) => {
@@ -1325,7 +1322,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(runBoth(mod, cases), both(cases, [115, 115, 115]));
   });
 
-  should('wasmTee handles branch-yield values without hiding later fallthrough reads', () => {
+  it('wasmTee handles branch-yield values without hiding later fallthrough reads', () => {
     const mod = new Module('tee_branch_yield').fn('run', ['u32', 'u32'], 'u32', (f, x, cond) => {
       const { u32 } = f.types;
       let out = u32.const(0);
@@ -1343,7 +1340,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(runBoth(mod, binaryCases), both(binaryCases, [15, 12, 10, 7]));
   });
 
-  should('TreeDAG rejects values that escape from an inner control scope', () => {
+  it('TreeDAG rejects values that escape from an inner control scope', () => {
     const mod = new Module('tee_scope_escape').fn('run', ['u32', 'u32'], 'u32', (f, x, cond) => {
       const { u32 } = f.types;
       let escaped: any;
@@ -1356,7 +1353,7 @@ describe('Optimizer target tests', () => {
     throws(() => toJs(mod, teeOpts), /TreeDAG\.check edge\(0\.2\.3\) to child from 0\.4/);
   });
 
-  should('cseOps keeps wasmTee assignments outside conditional single-use consumers', () => {
+  it('cseOps keeps wasmTee assignments outside conditional single-use consumers', () => {
     const mod = new Module('cse_tee_conditional')
       .mem('state', struct({ d: array('u32', {}, 4), tmp: array('u32', {}, 4) }))
       .mem('buffer', array('u32', {}, 8))
@@ -1434,7 +1431,7 @@ describe('Optimizer target tests', () => {
     ]);
   });
 
-  should('cseOps does not reassociate float variadic ops', () => {
+  it('cseOps does not reassociate float variadic ops', () => {
     const mg = graph('cse_variadic_float');
     mg.addFn('run', {
       inputs: ['f64', 'f64', 'f64'],
@@ -1454,7 +1451,7 @@ describe('Optimizer target tests', () => {
     );
   });
 
-  should('cseOps survives generated code lowering', () => {
+  it('cseOps survives generated code lowering', () => {
     const mod = new Module('cse_lowering').fn('run', ['u32'], 'u32', (f, x) =>
       f.types.u32.add(f.types.u32.rotl(x, 7), f.types.u32.rotl(x, 7))
     );
@@ -1462,7 +1459,7 @@ describe('Optimizer target tests', () => {
     deepStrictEqual(out.run(0x12345678), 878082066);
   });
 
-  should('public codegen enables cseOps by default', () => {
+  it('public codegen enables cseOps by default', () => {
     const mod = new Module('default_cse').fn('run', ['u32'], 'u32', (f, x) => {
       const { u32 } = f.types;
       const incA = u32.add(x, u32.const(1));
@@ -1502,7 +1499,7 @@ return Object.freeze({ ..._exports, memory: memoryExport, segments  });`
     );
   });
 
-  should('public codegen enables pressure-gated icse only for tee-less JS', () => {
+  it('public codegen enables pressure-gated icse only for tee-less JS', () => {
     const mod = new Module('default_icse').fn('run', ['u32'], 'u32', (f, input) => {
       const { u32 } = f.types;
       const values = [];
@@ -1536,7 +1533,7 @@ return Object.freeze({ ..._exports, memory: memoryExport, segments  });`
     );
   });
 
-  should('default Wasm variadic lowering executes cheap multi-arg integer reducers', () => {
+  it('default Wasm variadic lowering executes cheap multi-arg integer reducers', () => {
     const mod = new Module('wasm_variadic_tree').fn(
       'run',
       ['u32', 'u32', 'u32', 'u32'],
@@ -1564,4 +1561,4 @@ return Object.freeze({ ..._exports, memory: memoryExport, segments  });`
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

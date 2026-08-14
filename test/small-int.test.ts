@@ -1,11 +1,11 @@
-import { deepStrictEqual } from 'node:assert';
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import * as P from 'micro-packed';
+import { deepStrictEqual } from 'node:assert';
 import { Module, array } from '../src/module.ts';
 import { testBoth } from './utils.ts';
 
 describe('SmallInt', () => {
-  should('scalar wrap', () => {
+  it('scalar wrap', () => {
     const m = new Module('smallIntScalar');
     m.fn('u8_add', ['u8', 'u8'], 'u8', (f, a, b) => {
       const { u8 } = f.types;
@@ -36,7 +36,7 @@ describe('SmallInt', () => {
     });
   });
 
-  should('swizzle + extractLane', () => {
+  it('swizzle + extractLane', () => {
     const m = new Module('smallIntSimd');
     m.fn('swz0', [], 'u8', (f) => {
       const { u8, u8x16 } = f.types;
@@ -102,7 +102,7 @@ describe('SmallInt', () => {
     });
   });
 
-  should('memory views', () => {
+  it('memory views', () => {
     const m = new Module('smallIntMem')
       .mem('bytes', array('u8', {}, 4))
       .mem('words', array('u16', {}, 2))
@@ -180,7 +180,7 @@ describe('SmallInt', () => {
     });
   });
 
-  should('interleave small SIMD', () => {
+  it('interleave small SIMD', () => {
     const m = new Module('smallIntInterleave')
       .mem('in8', array('u8x16', {}, 16))
       .mem('out8', array('u8x16', {}, 16))
@@ -235,7 +235,7 @@ describe('SmallInt', () => {
     });
   });
 
-  should('conversions', () => {
+  it('conversions', () => {
     const m = new Module('smallIntConv');
     m.fn('u8_to_u32', ['u8'], 'u32', (f, a) => {
       return [f.types.u8.toN('u32', a)];
@@ -523,7 +523,7 @@ describe('SmallInt', () => {
       deepStrictEqual(mod.u8x16_to_i8x16_lane(), -1);
       deepStrictEqual(mod.u16x8_to_i16x8_lane(), -1);
     });
-    should('extmul', () => {
+    it('extmul', () => {
       const mod = new Module('smallint_extmul')
         .fn('u8x16_extmul_low_u', [], 'u16', (f) => {
           const { u8x16, u16x8 } = f.types;
@@ -563,4 +563,4 @@ describe('SmallInt', () => {
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

@@ -1,4 +1,4 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import * as P from 'micro-packed';
 import { deepStrictEqual, throws } from 'node:assert';
 import { FnOp, ModuleGraph, toJs, toMod, toWasm } from '../src/codegen.ts';
@@ -6,7 +6,7 @@ import * as js from '../src/js.ts';
 import { createJS, exec, wrapModule, wrapWASM } from '../src/js.ts';
 import * as memory from '../src/memory.ts';
 import { PosExpr } from '../src/memory.ts';
-import { Module, array, scalar, struct } from '../src/module.ts';
+import { array, Module, scalar, struct } from '../src/module.ts';
 import { toRuntime } from '../src/runtime.ts';
 import {
   genRuntimeTypeMod,
@@ -44,7 +44,7 @@ const SLOW = false;
 
 describe('Codegen', () => {
   describe('Basic', () => {
-    should('Basic', () => {
+    it('Basic', () => {
       const m = new Module('basicTest');
       m.fn('test', ['i32', 'i32'], 'i32', (f, A, B) => {
         const { i32 } = f.types;
@@ -55,7 +55,7 @@ describe('Codegen', () => {
         deepStrictEqual(mod.test(3, 2 ** 31), -2147483645);
       });
     });
-    should('select', () => {
+    it('select', () => {
       const genSelect = (t) => {
         const m = new Module('basicTest');
         // cond is always i32!
@@ -80,7 +80,7 @@ describe('Codegen', () => {
       test(exec(toWasm(genSelect('i64'))), 'i64');
       test(exec(toWasm(genSelect('u64'))), 'u64');
     });
-    should('u64 arg lowering', () => {
+    it('u64 arg lowering', () => {
       const m = new Module('basicTest');
       m.mem('test', array('u64', {}, 1));
       m.fn('test', ['u64'], 'void', (f, A) => {
@@ -126,7 +126,7 @@ describe('Codegen', () => {
       Object.fromEntries(
         toMod(m, opts).wasmMod.functions.map((fn: any) => [fn.name, fn.instructions])
       );
-    should('collects emitted op ngrams', () => {
+    it('collects emitted op ngrams', () => {
       const report = { ops: {}, ngrams: {}, functions: [] };
       const m = new Module('ngrams');
       m.fn('sum', ['i32', 'i32'], 'i32', (f, a, b) => {
@@ -162,7 +162,7 @@ describe('Codegen', () => {
         functions: [{ module: 'ngrams', label: 'ngrams', name: 'sum', ops: 7 }],
       });
     });
-    should('reads the public opNgrams option once', () => {
+    it('reads the public opNgrams option once', () => {
       const report = opReport();
       const m = new Module('ngramGetter').fn('run', ['u32'], 'u32', (_f, x) => x);
       let reads = 0;
@@ -181,7 +181,7 @@ describe('Codegen', () => {
         }
       );
     });
-    should('collects exact public ngram examples', () => {
+    it('collects exact public ngram examples', () => {
       const report = { ...opReport(), examples: {} };
       const m = new Module('ngramExamples')
         .fn('alpha', [], 'i32', (f) => f.types.i32.const(7))
@@ -226,7 +226,7 @@ describe('Codegen', () => {
         },
       });
     });
-    should('optimizes zero shifts and rotates', () => {
+    it('optimizes zero shifts and rotates', () => {
       const m = new Module('shiftZero');
       const cases = [];
       for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
@@ -238,7 +238,7 @@ describe('Codegen', () => {
       }
       checkReport(m, cases, { optimize: true });
     });
-    should('inverts comparisons followed by eqz', () => {
+    it('inverts comparisons followed by eqz', () => {
       const m = new Module('cmpEqz');
       const cases = [];
       for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
@@ -275,7 +275,7 @@ describe('Codegen', () => {
       });
       checkReport(m, seqs, { optimize: false });
     });
-    should('drops redundant masks before narrow stores', () => {
+    it('drops redundant masks before narrow stores', () => {
       const m = new Module('storeMask')
         .mem('buf32', array('u32', {}, 1))
         .mem('buf64', array('u64', {}, 1));
@@ -311,7 +311,7 @@ describe('Codegen', () => {
       }
       checkReport(m, cases, { optimize: false });
     });
-    should('combines adjacent scalar masks', () => {
+    it('combines adjacent scalar masks', () => {
       const m = new Module('maskChain');
       const cases = [];
       for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
@@ -329,7 +329,7 @@ describe('Codegen', () => {
       }
       checkReport(m, cases, { optimize: false });
     });
-    should('turns xor with all-one masks into not', () => {
+    it('turns xor with all-one masks into not', () => {
       const m = new Module('xorNot');
       const cases = [];
       for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
@@ -366,7 +366,7 @@ describe('Codegen', () => {
         )
       );
     });
-    should('folds scalar div/rem by one and unsigned powers of two', () => {
+    it('folds scalar div/rem by one and unsigned powers of two', () => {
       const m = new Module('divRemConst');
       const cases = [];
       for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
@@ -405,7 +405,7 @@ describe('Codegen', () => {
       }
       checkReport(m, cases, { optimize: true });
     });
-    should('turns equality with zero into eqz', () => {
+    it('turns equality with zero into eqz', () => {
       const m = new Module('eqZero');
       const cases = [];
       for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
@@ -423,7 +423,7 @@ describe('Codegen', () => {
       }
       checkReport(m, cases, { optimize: true });
     });
-    should('turns final right-zero equality into eqz', () => {
+    it('turns final right-zero equality into eqz', () => {
       const m = new Module('eqZeroFinal');
       const cases = [];
       for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
@@ -437,7 +437,7 @@ describe('Codegen', () => {
       }
       checkReport(m, cases, { optimize: false });
     });
-    should('turns and-not shapes into andnot', () => {
+    it('turns and-not shapes into andnot', () => {
       const m = new Module('andNot');
       const cases = [];
       for (const type of ['i32', 'i64', 'u32', 'u64'] as const) {
@@ -476,7 +476,7 @@ describe('Codegen', () => {
         )
       );
     });
-    should('removes redundant double eqz for booleans and condition slots', () => {
+    it('removes redundant double eqz for booleans and condition slots', () => {
       const exact = new Module('doubleEqzExact');
       exact.fn('boolOr', ['u32', 'u32', 'u32'], 'u32', (f, a, b, c) => {
         const { u32 } = f.types;
@@ -541,7 +541,7 @@ describe('Codegen', () => {
         { TAG: 'end' },
       ]);
     });
-    should('folds scalar boolean selects with constant arms', () => {
+    it('folds scalar boolean selects with constant arms', () => {
       const m = new Module('boolSelect');
       m.fn('nonzero', ['u32'], 'u32', (f, c) => {
         const { u32 } = f.types;
@@ -566,7 +566,7 @@ describe('Codegen', () => {
         { optimize: true }
       );
     });
-    should('uses 32-bit nonzero values directly as conditions', () => {
+    it('uses 32-bit nonzero values directly as conditions', () => {
       const m = new Module('nonzeroCond');
       m.fn('branch', ['u32'], 'u32', (f, c) => {
         const { u32 } = f.types;
@@ -605,7 +605,7 @@ describe('Codegen', () => {
         { TAG: 'end' },
       ]);
     });
-    should('preserves data select and mask shapes for constant-time expressions', () => {
+    it('preserves data select and mask shapes for constant-time expressions', () => {
       const m = new Module('constTimeSelect');
       m.fn('sameArm32', ['u32', 'u32'], 'u32', (f, c, a) => {
         const { u32 } = f.types;
@@ -656,7 +656,7 @@ describe('Codegen', () => {
         { TAG: 'end' },
       ]);
     });
-    should('uses guard blocks for large pure branch yields', () => {
+    it('uses guard blocks for large pure branch yields', () => {
       const m = new Module('branchGuard');
       m.fn('run', ['u32'], ['u32', 'u32', 'u32', 'u32', 'u32', 'u32'], (f, c) => {
         const { u32 } = f.types;
@@ -731,7 +731,7 @@ describe('Codegen', () => {
         { TAG: 'end' },
       ]);
     });
-    should('removes masks made redundant by known zero bits', () => {
+    it('removes masks made redundant by known zero bits', () => {
       const m = new Module('knownMask').mem('buf32', array('u32', {}, 1));
       m.fn('load8', [], 'u32', (f) => {
         const { u32 } = f.types;
@@ -868,7 +868,7 @@ describe('Codegen', () => {
         { optimize: true }
       );
     });
-    should('removes masks before left shifts when masked bits shift out', () => {
+    it('removes masks before left shifts when masked bits shift out', () => {
       const m = new Module('shiftMask');
       const cases = [];
       for (const type of ['i32', 'u32'] as const) {
@@ -919,7 +919,7 @@ describe('Codegen', () => {
       }
       checkReport(m, cases, { optimize: true });
     });
-    should('skips redundant source normalization for narrowing small-int casts', () => {
+    it('skips redundant source normalization for narrowing small-int casts', () => {
       const m = new Module('smallNarrowCast');
       m.fn('u8_from_i16', ['i16'], 'u8', (f, a) => [f.types.u8.fromN('i16', a)]);
       m.fn('i8_from_u16', ['u16'], 'i8', (f, a) => [f.types.i8.fromN('u16', a)]);
@@ -966,7 +966,7 @@ describe('Codegen', () => {
         { lowerSmallInt: true }
       );
     });
-    should('folds comparisons decided by value ranges', () => {
+    it('folds comparisons decided by value ranges', () => {
       const m = new Module('rangeCmp').mem('buf32', array('u32', {}, 1));
       m.fn('loadLt256', [], 'u32', (f) => {
         const { u32 } = f.types;
@@ -1025,7 +1025,7 @@ describe('Codegen', () => {
         { optimize: true }
       );
     });
-    should('folds eqz decided by facts without removing data selects', () => {
+    it('folds eqz decided by facts without removing data selects', () => {
       const m = new Module('eqzFacts');
       m.fn('zeroBit', ['u32'], 'u32', (f, a) => {
         const { u32 } = f.types;
@@ -1065,7 +1065,7 @@ describe('Codegen', () => {
         { TAG: 'end' },
       ]);
     });
-    should('removes redundant signed subword normalization', () => {
+    it('removes redundant signed subword normalization', () => {
       const m = new Module('signNorm');
       const cases = [];
       for (const { type, shift } of [
@@ -1094,7 +1094,7 @@ describe('Codegen', () => {
       }
       checkReport(m, cases, { optimize: true });
     });
-    should('folds no-wrap address constants into memory offsets', () => {
+    it('folds no-wrap address constants into memory offsets', () => {
       const m = new Module('memOffset').mem('buf', array('u32', {}, 1024));
       m.fn('safe', ['u32'], 'u32', (f, pos) => {
         const { u32 } = f.types;
@@ -1193,7 +1193,7 @@ describe('Codegen', () => {
         { TAG: 'end' },
       ]);
     });
-    should('uses tee for call result tails in Wasm and JS', () => {
+    it('uses tee for call result tails in Wasm and JS', () => {
       const mod = new Module('callTail')
         .importFn('inc', ['u32'], 'u32', undefined, 'custom')
         .fn('run', ['u32'], 'u32', (f, x) => f.functions.inc.call(x));
@@ -1207,7 +1207,7 @@ describe('Codegen', () => {
     });
   });
   describe('Memory', () => {
-    should('Basic', () => {
+    it('Basic', () => {
       const m = new Module('memTest')
         .mem('memSegment1', array('u32', {}, 3))
         .mem('memSegment2', array('u32', {}, 4))
@@ -1231,7 +1231,7 @@ describe('Codegen', () => {
         deepStrictEqual(mod.test(3, 2), [5, 11]);
       });
     });
-    should('Store', () => {
+    it('Store', () => {
       // Test that store actually works
       const m = new Module('memTest')
         .mem('memSegment1', array('u32', {}, 3))
@@ -1262,7 +1262,7 @@ describe('Codegen', () => {
         deepStrictEqual(view2.getInt32(4, true), 11);
       });
     });
-    should('load8/store8', () => {
+    it('load8/store8', () => {
       for (const type of ['i32', 'u32', 'i64', 'u64']) {
         const m = new Module('basicTest');
         m.mem('mem', array(type, {}, 7));
@@ -1436,7 +1436,7 @@ describe('Codegen', () => {
         });
       }
     });
-    should('fill', () => {
+    it('fill', () => {
       const mod = new Module('fill')
         .mem('state', array('u32', {}, 16))
         .mem('stateSimd', array('u32', {}, 4, 16))
@@ -1487,7 +1487,7 @@ describe('Codegen', () => {
         check(new Uint8Array(64));
       });
     });
-    should('copy', () => {
+    it('copy', () => {
       const mod = new Module('fill')
         .mem('src', array('u32', {}, 16))
         .mem('dst', array('u32', {}, 16))
@@ -1659,7 +1659,7 @@ describe('Codegen', () => {
         }
       });
     });
-    should('swap', () => {
+    it('swap', () => {
       const mswap = new Module('swap')
         .mem('input32', array('u32', {}, 1))
         .mem('input64', array('u64', {}, 1))
@@ -1762,7 +1762,7 @@ describe('Codegen', () => {
         );
       });
     });
-    should('slices', () => {
+    it('slices', () => {
       for (const swapEndianness of [false, true]) {
         for (const type of ['u32', 'u64', 'i32', 'i64']) {
           const c = swapEndianness ? CODERS_BE[type] : CODERS[type];
@@ -1895,12 +1895,12 @@ describe('Codegen', () => {
         const args = [...(node.args || []).map((i) => fmt(f, f.rawFn.byIdx(i))), ...opts];
         return `${node.type}.${node.op}(${args.join(', ')})`;
       };
-      should('collapse', () => {
+      it('collapse', () => {
         // Array collapse
         deepStrictEqual(array(array('u32', {}, 8), {}, 64), array('u32', {}, 64, 8));
         deepStrictEqual(array(array('u32', {}, 16, 8), {}, 64), array('u32', {}, 64, 16, 8));
       });
-      should('allocateMemSpec', () => {
+      it('allocateMemSpec', () => {
         const x = struct(fields);
         const allocated = memory.allocateMemSpec(1, x);
         deepStrictEqual(memory.getRegionInfoPath(allocated.pre, 'chunksDone'), {
@@ -2832,7 +2832,7 @@ describe('Codegen', () => {
         });
         deepStrictEqual(allocated.pos, 15296);
       });
-      should('memoryProxy', () => {
+      it('memoryProxy', () => {
         const memOpsMock: MemOps = (f: any, name: string, region: RegionExpr): MemHandle => {
           let suf = '';
           if (region.view && (region.view as any).addr === 'byte') {
@@ -3073,7 +3073,7 @@ describe('Codegen', () => {
         throws(() => proxy.state[8]);
         proxy.state[7];
       });
-      should('basic', () => {
+      it('basic', () => {
         let called = false;
 
         const mod = new Module('wat')
@@ -3372,7 +3372,7 @@ describe('Codegen', () => {
         toJs(mod);
         deepStrictEqual(called, true);
       });
-      should('nested', () => {
+      it('nested', () => {
         const x = array(struct({ rc: array('u64', {}, 24) }), {}, 128);
         const allocated = memory.allocateMemSpec(0, x);
         deepStrictEqual(memory.getRegionInfoPath(allocated.pre, 0, 'rc'), {
@@ -3525,7 +3525,7 @@ describe('Codegen', () => {
           pos: { base: 16, baseMul: [], syms: [{}], coeffs: [224] },
         });
       });
-      should('batch info', () => {
+      it('batch info', () => {
         const x2 = array(
           struct({ counter: 'u64', state: array('u64', {}, 25) }),
           { batch: true },
@@ -3833,7 +3833,7 @@ describe('Codegen', () => {
           subRegions: { '': [0, 32, 1, 32], salt: [0, 8, 1, 8], personalization: [16, 8, 1, 8] },
         });
       });
-      should('struct', () => {
+      it('struct', () => {
         let called = 0;
         const mod = new Module('wat')
           .mem(
@@ -4218,7 +4218,7 @@ describe('Codegen', () => {
         toJs(mod);
         deepStrictEqual(called, 2);
       });
-      should('cast', () => {
+      it('cast', () => {
         let called = 0;
         const mod = new Module('wat')
           .mem(
@@ -4380,7 +4380,7 @@ describe('Codegen', () => {
         toJs(mod);
         deepStrictEqual(called, 2);
       });
-      should('reshape', () => {
+      it('reshape', () => {
         let called = 0;
         const mod = new Module('wat')
           .mem(
@@ -4883,7 +4883,7 @@ describe('Codegen', () => {
         toJs(mod);
         deepStrictEqual(called, 2);
       });
-      should('simd', () => {
+      it('simd', () => {
         let called = 0;
         const mod = new Module('wat')
           .batchMem(
@@ -5002,7 +5002,7 @@ describe('Codegen', () => {
         toJs(mod, {});
         deepStrictEqual(called, 1);
       });
-      should('simd2', () => {
+      it('simd2', () => {
         for (const type of ['i32', 'u32', 'u64']) {
           for (const lanes of [2, 4]) {
             for (const endianess of [false, true]) {
@@ -5165,7 +5165,7 @@ describe('Codegen', () => {
           }
         }
       });
-      should('convert', () => {
+      it('convert', () => {
         const mod = new Module('wasm');
         for (const sign of ['i', 'u']) {
           mod
@@ -5320,7 +5320,7 @@ describe('Codegen', () => {
     });
   });
   describe('Optimizer', () => {
-    should('runtime types', () => {
+    it('runtime types', () => {
       const m = runtimeTypes;
       deepStrictEqual(m.i32.add(1, 2), 3);
       deepStrictEqual(m.u32.add(1, 2), 3);
@@ -5337,7 +5337,7 @@ describe('Codegen', () => {
     });
   });
   describe('SIMD', () => {
-    should('extmul', () => {
+    it('extmul', () => {
       const mod = new Module('wasm').fn('process', ['u64', 'u64'], 'void', (f, a, b) => {
         const { u64, u64x2 } = f.types;
         const vA = u64x2.fromN('u64', a);
@@ -5362,7 +5362,7 @@ describe('Codegen', () => {
       }
     });
     describe('rotations', () => {
-      should('rotations(32)', () => {
+      it('rotations(32)', () => {
         for (let shift = 0; shift < 64; shift++) {
           const mod = new Module('wasm')
             .mem('state', array('u32x4', {}, 2))
@@ -5401,7 +5401,7 @@ describe('Codegen', () => {
           });
         }
       });
-      should('rotations(64)', () => {
+      it('rotations(64)', () => {
         for (let shift = 0; shift < 128; shift++) {
           const mod = new Module('wasm')
             .mem('state', array('u64x2', {}, 2))
@@ -5436,7 +5436,7 @@ describe('Codegen', () => {
       });
     });
     describe('lowering', () => {
-      should('lowering', () => {
+      it('lowering', () => {
         const vType = 'u32x4';
         const mod = new Module('wasm')
           .mem('state', array('u32x4', {}, 2)) // 16*2 = 32 bytes
@@ -5466,7 +5466,7 @@ describe('Codegen', () => {
           );
         });
       });
-      should('lowering (2)', () => {
+      it('lowering (2)', () => {
         const vType = 'u32x4';
         const mod = new Module('wasm')
           .mem('state', array('u32x4', {}, 4))
@@ -5491,7 +5491,7 @@ describe('Codegen', () => {
           }
         });
       });
-      should('lowering (3, u64)', () => {
+      it('lowering (3, u64)', () => {
         const vType = 'u64x2';
         const mod = new Module('wasm')
           .mem('state', array('u64x2', {}, 4))
@@ -5517,7 +5517,7 @@ describe('Codegen', () => {
           }
         });
       });
-      should('lowering (4, u64, read)', () => {
+      it('lowering (4, u64, read)', () => {
         const vType = 'u64x2';
         const mod = new Module('wasm')
           .mem('state', array('u64x2', {}, 4))
@@ -5544,7 +5544,7 @@ describe('Codegen', () => {
           }
         });
       });
-      should('lowering (4, u64, extract_lane, replace_lane)', () => {
+      it('lowering (4, u64, extract_lane, replace_lane)', () => {
         const vType = 'u64x2';
         const type = 'u64';
         const mod = new Module('wasm')
@@ -5592,7 +5592,7 @@ describe('Codegen', () => {
           deepStrictEqual(c.decode(mod.segments.state).slice(0, 4), [1n, 0n, 0n, 1n]);
         });
       });
-      should('interleave basic', () => {
+      it('interleave basic', () => {
         for (const lanes of [2, 4, 8, 16]) {
           for (const type of ['i32', 'u32', 'i64', 'u64']) {
             for (const sz of [4, 8, 16, 32]) {
@@ -5669,7 +5669,7 @@ describe('Codegen', () => {
           }
         }
       });
-      should('rol/ror', () => {
+      it('rol/ror', () => {
         const OUT = {};
         for (const type of ['u32', 'u64']) {
           for (let shift = 0; shift < 64; shift++) {
@@ -5729,7 +5729,7 @@ describe('Codegen', () => {
         }
       });
     });
-    should('get/set/store/load', () => {
+    it('get/set/store/load', () => {
       for (const endianess of [false]) {
         for (const type of ['u32', 'u64', 'i32', 'i64']) {
           const vType = minSimdType(type);
@@ -5920,7 +5920,7 @@ describe('Codegen', () => {
         }
       }
     });
-    should('addr', () => {
+    it('addr', () => {
       for (const type of ['u32', 'u64', 'i32', 'i64']) {
         const vType = minSimdType(type);
         const mod = new Module('wasm');
@@ -6024,7 +6024,7 @@ describe('Codegen', () => {
     });
   });
   describe('call', () => {
-    should('basic', () => {
+    it('basic', () => {
       for (const type of ['u32', 'u64']) {
         const mod = new Module('call')
           .mem('state', array(type, {}, 8))
@@ -6079,7 +6079,7 @@ describe('Codegen', () => {
         });
       }
     });
-    should('callIf', () => {
+    it('callIf', () => {
       const C = P.array(null, P.U32LE);
       const mod = new Module('call')
         .mem('state', array('u32', {}, 1))
@@ -6112,7 +6112,7 @@ describe('Codegen', () => {
     });
   });
   describe('loop', () => {
-    should('basic block', () => {
+    it('basic block', () => {
       const type = 'u32';
       const mod = new Module('basicBlock')
         .mem('state', array(type, {}, 2))
@@ -6139,7 +6139,7 @@ describe('Codegen', () => {
         deepStrictEqual(c.decode(mod.segments.state), [13, 12]);
       });
     });
-    should('basic loop', () => {
+    it('basic loop', () => {
       const type = 'u32';
       const mod = new Module('basicLoop')
         .mem('state', array(type, {}, 2))
@@ -6173,7 +6173,7 @@ describe('Codegen', () => {
         deepStrictEqual(c.decode(mod.segments.state), [32, 0]);
       });
     });
-    should('nested block: br_if depth=1 swaps outer', () => {
+    it('nested block: br_if depth=1 swaps outer', () => {
       const TYP = 'u32';
       const mod = new Module('nestedBlockDepth1')
         .mem('state', array(TYP, {}, 2))
@@ -6203,7 +6203,7 @@ describe('Codegen', () => {
         deepStrictEqual(c.decode(m.segments.state), [11, 21]);
       });
     });
-    should('nested loop: continue self (depth=0) vs break outer (depth=1)', () => {
+    it('nested loop: continue self (depth=0) vs break outer (depth=1)', () => {
       const TYP = 'u32';
       const mod = new Module('nestedLoopDepths')
         .mem('state', array(TYP, {}, 2))
@@ -6256,7 +6256,7 @@ describe('Codegen', () => {
         deepStrictEqual(c.decode(m.segments.state), [8, 3]);
       });
     });
-    should('block diamond with guarded br_if assigning two results', () => {
+    it('block diamond with guarded br_if assigning two results', () => {
       const TYP = 'u32';
       const mod = new Module('diamondBlock')
         .mem('state', array(TYP, {}, 2))
@@ -6286,7 +6286,7 @@ describe('Codegen', () => {
         deepStrictEqual(c.decode(m.segments.state), [6, 11]); // slow path fallthrough
       });
     });
-    should('callIf via guard block: single call', () => {
+    it('callIf via guard block: single call', () => {
       const TYP = 'u32';
       const mod = new Module('callIf')
         .mem('state', array(TYP, {}, 1))
@@ -6316,7 +6316,7 @@ describe('Codegen', () => {
         deepStrictEqual(c.decode(m.segments.state), [17]);
       });
     });
-    should('branch yield shape check', () => {
+    it('branch yield shape check', () => {
       const TYP = 'u32';
       const mod = new Module('shapeCheck').fn('tmp', [], 'void', (f) => {
         const T = f.types[TYP];
@@ -6336,7 +6336,7 @@ describe('Codegen', () => {
       });
       toWasm(mod);
     });
-    should('block state saves skip unchanged slots', () => {
+    it('block state saves skip unchanged slots', () => {
       const mod = new Module('blockStateSaves').fn('run', ['u32'], 'u32', (f, n) => {
         const { u32 } = f.types;
         const [i, same] = f.block(
@@ -6448,7 +6448,7 @@ describe('Codegen', () => {
         { TAG: 'end' },
       ]);
     });
-    should('block state aliases survive split helpers', () => {
+    it('block state aliases survive split helpers', () => {
       const mod = new Module('splitBlockStateAliases').fn('run', ['u32'], 'u32', (f, n) => {
         const { u32 } = f.types;
         const [i, same] = f.block(
@@ -6505,7 +6505,7 @@ describe('Codegen', () => {
         ].join('\n')
       );
     });
-    should('block state control exits stay in parent split function', () => {
+    it('block state control exits stay in parent split function', () => {
       const mod = new Module('splitBlockStateBreak').fn(
         'run',
         ['u32', 'u32', 'u32', 'u32', 'u32'],
@@ -6566,7 +6566,7 @@ describe('Codegen', () => {
         );
       }
     });
-    should('non-typed optimized branch state keeps removed arg identity', () => {
+    it('non-typed optimized branch state keeps removed arg identity', () => {
       const mod = new Module('voidOptimizedBranchState').fn(
         'run',
         ['u32', 'u32', 'u32', 'u32', 'u32', 'u32'],
@@ -6628,7 +6628,7 @@ describe('Codegen', () => {
       for (const variant of variants)
         deepStrictEqual(exec(variant).run(2, 4, 4, 4, 6, 5), [3, 84, 68, 61, 366, 61]);
     });
-    should('block state multi-digit names save in parallel', () => {
+    it('block state multi-digit names save in parallel', () => {
       const mod = new Module('wideBlockStateSwap').fn('run', ['u32'], 'u32', (f, cond) => {
         const { u32 } = f.types;
         const init = Array.from({ length: 12 }, (_, i) => u32.const(i + 1));
@@ -6658,7 +6658,7 @@ describe('Codegen', () => {
         deepStrictEqual([out.run(0), out.run(1)], [1269449710, -383548860]);
       }
     });
-    should('split helpers carry reassigned block outputs', () => {
+    it('split helpers carry reassigned block outputs', () => {
       const mod = new Module('splitCarryBlockOutputs').fn(
         'run',
         ['u32', 'u32', 'u32', 'u32', 'u32', 'u32'],
@@ -6704,7 +6704,7 @@ describe('Codegen', () => {
         );
       }
     });
-    should('block state-array split helpers keep function names', () => {
+    it('block state-array split helpers keep function names', () => {
       const mod = new Module('stateArraySplitFunctionNames')
         .importFn('v1', ['u32'], 'u32', undefined, 'env')
         .fn('run', ['u32'], 'u32', (f, x) => {
@@ -6720,7 +6720,7 @@ describe('Codegen', () => {
       deepStrictEqual(exec(toWasm(mod), imports).run(1), 22);
       deepStrictEqual(exec(toJs(mod, { jsStateArray: true, jsOpsPerFn: 1 }), imports).run(1), 22);
     });
-    should('block state locals do not shadow imported function names', () => {
+    it('block state locals do not shadow imported function names', () => {
       const mod = new Module('blockStateFunctionNameCollision')
         .importFn('s1', ['u32'], 'u32', undefined, 'env')
         .fn('run', ['u32'], 'u32', (f, x) => {
@@ -6735,7 +6735,7 @@ describe('Codegen', () => {
       deepStrictEqual(exec(toWasm(mod), imports).run(1), 18);
       deepStrictEqual(exec(toJs(mod), imports).run(1), 18);
     });
-    should('split helper names do not shadow imported functions', () => {
+    it('split helper names do not shadow imported functions', () => {
       const mod = new Module('splitHelperFunctionNameCollision')
         .importFn('run_part0', ['u32'], 'u32', undefined, 'env')
         .fn('run', ['u32'], 'u32', (f, x) => {
@@ -6747,7 +6747,7 @@ describe('Codegen', () => {
       deepStrictEqual(exec(toWasm(mod), imports).run(1), 14);
       deepStrictEqual(exec(toJs(mod, { jsOpsPerFn: 1 }), imports).run(1), 14);
     });
-    should('split helpers do not redeclare tee-provided locals', () => {
+    it('split helpers do not redeclare tee-provided locals', () => {
       const mod = {
         memory: { size: 0, export: true },
         functions: [
@@ -6802,7 +6802,7 @@ describe('Codegen', () => {
         ]
       );
     });
-    should('wrapper locals do not shadow exported function names', () => {
+    it('wrapper locals do not shadow exported function names', () => {
       for (const name of ['buffer', 'memoryExport', '_importsEmbed', 'Object', 'class']) {
         const mod = new Module(`wrapperCollision_${name}`).fn(name, ['u32'], 'u32', (f, x) =>
           f.types.u32.add(x, f.types.u32.const(6))
@@ -6811,7 +6811,7 @@ describe('Codegen', () => {
         deepStrictEqual(exec(toJs(mod))[name](4), 10);
       }
     });
-    should('numeric globals and reserved words do not shadow exported function names', () => {
+    it('numeric globals and reserved words do not shadow exported function names', () => {
       const names = [
         'NaN',
         'Infinity',
@@ -6859,7 +6859,7 @@ describe('Codegen', () => {
         );
       }
     });
-    should('block state hoists common conditional save', () => {
+    it('block state hoists common conditional save', () => {
       const mod = new Module('blockStateCommonSave').fn('run', ['u32'], 'u32', (f, n) => {
         const { u32 } = f.types;
         const init = [
@@ -6941,7 +6941,7 @@ describe('Codegen', () => {
         ].join('\n')
       );
     });
-    should('block state skips all-unchanged branch assignments', () => {
+    it('block state skips all-unchanged branch assignments', () => {
       const branchIf = new Module('identityBranchIf').fn('run', ['u32'], 'u32', (f, n) => {
         const { u32 } = f.types;
         const [same] = f.block([n], (same) => {
@@ -7002,7 +7002,7 @@ describe('Codegen', () => {
         ]
       );
     });
-    should('block state swaps and rotates stay parallel across exits', () => {
+    it('block state swaps and rotates stay parallel across exits', () => {
       const variants = [
         (m) => exec(toWasm(m, { wasmBlockType: true })),
         (m) => exec(toWasm(m, { wasmBlockType: false, wasmTee: false })),
@@ -7101,7 +7101,7 @@ describe('Codegen', () => {
         [[2, 9], 923],
       ]);
     });
-    should('basic2', () => {
+    it('basic2', () => {
       const type = 'u32';
       const mod = new Module('loopTest')
         .mem('state', array(type, {}, 4))
@@ -7140,7 +7140,7 @@ describe('Codegen', () => {
         deepStrictEqual(c.decode(mod.segments.state), [21, 16, 15, 7]);
       });
     });
-    should('inner block breaks grandparent loop (depth=2)', () => {
+    it('inner block breaks grandparent loop (depth=2)', () => {
       const TYP = 'u32';
       const mod = new Module('breakGrandparent')
         .mem('state', array(TYP, {}, 2))
@@ -7182,7 +7182,7 @@ describe('Codegen', () => {
         deepStrictEqual(c.decode(m.segments.state), [2, 1]);
       });
     });
-    should('inner block continues outer loop (depth=1)', () => {
+    it('inner block continues outer loop (depth=1)', () => {
       const TYP = 'u32';
       const mod = new Module('continueOuterLoop')
         .mem('state', array(TYP, {}, 2))
@@ -7224,7 +7224,7 @@ describe('Codegen', () => {
         deepStrictEqual(c.decode(m.segments.state), [32, 5]);
       });
     });
-    should('loop types', () => {
+    it('loop types', () => {
       for (const type of ['u32', 'i32', 'u64', 'i64']) {
         const mod = new Module('continueOuterLoop')
           .mem('state', array(type, {}, 2))
@@ -7533,7 +7533,7 @@ describe('Codegen', () => {
       }
     });
     describe('loops high-level', () => {
-      should('for basic', () => {
+      it('for basic', () => {
         const mod = new Module('nestedFor')
           .fn('tmp', ['i32', 'i32'], 'void', (f, N, M) => {
             const T = f.types.i32;
@@ -7573,7 +7573,7 @@ describe('Codegen', () => {
           }
         });
       });
-      should('for nested', () => {
+      it('for nested', () => {
         const mod = new Module('nestedFor').fn(
           'tmp',
           ['i32', 'i32', 'i32'],
@@ -7624,7 +7624,7 @@ describe('Codegen', () => {
           }
         });
       });
-      should('for', () => {
+      it('for', () => {
         function jsNestedForMirror(
           N,
           M,
@@ -7872,7 +7872,7 @@ describe('Codegen', () => {
           // at i=2: j=0 (continue), j=1 -> break Outer before work -> stop
         ]);
       });
-      should('doWhile', () => {
+      it('doWhile', () => {
         const mod = new Module('nestedFor').fn('tmp2', ['i32', 'i32'], 'void', (f, N, M) => {
           const T = f.types.i32;
           return f.doN1([T.const(1)], N, (i, x) => [T.mul(x, M)]);
@@ -7903,7 +7903,7 @@ describe('Codegen', () => {
       });
     });
     describe('if/else', () => {
-      should('basic', () => {
+      it('basic', () => {
         function jsIfOnly(x, y) {
           // if (x > 0) y = y * 2;
           return x > 0 ? y * 2 : y;
@@ -7995,13 +7995,13 @@ describe('Codegen', () => {
 });
 
 describe('Review regressions', () => {
-  should('batchFn lanes are positive', () => {
+  it('batchFn lanes are positive', () => {
     const mod = new Module('batch_lanes');
     throws(() => mod.batchFn('zero', { lanes: 0 }, [], () => {}), /wrong lanes/);
     throws(() => mod.batchFn('negative', { lanes: -1 }, [], () => {}), /wrong lanes/);
   });
 
-  should('ModuleGraph output edges distinguish sibling path prefixes', () => {
+  it('ModuleGraph output edges distinguish sibling path prefixes', () => {
     const mg = new ModuleGraph('prefix_edge', {}, new Module('prefix_edge'), {});
     mg.subgraph(
       'function',
@@ -8027,7 +8027,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('PosExpr eval includes numeric base products', () => {
+  it('PosExpr eval includes numeric base products', () => {
     deepStrictEqual(PosExpr.eval({ base: 5, baseMul: [6], syms: [], coeffs: [] }, []), 11);
     throws(
       () => PosExpr.eval({ base: 0, baseMul: [[new FnOp('0')]], syms: [], coeffs: [] }, []),
@@ -8035,20 +8035,20 @@ describe('Review regressions', () => {
     );
   });
 
-  should('array dimensions are positive safe integers', () => {
+  it('array dimensions are positive safe integers', () => {
     throws(() => array('u32', {}, 2, 0), /wrong array size/);
     throws(() => array('u32', {}, 2, 1.5), /wrong array size/);
   });
 
-  should('array dimensions reject negative sizes', () => {
+  it('array dimensions reject negative sizes', () => {
     throws(() => array('u32', {}, 2, -1), /wrong array size/);
   });
 
-  should('array dimensions reject unsafe total size', () => {
+  it('array dimensions reject unsafe total size', () => {
     throws(() => array('u8', {}, Number.MAX_SAFE_INTEGER, 2), /wrong array size/);
   });
 
-  should('symbolic reshape casts keep dynamic dimensions', () => {
+  it('symbolic reshape casts keep dynamic dimensions', () => {
     const mod = new Module('symbolic_reshape_cast');
     mod.mem('buffer', array('u32', {}, 64, 4));
     mod.fn('run', ['u32', 'u32'], 'void', (f, p, max) => {
@@ -8058,7 +8058,7 @@ describe('Review regressions', () => {
     toMod(mod);
   });
 
-  should('runtime reshape keeps dynamic zero-valued dimensions symbolic', () => {
+  it('runtime reshape keeps dynamic zero-valued dimensions symbolic', () => {
     const mod = new Module('runtime_dynamic_reshape')
       .mem('buffer', array('u32', {}, 64, 4))
       .fn('run', ['u32', 'u32'], 'u32', (f, p, max) => {
@@ -8070,7 +8070,7 @@ describe('Review regressions', () => {
     deepStrictEqual(toRuntime(() => typeMod, mod)().run(0, 16), 7);
   });
 
-  should('reshape dimensions are positive safe integers', () => {
+  it('reshape dimensions are positive safe integers', () => {
     const mod = new Module('negative_reshape');
     mod.mem('buf', array('u8', {}, 4));
     mod.fn('bad', [], 'void', (f) => {
@@ -8079,7 +8079,7 @@ describe('Review regressions', () => {
     throws(() => toMod(mod, { optimize: false }), /wrong reshape dimension/);
   });
 
-  should('reshape symbolic dimensions are integer expressions', () => {
+  it('reshape symbolic dimensions are integer expressions', () => {
     const mod = new Module('float_reshape');
     mod.mem('buf', array('u8', {}, 4));
     mod.fn('bad', ['f32'], 'void', (f, x) => {
@@ -8088,7 +8088,7 @@ describe('Review regressions', () => {
     throws(() => toMod(mod, { optimize: false }), /wrong reshape dimension/);
   });
 
-  should('reshape dimensions reject non-expression values', () => {
+  it('reshape dimensions reject non-expression values', () => {
     const mod = new Module('string_reshape');
     mod.mem('buf', array('u8', {}, 4));
     mod.fn('bad', [], 'void', (f) => {
@@ -8097,7 +8097,7 @@ describe('Review regressions', () => {
     throws(() => toMod(mod, { optimize: false }), /wrong reshape dimension/);
   });
 
-  should('statically unaligned scalar atomics are rejected', () => {
+  it('statically unaligned scalar atomics are rejected', () => {
     const mod = new Module('atomic_align');
     mod.mem('mem', struct({ pad: scalar('u8'), x: scalar('u32', { align: 1 }) }));
     mod.fn('test', [], 'void', (f) => {
@@ -8107,7 +8107,7 @@ describe('Review regressions', () => {
     throws(() => toMod(mod, { useThreads: true }), /unaligned atomic/);
   });
 
-  should('JS atomics reject unaligned effective addresses', () => {
+  it('JS atomics reject unaligned effective addresses', () => {
     const run = (instructions: any[], outputs: string[] = ['i32']) => {
       const mod = {
         memory: { size: 1024, maximum: 1024, shared: true, export: true },
@@ -8156,7 +8156,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS integer memory fast paths handle unaligned effective addresses', () => {
+  it('JS integer memory fast paths handle unaligned effective addresses', () => {
     const fn = (name: string, instructions: any[]) => ({
       name,
       export: true,
@@ -8257,7 +8257,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS f32.sqrt rounds results to binary32', () => {
+  it('JS f32.sqrt rounds results to binary32', () => {
     const mod = {
       functions: [
         {
@@ -8280,7 +8280,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS fallback i32.load keeps signed i32 shape', () => {
+  it('JS fallback i32.load keeps signed i32 shape', () => {
     const mod = {
       memory: { size: 65536, export: true },
       functions: [
@@ -8311,7 +8311,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS memory addresses and offsets use unsigned wasm32 arithmetic', () => {
+  it('JS memory addresses and offsets use unsigned wasm32 arithmetic', () => {
     const fn = (name: string, instructions: any[]) => ({
       name,
       export: true,
@@ -8385,7 +8385,7 @@ describe('Review regressions', () => {
     ],
   });
 
-  should('JS typed array indexes omit redundant wrapped byte operands', () => {
+  it('JS typed array indexes omit redundant wrapped byte operands', () => {
     const mod = {
       memory: { size: 65536 },
       functions: [
@@ -8414,7 +8414,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS conditions use comparison truthiness without numeric boolean coercion', () => {
+  it('JS conditions use comparison truthiness without numeric boolean coercion', () => {
     const mod = new Module('condSource');
     mod.fn('branch', ['u32', 'u32'], 'u32', (f, a, b) => {
       const { u32 } = f.types;
@@ -8442,7 +8442,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS integer comparisons omit numeric constant coercions', () => {
+  it('JS integer comparisons omit numeric constant coercions', () => {
     const mod = new Module('cmpConstSource');
     mod.fn('signed', ['i32'], 'u32', (f, a) => {
       const { i32 } = f.types;
@@ -8464,7 +8464,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS bitwise ops use comparison truthiness without numeric boolean coercion', () => {
+  it('JS bitwise ops use comparison truthiness without numeric boolean coercion', () => {
     const mod = new Module('bitwiseCmpSource');
     mod.fn('and', ['i32', 'i32'], 'i32', (f, a, b) => {
       const { i32 } = f.types;
@@ -8504,7 +8504,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS conversion coercions omit simple local operand parentheses', () => {
+  it('JS conversion coercions omit simple local operand parentheses', () => {
     const convert = (name: string, output: string, tag: string, add = false) =>
       rawFn(name, ['i32'], output, [
         ...(add ? [{ TAG: 'i32.const', data: 1n }, { TAG: 'i32.add' }] : []),
@@ -8548,7 +8548,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS integer div/rem omit redundant operand wrappers', () => {
+  it('JS integer div/rem omit redundant operand wrappers', () => {
     const fn = (name: string, tag: string) => rawFn(name, ['i32', 'i32'], 'i32', [{ TAG: tag }]);
     const mod = {
       memory: { size: 0 },
@@ -8581,7 +8581,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS bulk memory ops use unsigned wasm32 addresses', () => {
+  it('JS bulk memory ops use unsigned wasm32 addresses', () => {
     const fn = (name: string, instructions: any[]) => ({
       name,
       export: true,
@@ -8638,7 +8638,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('checkFn sees leading call memory barriers', () => {
+  it('checkFn sees leading call memory barriers', () => {
     const mod = new Module('checkfn_call_barrier')
       .mem('mem', array('u32', {}, 1))
       .importFn('touch', [], 'void')
@@ -8651,7 +8651,7 @@ describe('Review regressions', () => {
     throws(() => toMod(mod, { optimize: false }), /strong link|missing link/);
   });
 
-  should('custom import modules are honored by JS and Wasm outputs', () => {
+  it('custom import modules are honored by JS and Wasm outputs', () => {
     const mod = new Module('custom_import')
       .importFn('inc', ['u32'], 'u32', undefined, 'custom')
       .fn('run', ['u32'], 'u32', (f, x) => f.functions.inc.call(x));
@@ -8660,7 +8660,7 @@ describe('Review regressions', () => {
     deepStrictEqual(exec(toWasm(mod), imports).run(41), 42);
   });
 
-  should('embedded custom imports merge with provided custom imports', () => {
+  it('embedded custom imports merge with provided custom imports', () => {
     const mod = new Module('custom_import_mixed')
       .importFn('inc', ['u32'], 'u32', (x) => x + 1, 'custom')
       .importFn('dbl', ['u32'], 'u32', undefined, 'custom')
@@ -8673,30 +8673,30 @@ describe('Review regressions', () => {
     deepStrictEqual(exec(toWasm(mod), imports).run(10), 31);
   });
 
-  should('f64 constants preserve double precision', () => {
+  it('f64 constants preserve double precision', () => {
     const value = Math.PI;
     const mod = new Module('f64_precision').fn('run', [], 'f64', (f) => f.types.f64.const(value));
     deepStrictEqual(exec(toWasm(mod)).run(), value);
   });
 
-  should('jsStateArray preserves signed i32 returns', () => {
+  it('jsStateArray preserves signed i32 returns', () => {
     const mod = new Module('state_array_i32').fn('id', ['i32'], 'i32', (_f, x) => x);
     deepStrictEqual(exec(toJs(mod, { jsStateArray: true })).id(-1), -1);
   });
 
-  should('jsStateArray preserves f32 and f64 state', () => {
+  it('jsStateArray preserves f32 and f64 state', () => {
     const f32 = new Module('state_array_f32').fn('id', ['f32'], 'f32', (_f, x) => x);
     const f64 = new Module('state_array_f64').fn('id', ['f64'], 'f64', (_f, x) => x);
     deepStrictEqual(exec(toJs(f32, { jsStateArray: true })).id(1.1), exec(toWasm(f32)).id(1.1));
     deepStrictEqual(exec(toJs(f64, { jsStateArray: true })).id(1.5), exec(toWasm(f64)).id(1.5));
   });
 
-  should('jsStateArray output is deterministic across createJS calls', () => {
+  it('jsStateArray output is deterministic across createJS calls', () => {
     const mod = new Module('state_array_deterministic').fn('id', ['i32'], 'i32', (_f, x) => x);
     deepStrictEqual(toJs(mod, { jsStateArray: true }), toJs(mod, { jsStateArray: true }));
   });
 
-  should('runtime SIMD shuffle matches generated JS', () => {
+  it('runtime SIMD shuffle matches generated JS', () => {
     const mod = new Module('runtime_shuffle').fn('lanes', [], ['u32', 'u32', 'u32', 'u32'], (f) => {
       const { u32x4 } = f.types;
       const src = u32x4.laneOffsets();
@@ -8708,7 +8708,7 @@ describe('Review regressions', () => {
     deepStrictEqual(toRuntime(() => typeMod, mod)().lanes(), expected);
   });
 
-  should('runtime doN labeled break strips internal counter like generated JS', () => {
+  it('runtime doN labeled break strips internal counter like generated JS', () => {
     const mod = new Module('runtime_doN_label_break').fn('run', [], ['u32', 'u32'], (f) => {
       const { u32 } = f.types;
       const [sum, count] = f.doN(
@@ -8729,7 +8729,7 @@ describe('Review regressions', () => {
     deepStrictEqual(toRuntime(() => typeMod, mod)().run(), expected);
   });
 
-  should('runtime ifElse treats void branch as empty state', () => {
+  it('runtime ifElse treats void branch as empty state', () => {
     const mod = new Module('runtime_ifElse_void_state').fn('run', [], 'u32', (f) => {
       const { u32 } = f.types;
       const out = f.ifElse(u32.const(1), [], () => {});
@@ -8740,7 +8740,7 @@ describe('Review regressions', () => {
     deepStrictEqual(toRuntime(() => typeMod, mod)().run(), expected);
   });
 
-  should('runtime memOps executes scalar atomic store/load', () => {
+  it('runtime memOps executes scalar atomic store/load', () => {
     const mod = new Module('runtime_memops_atomics')
       .mem('state', struct({ value: 'u32' }))
       .fn('run', [], 'u32', (f) => {
@@ -8753,7 +8753,7 @@ describe('Review regressions', () => {
     deepStrictEqual(toRuntime(() => typeMod, mod, { useThreads: true } as any)().run(), expected);
   });
 
-  should('runtime does not export imported helper functions', () => {
+  it('runtime does not export imported helper functions', () => {
     const mod = new Module('runtime_import_export_shape')
       .importFn('inc', ['u32'], 'u32', (x: number) => x + 1)
       .fn('run', ['u32'], 'u32', (f, x) => {
@@ -8766,7 +8766,7 @@ describe('Review regressions', () => {
     deepStrictEqual(Object.keys(runtime).sort(), ['memory', 'run', 'segments']);
   });
 
-  should('runtime SIMD shifts pass scalar shift arguments', () => {
+  it('runtime SIMD shifts pass scalar shift arguments', () => {
     const coder = TypeCoders.u32x4;
     const input = coder.encode([1, 2, 0x8000_0000, 0xffff_ffff]);
     const mod = new Module('runtime_simd_shifts').mem('state', struct({ A: 'u32x4', D: 'u32x4' }));
@@ -8794,7 +8794,7 @@ describe('Review regressions', () => {
     }
   });
 
-  should('SIMD lane immediates reject out-of-range lanes', () => {
+  it('SIMD lane immediates reject out-of-range lanes', () => {
     const rawShuffle = (lane: number) => ({
       functions: [
         {
@@ -8887,7 +8887,7 @@ describe('Review regressions', () => {
     throws(() => runtime.replaceLane([0, 1, 2, 3], 4, 9), /lane|range|invalid/i);
   });
 
-  should('optimizer preserves NaN for floating multiply by zero', () => {
+  it('optimizer preserves NaN for floating multiply by zero', () => {
     const mod = new Module('float_mul_zero')
       .fn('f32', ['f32'], 'f32', (f, x) => f.types.f32.mul(x, f.types.f32.const(0)))
       .fn('f64', ['f64'], 'f64', (f, x) => f.types.f64.mul(x, f.types.f64.const(0)))
@@ -8923,7 +8923,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('lowerPatternJS validates and reads scalar pattern bytes across args', () => {
+  it('lowerPatternJS validates and reads scalar pattern bytes across args', () => {
     const invalid = new Module('lower_pattern_js_oob').fn('run', ['u32'], 'u32', (f, x) => {
       const out = (f as any).rawFn.op('u32', 'pattern', [x], { pattern: [0, 1, 2, 4] });
       return [out];
@@ -8947,7 +8947,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('lowerSIMD preserves partial bitselect masks', () => {
+  it('lowerSIMD preserves partial bitselect masks', () => {
     const mod = new Module('simd_bitselect_mask').fn('lane0', [], 'i32', (f) => {
       const { i32x4 } = f.types;
       const a = i32x4.const(-1_431_655_766);
@@ -8962,7 +8962,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('lowerSIMD supports i32x4 to i64x2 extension', () => {
+  it('lowerSIMD supports i32x4 to i64x2 extension', () => {
     const mod = new Module('simd_i32x4_extend')
       .fn('signed', [], ['u32', 'u32', 'u32', 'u32'], (f) => {
         const { i32, i32x4, i64, i64x2 } = f.types;
@@ -8999,7 +8999,7 @@ describe('Review regressions', () => {
     deepStrictEqual({ signed: lowered.signed(), unsigned: lowered.unsigned() }, expected);
   });
 
-  should('lowerSIMD supports i32x4 to i64x2 extmul', () => {
+  it('lowerSIMD supports i32x4 to i64x2 extmul', () => {
     const mod = new Module('simd_i32x4_extmul')
       .fn('lowUnsigned', [], ['u32', 'u32'], (f) => {
         const { u32, u32x4, u64, u64x2 } = f.types;
@@ -9028,7 +9028,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('lowerSmallInt normalizes imported small-int call results', () => {
+  it('lowerSmallInt normalizes imported small-int call results', () => {
     const mod = new Module('small_import_result')
       .importFn('byte', [], 'u8', () => 0x1ff)
       .fn('local', [], 'u8', (f) => [f.types.u8.fromN('u32', f.types.u32.const(0x1ff))])
@@ -9038,7 +9038,7 @@ describe('Review regressions', () => {
     deepStrictEqual(out.run(), 0xff);
   });
 
-  should('lowerU64Arg handles imported u64 call arguments', () => {
+  it('lowerU64Arg handles imported u64 call arguments', () => {
     const mod = new Module('lower_u64_arg_import')
       .importFn('sink', ['u64'], 'void')
       .fn('run', ['u64'], 'void', (f, x) => {
@@ -9054,7 +9054,7 @@ describe('Review regressions', () => {
     }
   });
 
-  should('lowerU64Arg preserves mixed outputs after wide outputs', () => {
+  it('lowerU64Arg preserves mixed outputs after wide outputs', () => {
     const mod = new Module('lower_u64_arg_mixed_outputs')
       .importFn('impPair', [], ['u64', 'u32'])
       .fn('pair', [], ['u64', 'u32'], (f) => {
@@ -9082,7 +9082,7 @@ describe('Review regressions', () => {
     }
   });
 
-  should('lowerVirtualSIMDMask loads only active lanes', () => {
+  it('lowerVirtualSIMDMask loads only active lanes', () => {
     const mod = new Module('virtual_mask_load_width')
       .mem('buf', array('u32', {}, 16_384))
       .fn('scalar', [], ['u32', 'u32'], (f) => {
@@ -9107,7 +9107,7 @@ describe('Review regressions', () => {
     }
   });
 
-  should('lowerVirtualSIMDPairs lowers lane shuffles across native parts', () => {
+  it('lowerVirtualSIMDPairs lowers lane shuffles across native parts', () => {
     const expect = (lanes: number, rhsOffset: number, pattern: number[]) =>
       pattern.map((lane) => (lane < lanes ? lane : rhsOffset + lane - lanes));
     const u32x8Pat = [7, 0, 8, 15, 3, 12, 4, 11];
@@ -9140,7 +9140,7 @@ describe('Review regressions', () => {
     }
   });
 
-  should('JS output rejects memory.grow because memory views are fixed-size', () => {
+  it('JS output rejects memory.grow because memory views are fixed-size', () => {
     throws(
       () =>
         createJS(
@@ -9168,7 +9168,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('JS memory.size returns wasm page count', () => {
+  it('JS memory.size returns wasm page count', () => {
     const mod = {
       memory: { size: 65537, maximum: 131072, export: true },
       functions: [
@@ -9192,7 +9192,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('function name memory is reserved for exported module memory', () => {
+  it('function name memory is reserved for exported module memory', () => {
     throws(() => new Module('reserved').fn('memory', [], 'void', () => {}), /reserved.*memory/);
     throws(() => new Module('reserved').importFn('memory', [], 'void'), /reserved.*memory/);
     throws(
@@ -9201,7 +9201,7 @@ describe('Review regressions', () => {
     );
   });
 
-  should('function name segments is reserved for wrapper segment views', () => {
+  it('function name segments is reserved for wrapper segment views', () => {
     throws(() => new Module('reserved').fn('segments', [], 'void', () => {}), /reserved.*segments/);
     throws(() => new Module('reserved').importFn('segments', [], 'void'), /reserved.*segments/);
     throws(
@@ -9211,4 +9211,4 @@ describe('Review regressions', () => {
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

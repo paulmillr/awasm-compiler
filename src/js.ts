@@ -223,7 +223,7 @@ const wrapped = (src: string) => !!(exprShape(src) & 1);
 
 const unwrap = (src: string) => {
   let res = src;
-  for (; wrapped(res); ) res = res.slice(1, -1);
+  for (; wrapped(res);) res = res.slice(1, -1);
   return res;
 };
 

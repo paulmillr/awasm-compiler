@@ -1,9 +1,9 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import { deepStrictEqual } from 'node:assert';
 import { toMod, type FnOp } from '../src/codegen.ts';
 import { Module, array } from '../src/module.ts';
-import * as values from '../src/values.ts';
 import type { Fact } from '../src/values.ts';
+import * as values from '../src/values.ts';
 
 const saveFacts = (f: any, facts: Record<string, Fact | undefined>, ops: Record<string, FnOp>) => {
   for (const [name, op] of Object.entries(ops)) facts[name] = f.rawFn.ops.get(op.idx).fact;
@@ -14,7 +14,7 @@ const known = (bits: bigint, value: bigint, min = value, max = value): Fact => (
 });
 
 describe('Values', () => {
-  should('accepts lightweight graph inputs', () => {
+  it('accepts lightweight graph inputs', () => {
     const graph = {
       ops: {
         get(idx: string) {
@@ -41,12 +41,12 @@ describe('Values', () => {
     });
     deepStrictEqual(values.weight(graph)('x'), 0);
   });
-  should('does not dispatch inherited names as range operations', () => {
+  it('does not dispatch inherited names as range operations', () => {
     const graph = { ops: { get: () => ({ kind: 'op' }) } };
     const node = { kind: 'op', op: 'constructor', type: 'u32', args: [], opts: {} };
     deepStrictEqual(values.infer(graph as any, node as any), undefined);
   });
-  should('omits unknown select facts', () => {
+  it('omits unknown select facts', () => {
     const nodes = {
       a: { kind: 'op', fact: { range: { min: 1n, max: 2n } } },
       b: { kind: 'op', fact: { range: { min: 3n, max: 4n } } },
@@ -57,7 +57,7 @@ describe('Values', () => {
       range: { min: 1n, max: 4n },
     });
   });
-  should('infers signed subword ranges from sign extension', () => {
+  it('infers signed subword ranges from sign extension', () => {
     const facts: Record<string, Fact | undefined> = {};
     const m = new Module('signFacts');
     m.fn('facts', ['i32', 'i64'], 'u32', (f, a32, a64) => {
@@ -75,7 +75,7 @@ describe('Values', () => {
       i64i16: { range: { min: -32768n, max: 32767n } },
     });
   });
-  should('infers ranges for count operations', () => {
+  it('infers ranges for count operations', () => {
     const facts: Record<string, Fact | undefined> = {};
     const m = new Module('countFacts');
     m.fn('facts', ['u32', 'u64'], 'u32', (f, a32, a64) => {
@@ -96,7 +96,7 @@ describe('Values', () => {
       ctz64: { range: { min: 0n, max: 64n } },
     });
   });
-  should('infers known bits and ranges on node creation', () => {
+  it('infers known bits and ranges on node creation', () => {
     const facts: Record<string, Fact | undefined> = {};
     const m = new Module('valueFacts').mem('buf32', array('u32', {}, 1));
     m.fn('facts', ['u8', 'u32'], 'u32', (f, u8Arg, word) => {
@@ -161,7 +161,7 @@ describe('Values', () => {
       select: known(0xfffffffen, 0xf0n, 0xf0n, 0xf1n),
     });
   });
-  should('calculates graph weights for scheduling', () => {
+  it('calculates graph weights for scheduling', () => {
     let rawFn: any;
     const ids: Record<string, string> = {};
     const m = new Module('weights');
@@ -188,4 +188,4 @@ describe('Values', () => {
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

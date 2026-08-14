@@ -1,4 +1,4 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import * as fc from 'fast-check';
 import * as P from 'micro-packed';
 import { deepStrictEqual } from 'node:assert';
@@ -164,7 +164,7 @@ describe('Types', () => {
       for (const op of types.opsForType(type)) {
         if (ONLY_OP && !ONLY_OP.includes(op)) continue;
         if (types.opsShifts.has(op)) {
-          should(op, () => {
+          it(op, () => {
             fc.assert(
               fc.property(fc.tuple(fcArg, fci32Arg), ([a, shift]) => {
                 check(op, op, a, undefined, undefined, undefined, shift);
@@ -196,7 +196,7 @@ describe('Types', () => {
           });
         }
         if (types.ops1Arg.has(op)) {
-          should(op, () =>
+          it(op, () =>
             fc.assert(
               fc.property(fc.tuple(fcArg), ([a]) => {
                 check(op, op, a);
@@ -206,7 +206,7 @@ describe('Types', () => {
           );
         }
         if (types.ops2Arg.has(op)) {
-          should(op, () =>
+          it(op, () =>
             fc.assert(
               fc.property(fc.tuple(fcArg, fcArg), ([a, b]) => {
                 check(op, op, a, b);
@@ -216,33 +216,30 @@ describe('Types', () => {
           );
         }
         if (types.opsVariadic.has(op)) {
-          should(`${op}3`, () =>
+          it(`${op}3`, () =>
             fc.assert(
               fc.property(fc.tuple(fcArg, fcArg, fcArg), ([a, b, c]) => {
                 check(`${op}3`, op, a, b, c);
               }),
               OPTS
-            )
-          );
-          should(`${op}4`, () =>
+            ));
+          it(`${op}4`, () =>
             fc.assert(
               fc.property(fc.tuple(fcArg, fcArg, fcArg, fcArg), ([a, b, c, d]) => {
                 check(`${op}4`, op, a, b, c, d);
               }),
               OPTS
-            )
-          );
+            ));
         }
       }
-      should('select', () =>
+      it('select', () =>
         fc.assert(
           fc.property(fc.tuple(fcArg, fcArg, fcArg, fcArg), ([a, b, c, d]) => {
             check('select', 'select', a, b, c, d);
           }),
           OPTS
-        )
-      );
-      should('laneOffsets', () => {
+        ));
+      it('laneOffsets', () => {
         check(
           'laneOffsets0',
           'laneOffsets',
@@ -264,7 +261,7 @@ describe('Types', () => {
           false
         );
       });
-      should('shape', () => {
+      it('shape', () => {
         const shapes = [];
         const mod = new Module('type_tests_' + type)
           .mem('state', array(type, {}, 5))
@@ -299,4 +296,4 @@ describe('Types', () => {
     });
   }
 });
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

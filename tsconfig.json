@@ -4,9 +4,7 @@
     "outDir": ".",
     // TypeScript 6 requires this when outDir is the package root and sources live in src.
     "rootDir": "src",
-    "isolatedDeclarations": false,
-    "sourceMap": false,
-    "declarationMap": false
+    "isolatedDeclarations": false
   },
   "include": [
     "src"

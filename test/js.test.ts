@@ -1,10 +1,10 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import { deepStrictEqual } from 'node:assert';
 import * as js from '../src/js.ts';
 import * as wasm from '../src/wasm.ts';
 
 describe('JS', () => {
-  should('genObject', () => {
+  it('genObject', () => {
     deepStrictEqual(js.genObject({ a: { b: '3+2' } }), `{a: {b: 3+2}}`);
     deepStrictEqual(
       js.genObject({ a: 'a', nested: { b: 'b', c: '3+2' } }),
@@ -23,7 +23,7 @@ describe('JS', () => {
     deepStrictEqual(Object.prototype.hasOwnProperty.call(protoParsed, '__proto__'), true);
     deepStrictEqual(protoParsed.__proto__, 7);
   });
-  should('isLiveAfter', () => {
+  it('isLiveAfter', () => {
     const dead = [
       { TAG: 'local.get', data: 0n },
       { TAG: 'drop' },
@@ -43,7 +43,7 @@ describe('JS', () => {
     ];
     deepStrictEqual(js.__TEST.isLiveAfter(live as any, 3, 0), true);
   });
-  should('split helper returns use object shorthand for locals', () => {
+  it('split helper returns use object shorthand for locals', () => {
     const n = 12;
     const instructions = [];
     for (let i = 0; i < n; i++)
@@ -76,7 +76,7 @@ describe('JS', () => {
       ['return {v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11};']
     );
   });
-  should('call tail remains live across skippable block assignment', () => {
+  it('call tail remains live across skippable block assignment', () => {
     const mod = {
       functions: [
         { name: 'seed', import: true, inputs: [], outputs: ['i32'] },
@@ -111,7 +111,7 @@ describe('JS', () => {
     deepStrictEqual(jsMod.skip_set(1), 42);
     deepStrictEqual(jsMod.skip_set(0), 7);
   });
-  should('genWASM', () => {
+  it('genWASM', () => {
     return;
     const code = wasm.createWasm({
       memory: { size: 1024, export: true },
@@ -154,7 +154,7 @@ return { ..._exports, memory, segments };`
       data_chunks: [new Uint8Array(100)],
     });
   });
-  should('wrapWASM wasmAsHex', () => {
+  it('wrapWASM wasmAsHex', () => {
     const def = {
       memory: { size: 1024, export: true },
       functions: [
@@ -188,7 +188,7 @@ return { ..._exports, memory, segments };`
     const mod = js.exec(js.wrapModule(def, raw, {}));
     deepStrictEqual(mod.add(1, 2), 3);
   });
-  should('freeze option freezes segment chunk arrays', () => {
+  it('freeze option freezes segment chunk arrays', () => {
     const def = { memory: { size: 32, export: true }, functions: [] };
     const segments = {
       data: {
@@ -217,7 +217,7 @@ return { ..._exports, memory, segments };`
     out.segments.data_chunks[0][0] = 7;
     deepStrictEqual(out.segments.data_chunks[0][0], 7);
   });
-  should('dead local.set keeps atomic side effects', () => {
+  it('dead local.set keeps atomic side effects', () => {
     const raw = js.createJS(
       {
         memory: { size: 1024, shared: true, export: true },
@@ -259,7 +259,7 @@ const instance = { exports: {main, memory: { buffer: __buf }}};
 `
     );
   });
-  should('materializes direct memory-load operands before composing expressions', () => {
+  it('materializes direct memory-load operands before composing expressions', () => {
     const mod = {
       memory: { size: 1024, export: true },
       functions: [
@@ -307,4 +307,4 @@ const instance = { exports: {main, memory: { buffer: __buf }}};
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

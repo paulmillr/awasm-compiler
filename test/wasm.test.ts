@@ -1,4 +1,4 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import { base64, hex } from '@scure/base';
 import { deepStrictEqual, throws } from 'node:assert';
 import * as js from '../src/js.ts';
@@ -30,7 +30,7 @@ function oneFn(...instructions) {
 }
 
 describe('WASM', () => {
-  should('LEB128', () => {
+  it('LEB128', () => {
     const VECTORS = [
       [0x1fffffn, new Uint8Array([255, 255, 127])],
       [624485n, new Uint8Array([0xe5, 0x8e, 0x26])],
@@ -74,10 +74,10 @@ describe('WASM', () => {
       deepStrictEqual(wasm.SLEB128.decode(bytes), n);
     }
   });
-  should('leb failed', () => {
+  it('leb failed', () => {
     deepStrictEqual(Buffer.from(wasm.LEB128.encode(1116352408n)).toString('hex'), '98dfa89404');
   });
-  should('sleb const', () => {
+  it('sleb const', () => {
     const w = base64.decode(
       'AGFzbQEAAAABBQFgAAF/AwIBAAcIAQR0ZXN0AAAKCQEHAEF/QSpqCwAKBG5hbWUCAwEAAA=='
     );
@@ -94,7 +94,7 @@ describe('WASM', () => {
     ]);
   });
 
-  should('add', () => {
+  it('add', () => {
     const w = `00 61 73 6d  01 00 00 00      ; Magic number and version
 01 07                         ; Type Section
   01                          ; One type entry
@@ -155,7 +155,7 @@ describe('WASM', () => {
     });
     deepStrictEqual(add2, fixAsm(w));
   });
-  should('multi-function', () => {
+  it('multi-function', () => {
     const w = base64.decode(
       'AGFzbQEAAAABEwNgAn9/AX9gAn5+AX5gAn19AX0DBAMAAQIHEwMDYWRkAAADbXVsAAEDZGl2AAIKGQMHACAAIAFqCwcAIAAgAX4LBwAgACABlQsAUARuYW1lARADAANhZGQBA211bAIDZGl2AhkDAAIAAXgBAXkBAgABeAEBeQICAAF4AQF5BBwDAAdpMzJfYWRkAQdpNjRfbXVsAgdmMzJfZGl2'
     );
@@ -207,7 +207,7 @@ describe('WASM', () => {
     decoded.sections = decoded.sections.slice(0, 4);
     deepStrictEqual(wasm.wasmBinary.decode(tmp), decoded);
   });
-  should('multi-return', () => {
+  it('multi-return', () => {
     const w = base64.decode(
       'AGFzbQEAAAABCQFgAn9/A39/fwMCAQAHCwEHY29tcHV0ZQAAChMBEQAgACABaiAAIAFsIAAgAWsLADIEbmFtZQEKAQAHY29tcHV0ZQIJAQACAAFhAQFiBBQBABFtdWx0aV9yZXR1cm5fdHlwZQ=='
     );
@@ -215,7 +215,7 @@ describe('WASM', () => {
     deepStrictEqual(t.compute(3, 5), [8, 15, -2]);
     log(wasm.wasmBinary.decode(w));
   });
-  should('factorial', () => {
+  it('factorial', () => {
     const w = base64.decode(
       'AGFzbQEAAAABBgFgAXwBfAMCAQAHBwEDZmFjAAAKLgEsACAARAAAAAAAAPA/YwR8RAAAAAAAAPA/BSAAIABEAAAAAAAA8D+hEACiCwsAEgRuYW1lAQYBAANmYWMCAwEAAA=='
     );
@@ -226,7 +226,7 @@ describe('WASM', () => {
     log(wasm.wasmBinary.decode(w));
   });
 
-  should('complex', () => {
+  it('complex', () => {
     const w = base64.decode(
       'AGFzbQEAAAABCAFgA399fgF8Ag8BA2VudgZtZW1vcnkCAAEDAgEABwsBB2NvbXBsZXgAAAo9ATsDAX8BfQF8IABBCmohAyABQwAAIECUIQQgArlEAAAAAAAA8D+gIQVBACgCACADaiEDIANBBDYCACAFCwBUBG5hbWUBCgEAB2NvbXBsZXgCKwEABgABeAEBeQIBegMHc3VtX2kzMgQIdGVtcF9mMzIFCnJlc3VsdF9mNjQEFAEAEWNvbXBsZXhfZnVuY190eXBl'
     );
@@ -303,7 +303,7 @@ describe('WASM', () => {
       },
     ]);
   });
-  should('function signature rejects void valtype', () => {
+  it('function signature rejects void valtype', () => {
     const def = (field) => ({
       functions: [
         {
@@ -319,7 +319,7 @@ describe('WASM', () => {
     throws(() => wasm.createWasm(def('inputs')), /void.*function.*signature/i);
     throws(() => wasm.createWasm(def('outputs')), /void.*function.*signature/i);
   });
-  should('locals reject void valtype', () => {
+  it('locals reject void valtype', () => {
     const def = (type) => ({
       functions: [
         {
@@ -335,7 +335,7 @@ describe('WASM', () => {
     deepStrictEqual(WebAssembly.validate(wasm.createWasm(def('i32'))), true);
     throws(() => wasm.createWasm(def('void')), /void.*local.*valtype/i);
   });
-  should('instruction immediates are encoded in their valid domain', () => {
+  it('instruction immediates are encoded in their valid domain', () => {
     const fence = wasm.createWasm(oneFn({ TAG: 'atomic.fence', data: undefined }));
     deepStrictEqual(WebAssembly.validate(fence), true);
     const validNull = wasm.createWasm(
@@ -347,7 +347,7 @@ describe('WASM', () => {
       /ref|null|type/i
     );
   });
-  should('memory basic', () => {
+  it('memory basic', () => {
     const w = base64.decode(
       'AGFzbQEAAAABBgFgAX8BfwMCAQAFBAEBAgIHGwIDbWVtAgARbWFuaXB1bGF0ZV9tZW1vcnkAAAoQAQ4AIABBKjYCACAAKAIACwAmBG5hbWUBFAEAEW1hbmlwdWxhdGVfbWVtb3J5AgkBAAEABGFkZHI='
     );
@@ -435,7 +435,7 @@ describe('WASM', () => {
       /initial.*maximum|maximum.*initial|memory/i
     );
   });
-  should('simd endianess', () => {
+  it('simd endianess', () => {
     const w = base64.decode(
       'AGFzbQEAAAABBgFgAn9/AAIPAQNlbnYGbWVtb3J5AgABAwIBAAceARpzd2FwX2VuZGlhbl91MzJfdXNpbmdfc2ltZAAACkUBQwEBfyAAIAFqIQIDQCAAIAJJBEAgACAA/QAEACAA/QAEAP0NAwIBAAcGBQQLCgkIDw4NDP0LBAAgAEEQaiEADAELCwsAOARuYW1lAR0BABpzd2FwX2VuZGlhbl91MzJfdXNpbmdfc2ltZAISAQADAANwdHIBA2xlbgIDZW5k'
     );
@@ -482,7 +482,7 @@ describe('WASM', () => {
     ]);
   });
 
-  should('memory grow on import', () => {
+  it('memory grow on import', () => {
     return;
     const w = base64.decode(
       'AGFzbQEAAAABBgFgAX8BfwIQAQNlbnYGbWVtb3J5AgEBCgMCAQAHDwELZ3Jvd19tZW1vcnkAAAoIAQYAIABAAAsAIQRuYW1lAQ4BAAtncm93X21lbW9yeQIKAQABAAVwYWdlcw=='
@@ -497,14 +497,14 @@ describe('WASM', () => {
     log(wasm.wasmBinary.decode(w));
   });
 
-  should('control flow', () => {
+  it('control flow', () => {
     const w = base64.decode(
       'AGFzbQEAAAABCAFgA39/fQF/Ag8BA2VudgZtZW1vcnkCAAEDAgEABwsBB2NvbXBsZXgAAAo7ATkCAn8BfSAAIQNBBSEEIAEgA2ohAwJAA0AgBEUNASADQQFqIQMgBEEBayEEDAALCyADQQA2AgAgAwsASQRuYW1lAQoBAAdjb21wbGV4AiABAAYAAXgBAXkCAXoDA3N1bQQHY291bnRlcgUEdGVtcAQUAQARY29tcGxleF9mdW5jX3R5cGU='
     );
     log(wasm.wasmBinary.decode(w));
   });
 
-  should('blockTypes', async () => {
+  it('blockTypes', async () => {
     const w = wasm.createWasm({
       memory: { size: 0 },
       functions: [
@@ -603,7 +603,7 @@ describe('WASM', () => {
     deepStrictEqual(t2.test(5), 32n);
     deepStrictEqual(t2.test(10), 1024n);
   });
-  should('block type index 64', () => {
+  it('block type index 64', () => {
     const functions = [];
     // The block signature below becomes the 65th distinct type, i.e. typeidx 64.
     for (let i = 0; i < 64; i++) {
@@ -633,7 +633,7 @@ describe('WASM', () => {
     );
     deepStrictEqual((instance.exports.test as () => number)(), 7);
   });
-  should('atomics', async () => {
+  it('atomics', async () => {
     const buf = hex.decode(
       `00 61 73 6d 01 00 00 00
 01 13
@@ -660,7 +660,7 @@ describe('WASM', () => {
     fence(); // just executes
     log(wasm.wasmBinary.decode(buf));
   });
-  should('memory', () => {
+  it('memory', () => {
     const t = {
       sharedImport: base64.decode('AGFzbQEAAAACEQEDZW52Bm1lbW9yeQIDAYACAAgEbmFtZQIBAA=='),
       sharedExport: base64.decode('AGFzbQEAAAAFBQEDAYACBwoBBm1lbW9yeQIAAAgEbmFtZQIBAA=='),
@@ -672,7 +672,7 @@ describe('WASM', () => {
       log(wasm.wasmBinary.decode(t[k]));
     }
   });
-  should('createWasm', () => {
+  it('createWasm', () => {
     const def = {
       memory: {
         size: 64 * 1023,
@@ -736,4 +736,4 @@ describe('WASM', () => {
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

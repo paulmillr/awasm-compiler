@@ -1,15 +1,15 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import { deepStrictEqual, throws } from 'node:assert';
 import * as types from '../src/types.ts';
 import * as utils from '../src/utils.ts';
 
 describe('Utils', () => {
   describe('Dimensions', () => {
-    should('basic', () => {
+    it('basic', () => {
       deepStrictEqual(utils.Dimensions(2, 4, 8).cardinality, 64);
       deepStrictEqual(utils.Dimensions(3, 5, 7).cardinality, 105);
     });
-    should('integer domain', () => {
+    it('integer domain', () => {
       throws(() => utils.Dimensions(1.5), /wrong dimension size/);
       throws(() => utils.Dimensions(Number.MAX_SAFE_INTEGER, 2), /wrong dimension cardinality/);
       const d = utils.Dimensions(3);
@@ -20,7 +20,7 @@ describe('Utils', () => {
       throws(() => d.set(target, [1.5], 9), /wrong dimension position/);
       deepStrictEqual(target, [0, 1, 2]);
     });
-    should('flatKey', () => {
+    it('flatKey', () => {
       const x = utils.Dimensions(5, 3, 2);
       const VECTORS = [
         [0, 0, 0],
@@ -59,7 +59,7 @@ describe('Utils', () => {
         deepStrictEqual(x.key.encode(x.key.decode(i)), i);
       }
     });
-    should('named', () => {
+    it('named', () => {
       const d = utils.Dimensions(5, 3, 2);
       const x1 = [3, 2, 1];
       const x2 = { chunk: 3, lane: 2, pos: 1 };
@@ -73,7 +73,7 @@ describe('Utils', () => {
       deepStrictEqual(nD.key.decode(idx), x2);
       deepStrictEqual(nD.key.encode(x2), idx);
     });
-    should('flat', () => {
+    it('flat', () => {
       const d = utils.Dimensions(5, 3, 2);
       const s = utils.seq(d.cardinality);
       // prettier-ignore
@@ -89,7 +89,7 @@ describe('Utils', () => {
     });
   });
   describe('Shape', () => {
-    should('Basic', () => {
+    it('Basic', () => {
       const S = utils.Shape<number>((x): x is number => typeof x === 'number');
       const input = { a: [1, 2], b: { c: 3 } };
       const { shape, flat } = S.decode(input);
@@ -106,7 +106,7 @@ describe('Utils', () => {
       deepStrictEqual(S.validate(shape, { a: [1, 2] }), false);
       deepStrictEqual(S.validate(shape, [1, 2, 3]), false);
     });
-    should('Basic2', () => {
+    it('Basic2', () => {
       const S2 = utils.Shape<number>((x): x is number => typeof x === 'string');
       const input = ['A', 'B', ['C', 'D'], { D: 'E' }, ['F', ['G', 'H', ['J']]]];
       const { shape, flat } = S2.decode(input);
@@ -120,7 +120,7 @@ describe('Utils', () => {
     });
   });
   describe('splitU64', () => {
-    should('validates precise number domain', () => {
+    it('validates precise number domain', () => {
       deepStrictEqual(utils.splitU64(0), { l: 0, h: 0 });
       deepStrictEqual(utils.splitU64(0x1_0000_0000), { l: 0, h: 1 });
       deepStrictEqual(utils.splitU64(Number.MAX_SAFE_INTEGER), { l: -1, h: 0x1fffff });
@@ -131,7 +131,7 @@ describe('Utils', () => {
   });
   describe('Graph', () => {
     describe('Path', () => {
-      should('basic', () => {
+      it('basic', () => {
         deepStrictEqual(utils.Path.encode([1, 2, 3], utils.Path.getFlags(['weak'])), '1.2.3w');
         deepStrictEqual(utils.Path.encode([1, 2, 3], utils.Path.getFlags([])), '1.2.3');
         deepStrictEqual(utils.Path.decode('1.2.3w'), {
@@ -254,7 +254,7 @@ describe('Utils', () => {
         return [node.opts?.isMut ? 'isMut' : undefined];
       },
     };
-    should('basic', () => {
+    it('basic', () => {
       const g = new utils.TreeDAG({ kind: 'module', name: 'test', nodes: [] }, dagOpts);
       const fn = g.add({ kind: 'function', name: 'test', inputs: [], outputs: [], nodes: [] });
       g.enter(fn);
@@ -378,7 +378,7 @@ describe('Utils', () => {
 `
       );
     });
-    should('order', () => {
+    it('order', () => {
       const g = new utils.TreeDAG({ kind: 'module', name: 'test', nodes: [] }, dagOpts);
       const a = g.add({ type: 'u32', op: 'const', opts: { real: true, id: 'a' } });
       const b = g.add({ type: 'u32', op: 'const', opts: { real: true, id: 'b' } });
@@ -418,7 +418,7 @@ describe('Utils', () => {
     });
   });
   describe('SIMD', () => {
-    should('shuffleLanes', () => {
+    it('shuffleLanes', () => {
       const lanes = utils.chunks(utils.seq(32), 4);
       deepStrictEqual(types.SIMDUtils.shuffleLanes(4, [0, 4, 1, 5]), [
         ...lanes[0],
@@ -433,7 +433,7 @@ describe('Utils', () => {
         ...lanes[7],
       ]);
     });
-    should('tmp', () => {
+    it('tmp', () => {
       return;
       //       From this:    [[ 0, 1, 2, 3  ], [ 4, 5, 6, 7  ], [ 8, 9, 10, 11 ], [ 12, 13, 14, 15 ]]
       // We want this: [[ 0, 8, 4, 12 ], [ 1, 9, 5, 13 ], [ 2, 10, 6, 14 ], [ 3, 11, 7, 15 ]]
@@ -450,4 +450,4 @@ describe('Utils', () => {
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

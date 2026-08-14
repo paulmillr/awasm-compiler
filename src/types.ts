@@ -1345,12 +1345,10 @@ function cast(f: ModuleGraph, fromType: TypeName, toType: TypeName, value: FnOp)
     const sizeMismatch = sizeof(fromType) !== sizeof(toType);
     if (sizeMismatch) {
       if (isSmall(fromType) || isSmall(toType)) {
-        if (
-          !(
-            (isSmall(fromType) && (toType === 'i32' || toType === 'u32')) ||
-            (isSmall(toType) && (fromType === 'i32' || fromType === 'u32'))
-          )
-        )
+        if (!(
+          (isSmall(fromType) && (toType === 'i32' || toType === 'u32')) ||
+          (isSmall(toType) && (fromType === 'i32' || fromType === 'u32'))
+        ))
           throw new Error(`cast(${fromType} -> ${toType}): size mismatch`);
       } else throw new Error(`cast(${fromType} -> ${toType}): size mismatch`);
     }

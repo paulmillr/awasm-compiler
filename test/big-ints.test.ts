@@ -1,4 +1,4 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import * as P from 'micro-packed';
 import { deepStrictEqual } from 'node:assert';
 import { Module, array } from '../src/module.ts';
@@ -8,7 +8,7 @@ import { runtimeTypeMod, testBothOpts } from './utils.ts';
 describe('BigInt', () => {
   const BIG_OPTS = { noRuntime: true, lowerU64: true };
   const BIG_SIMD_OPTS = { noRuntime: true, lowerU64: true, optimize: false };
-  should('u128 conversions', () => {
+  it('u128 conversions', () => {
     const m = new Module('bigInt128');
     m.fn(
       'u128_from_u32_parts',
@@ -45,7 +45,7 @@ describe('BigInt', () => {
     });
   });
 
-  should('i128 sign extension', () => {
+  it('i128 sign extension', () => {
     const m = new Module('bigInt128Signed');
     m.fn('i128_from_i32', ['i32'], ['i32', 'i32', 'i32', 'i32'], (f, a) => {
       const v = f.types.i128.fromN('i32', a);
@@ -69,7 +69,7 @@ describe('BigInt', () => {
     });
   });
 
-  should('u256 conversions', () => {
+  it('u256 conversions', () => {
     const m = new Module('bigInt256');
     m.fn(
       'u256_from_u32_parts',
@@ -103,7 +103,7 @@ describe('BigInt', () => {
     });
   });
 
-  should('u128 ops', () => {
+  it('u128 ops', () => {
     const m = new Module('bigInt128Ops');
     m.mem('out128', array('u128', {}, 1));
     m.mem('out128r', array('u128', {}, 1));
@@ -201,7 +201,7 @@ describe('BigInt', () => {
     });
   });
 
-  should('u128 batchFn lanes', () => {
+  it('u128 batchFn lanes', () => {
     const m = new Module('bigIntBatch');
     m.mem('data', array('u128', {}, 8));
     m.batchFn('sum', { lanes: 4 }, ['u32', 'u32'], (f, lanes, pos, _perBatch, a, b) => {
@@ -223,7 +223,7 @@ describe('BigInt', () => {
       deepStrictEqual(vals.slice(4), [0n, 0n, 0n, 0n]);
     });
   });
-  should('runtime batchFn scalar lanes still resolve scalar getType', () => {
+  it('runtime batchFn scalar lanes still resolve scalar getType', () => {
     const m = new Module('bigIntBatchRuntimeLanes');
     m.mem('data', array('u64', {}, 8));
     m.batchFn('sum', { lanes: 4 }, ['u32', 'u32'], (f, lanes, pos, _perBatch, a, b) => {
@@ -237,7 +237,7 @@ describe('BigInt', () => {
     deepStrictEqual(vals.slice(4), [0n, 0n, 0n, 0n]);
   });
 
-  should('u256 ops', () => {
+  it('u256 ops', () => {
     const m = new Module('bigInt256Ops');
     m.mem('out256', array('u256', {}, 1));
     const u256Mask = (1n << 256n) - 1n;
@@ -272,7 +272,7 @@ describe('BigInt', () => {
       deepStrictEqual(read256(), shiftExpected);
     });
   });
-  should('literal scalar ops preserve every BigInt type', () => {
+  it('literal scalar ops preserve every BigInt type', () => {
     const defs = [
       { type: 'i128', bits: 128, coder: P.I128LE, signed: true },
       { type: 'u128', bits: 128, coder: P.U128LE, signed: false },
@@ -371,7 +371,7 @@ describe('BigInt', () => {
       }
     });
   });
-  should('dynamic scalar eqz preserves every BigInt type', () => {
+  it('dynamic scalar eqz preserves every BigInt type', () => {
     const defs = [
       { type: 'i128', bits: 128, coder: P.I128LE, signed: true },
       { type: 'u128', bits: 128, coder: P.U128LE, signed: false },
@@ -403,4 +403,4 @@ describe('BigInt', () => {
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);

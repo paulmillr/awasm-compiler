@@ -1,4 +1,4 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import { deepStrictEqual } from 'node:assert';
 import { toJs, toWasm } from '../src/codegen.ts';
 import * as js from '../src/js.ts';
@@ -6,7 +6,7 @@ import { Module, array, struct } from '../src/module.ts';
 import { genRuntimeTypes } from '../src/types.ts';
 import * as utils from '../src/utils.ts';
 //import { createRuntime } from '../../src/runtime.ts';
-import { bench } from '@paulmillr/jsbt/bench.js';
+import { bench } from '@paulmillr/jsbt/benchmark.js';
 import * as P from 'micro-packed';
 import { exec } from '../src/js.ts';
 import { WorkerPool, modJs as wpModJS, modWasm as wpModWasm } from './workers.ts';
@@ -50,7 +50,7 @@ const SLOW = false;
 const BENCH_OPTS = { maxRunTimeSec: 0.1 };
 
 describe('threads', () => {
-  should('basic', async () => {
+  it('basic', async () => {
     // NOTE: This is tricky to test, we need to look at performance
     // to verify threads still work since it will work even if threads crashed/failed to start
     //  if (!SLOW) return;
@@ -229,4 +229,4 @@ describe('threads', () => {
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);
