@@ -26,6 +26,60 @@ export type Rewrite = (node: Node, args: FnOp[], idx: NodeIdx) => FnOp | undefin
 /** Factory shape for rewrites that close over one module graph. */
 export type RewriteFn = (fn: ModuleGraph, opts?: CompilerOpts) => Rewrite;
 
+// These instructions can produce or propagate NaNs. Bit-preserving/sign-only operations such as
+// load, store, reinterpret, abs, neg, and copysign intentionally stay outside this set.
+const NaNProducingFloatOps = new Set([
+  'add',
+  'sub',
+  'mul',
+  'div',
+  'rem',
+  'min',
+  'max',
+  'sqrt',
+  'ceil',
+  'floor',
+  'trunc',
+  'nearest',
+  'demote_f64',
+  'promote_f32',
+  'demote_f64x2_zero',
+  'promote_low_f32x4',
+  'pmin',
+  'pmax',
+  'relaxed_madd',
+  'relaxed_nmadd',
+  'relaxed_min',
+  'relaxed_max',
+]);
+
+/**
+ * Replaces NaNs produced by floating-point instructions with a fixed positive-canonical NaN.
+ *
+ * The raw instruction is cloned directly into the graph so construction CSE cannot return the
+ * node currently being rewritten. The WeakSet makes the transformation stable across the rewrite
+ * fixpoint without leaking an internal marker into emitted instructions.
+ */
+export function deterministicNaN(fn: ModuleGraph, _opts: CompilerOpts = {}): Rewrite {
+  const rawInstructions = new WeakSet<Node>();
+  return (node, _args, idx) => {
+    if (
+      node.kind !== 'op' ||
+      rawInstructions.has(node) ||
+      !types.FloatType.has(node.type) ||
+      !NaNProducingFloatOps.has(node.op)
+    )
+      return;
+
+    const rawNode = utils.deepClone(node);
+    const rawIdx = fn.ops.add(rawNode, undefined, `deterministicNaN:${idx}`);
+    rawInstructions.add(fn.ops.get(rawIdx));
+    const raw = fn.byIdx(rawIdx);
+    const T = fn.types[node.type];
+    return T.select(T.ne(raw, raw), T.const(NaN), raw);
+  };
+}
+
 // These are very self-contained, so even if they small it is reasonable to move out them.
 // Maybe even separate files?
 const constKey = (value: any): string | undefined => {

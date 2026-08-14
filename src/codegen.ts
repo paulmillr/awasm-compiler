@@ -211,6 +211,7 @@ export type CompilerOpts = Flags & {
   icseOps?: boolean; // Pressure-gated inverse CSE for tee-less generated code.
   motionOps?: boolean; // Pure-op code motion across block/loop scopes; set false for baselines.
   optBlockState?: boolean; // Block-state passthrough; backend defaults may retain saved state.
+  deterministicNaN?: boolean; // Canonicalize NaNs produced by floating-point instructions.
 
   // wasm low level (both js and wasm)
   wasmBlockType?: boolean;
@@ -276,6 +277,7 @@ const DefaultOpts: CompilerOpts = {
   wasmBlockType: true,
   wasmTee: true,
   optExtMul: true,
+  deterministicNaN: true,
 };
 const DefaultOptsJS: CompilerOpts = {
   lowerU64: true,
@@ -953,6 +955,10 @@ export class ModuleGraph {
       run(lowerWasm);
       run(lowerSmallIntWasm);
     }
+    // This must run after all backend lowering so it also covers floating-point operations
+    // introduced by those passes (for example the expansion of floating-point remainder).
+    if (opts.deterministicNaN)
+      run({ deterministicNaN: getRewrite(rewrites.deterministicNaN) });
     // Inverse CSE runs last: earlier CSE/motion passes would re-merge or hoist its clones.
     // Tee-backed Wasm already re-reads shared values cheaply and benchmarked worse with cloning.
     if (opts.icseOps && !opts.wasmTee) run({ icseOps: getRewrite(rewrites.icse) });

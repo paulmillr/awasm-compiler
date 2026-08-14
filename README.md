@@ -165,6 +165,12 @@ WASM is designed for encoding compactness, not ergonomics. We provide:
 
 Plus higher-level conveniences: endianness conversion, unified scalar/SIMD API with automatic interleaving.
 
+Floating-point instructions produce a fixed positive-canonical NaN by default, making generated
+Wasm NaN bits reproducible across engines; the JavaScript backend follows the same value-level
+policy. Pass `deterministicNaN: false` to `toWasm` or `toJs` to keep the host's full-profile NaN
+propagation. Loads, stores, reinterprets, `abs`, `neg`, and `copysign` preserve their raw-bit
+behavior in either mode.
+
 ## Quick Start
 
 ```typescript

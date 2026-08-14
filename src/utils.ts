@@ -209,6 +209,42 @@ export function reverseObject<T extends Record<string, string | number>>(obj: T)
   return res;
 }
 
+const floatLE = (size: 4 | 8): P.CoderType<number> =>
+  P.wrap({
+    size,
+    encodeStream(w, value) {
+      const bytes = new Uint8Array(size);
+      const view = P.utils.createView(bytes);
+      // DataView is allowed to choose a NaN payload. Emit the WebAssembly
+      // positive-canonical representation explicitly so constants are reproducible.
+      if (Number.isNaN(value)) {
+        if (size === 4) view.setUint32(0, 0x7fc00000, true);
+        else {
+          view.setUint32(0, 0, true);
+          view.setUint32(4, 0x7ff80000, true);
+        }
+      } else if (size === 4) view.setFloat32(0, value, true);
+      else view.setFloat64(0, value, true);
+      w.bytes(bytes);
+    },
+    decodeStream(r) {
+      const view = P.utils.createView(r.bytes(size));
+      return size === 4 ? view.getFloat32(0, true) : view.getFloat64(0, true);
+    },
+    validate(value) {
+      if (typeof value !== 'number')
+        throw new TypeError(`f${size * 8}: expected number, got ${typeof value}`);
+      if (size === 4 && Math.fround(value) !== value && !Number.isNaN(value))
+        throw new Error(`f32: wrong value=${value}`);
+      return value;
+    },
+  });
+
+/** Little-endian IEEE-754 coder that accepts every binary32 NaN payload. */
+export const F32LE = /* @__PURE__ */ floatLE(4);
+/** Little-endian IEEE-754 coder that accepts every binary64 NaN payload. */
+export const F64LE = /* @__PURE__ */ floatLE(8);
+
 /**
  * Builds a bidirectional micro-packed coder from a string mapping.
  *

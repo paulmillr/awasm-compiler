@@ -1,6 +1,6 @@
 import type { TRet } from '@scure/base';
 import * as P from 'micro-packed';
-import { aarray, deepFreeze } from './utils.ts';
+import { aarray, deepFreeze, F32LE, F64LE } from './utils.ts';
 
 const _0n = /* @__PURE__ */ BigInt(0);
 type TypeVal = 'void' | 'i32' | 'i64' | 'f32' | 'f64' | 'v128';
@@ -129,7 +129,7 @@ const memory = {
   tee: { local: 0x22,                            args: idx },
 };
 
-const constarg = { i32: SLEB128, i64: SLEB128, f32: P.F32LE, f64: P.F64LE };
+const constarg = { i32: SLEB128, i64: SLEB128, f32: F32LE, f64: F64LE };
 // prettier-ignore
 const basic = {
   load:            { i32: 0x28, i64: 0x29, f32: 0x2a, f64: 0x2b, args: memarg   },

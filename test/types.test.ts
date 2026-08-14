@@ -223,13 +223,23 @@ describe('Types', () => {
               }),
               OPTS
             ));
-          it(`${op}4`, () =>
+          it(`${op}4`, () => {
+            if (type === 'f32' && op === 'add') {
+              const signalingNaN = Uint8Array.from([0x00, 0x00, 0x81, 0x7f]);
+              const zero = new Uint8Array(4);
+              const canonicalNaN = Uint8Array.from([0x00, 0x00, 0xc0, 0x7f]);
+              deepStrictEqual(C.encode(NaN), canonicalNaN);
+              check(`${op}4`, op, signalingNaN, zero, zero, zero);
+              for (const mod of getTypeMods(type))
+                deepStrictEqual(mod.segments['state.RET'], canonicalNaN);
+            }
             fc.assert(
               fc.property(fc.tuple(fcArg, fcArg, fcArg, fcArg), ([a, b, c, d]) => {
                 check(`${op}4`, op, a, b, c, d);
               }),
               OPTS
-            ));
+            );
+          });
         }
       }
       it('select', () =>
