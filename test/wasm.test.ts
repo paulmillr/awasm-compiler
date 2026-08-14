@@ -1,4 +1,4 @@
-import { describe, it } from '@paulmillr/jsbt/test.js';
+import { describe, it } from './jsbt.js';
 import { base64, hex } from '@scure/base';
 import { deepStrictEqual, throws } from 'node:assert';
 import * as js from '../src/js.ts';

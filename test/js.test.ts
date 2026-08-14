@@ -1,4 +1,4 @@
-import { describe, it } from '@paulmillr/jsbt/test.js';
+import { describe, it } from './jsbt.js';
 import { deepStrictEqual } from 'node:assert';
 import * as js from '../src/js.ts';
 import * as wasm from '../src/wasm.ts';

@@ -1,4 +1,4 @@
-import { describe, it } from '@paulmillr/jsbt/test.js';
+import { describe, it } from './jsbt.js';
 import * as fc from 'fast-check';
 import * as P from 'micro-packed';
 import { deepStrictEqual } from 'node:assert';
@@ -7,7 +7,7 @@ import * as js from '../src/js.ts';
 import { Module, array, struct } from '../src/module.ts';
 import { toRuntime } from '../src/runtime.ts';
 import * as types from '../src/types.ts';
-import { runtimeTypeMod } from './utils.ts';
+import { getRuntimeTypeMod } from './utils.ts';
 const SLOW = false; // takes 10 min
 const STATIC_SHIFTS = SLOW;
 const OPTS = { numRuns: SLOW ? 10_000 : 1_000 };
@@ -17,8 +17,9 @@ const ONLY_TYPE = false; // ['f32', 'f64', 'f32x4', 'f64x4']; //, 'f64', 'f32x4'
 
 describe('Types', () => {
   const typeMods = {};
-  for (const type of types.TypeName) {
-    if (ONLY_TYPE && !ONLY_TYPE.includes(type)) continue;
+
+  const getTypeMods = (type) => {
+    if (typeMods[type]) return typeMods[type];
     const mod = new Module('type_tests_' + type).mem(
       'state',
       struct({
@@ -65,17 +66,16 @@ describe('Types', () => {
     });
     genOps('laneOffsets0', (f) => f.getType(type).laneOffsets());
     genOps('laneOffsets5', (f) => f.getType(type).laneOffsets(5));
-    typeMods[type] = [
+    return (typeMods[type] = [
       js.exec(toWasm(mod, SMALL_OPTS)),
       js.exec(toJs(mod, SMALL_OPTS)),
-      toRuntime(() => runtimeTypeMod, mod, SMALL_OPTS)(),
-    ];
-  }
+      toRuntime(getRuntimeTypeMod, mod, SMALL_OPTS)(),
+    ]);
+  };
 
   for (const type of types.TypeName) {
     if (ONLY_TYPE && !ONLY_TYPE.includes(type)) continue;
     describe(type, () => {
-      const mods = typeMods[type];
       const C = types.TypeCoders[type];
       const Cmask = types.TypeCoders[types.maskType(type)];
       const fcArg = fc.uint8Array({ minLength: C.size, maxLength: C.size });
@@ -97,7 +97,7 @@ describe('Types', () => {
           if (Number.isNaN(raw) || (Array.isArray(raw) && raw.some((i) => Number.isNaN(i))))
             return res2; // NaN cannonicalized (negative nan)
         }
-        for (const mod of mods) {
+        for (const mod of getTypeMods(type)) {
           if (a) mod.segments['state.A'].set(a);
           if (b) mod.segments['state.B'].set(b);
           if (c) mod.segments['state.C'].set(c);
@@ -140,7 +140,7 @@ describe('Types', () => {
           const laneType = types.ScalarOf(type);
           const lanes = types.lanesOf(type);
           const Clane = types.TypeCoders[laneType];
-          const laneMods = typeMods[laneType];
+          const laneMods = getTypeMods(laneType);
           const Alanes = a ? C.decode(a) : undefined;
           const Blanes = b ? C.decode(b) : undefined;
           const Clanes = c ? C.decode(c) : undefined;
@@ -290,7 +290,7 @@ describe('Types', () => {
           });
         js.exec(toWasm(mod, SMALL_OPTS));
         js.exec(toJs(mod, SMALL_OPTS));
-        toRuntime(() => runtimeTypeMod, mod, SMALL_OPTS)().tmp();
+        toRuntime(getRuntimeTypeMod, mod, SMALL_OPTS)().tmp();
         for (let i = 1; i < shapes.length; i++) deepStrictEqual(shapes[i], shapes[0]);
       });
     });

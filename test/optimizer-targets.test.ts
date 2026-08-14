@@ -1,4 +1,5 @@
-import { describe, it } from '@paulmillr/jsbt/test.js';
+import { describe, it } from './jsbt.js';
+import { hex } from '@scure/base';
 import { deepStrictEqual, throws } from 'node:assert';
 import { ModuleGraph, toJs, toMod, toWasm } from '../src/codegen.ts';
 import { exec } from '../src/js.ts';
@@ -1403,7 +1404,7 @@ describe('Optimizer target tests', () => {
           });
         });
       });
-    const d = Uint8Array.fromHex('edf09de876c642ee4d78bce4ceedfc4f');
+    const d = hex.decode('edf09de876c642ee4d78bce4ceedfc4f');
     const res = [];
     for (const compile of [toJs, toWasm]) {
       const out = exec(compile(mod, { cseOps: true, noRuntime: true }));
@@ -1413,8 +1414,8 @@ describe('Optimizer target tests', () => {
       out.run(1, 1, 2);
       res.push({
         target: compile === toJs ? 'js' : 'wasm',
-        buffer: out.segments.buffer.subarray(0, 20).toHex(),
-        tmp: out.segments['state.tmp'].subarray(0, 16).toHex(),
+        buffer: hex.encode(out.segments.buffer.subarray(0, 20)),
+        tmp: hex.encode(out.segments['state.tmp'].subarray(0, 16)),
       });
     }
     deepStrictEqual(res, [

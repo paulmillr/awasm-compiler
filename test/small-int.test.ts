@@ -1,4 +1,4 @@
-import { describe, it } from '@paulmillr/jsbt/test.js';
+import { describe, it } from './jsbt.js';
 import * as P from 'micro-packed';
 import { deepStrictEqual } from 'node:assert';
 import { Module, array } from '../src/module.ts';
